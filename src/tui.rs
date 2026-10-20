@@ -2852,6 +2852,28 @@ impl ReportPanel {
         self.text = report.to_string();
     }
 
+    /// Appends one plain line of text to the report, for panels that stream
+    /// while open (a `!`/`!!` shell escape's live output). The panel keeps
+    /// its scroll position: `draw` follows the tail when the view is at the
+    /// bottom and stays pinned when the user has scrolled up.
+    pub fn push_line(&mut self, text: &str) {
+        self.log.push_plain(text);
+        self.text.push_str(text);
+        self.text.push('\n');
+    }
+
+    /// Makes the panel follow its tail, for streaming panels that should show
+    /// new output as it arrives rather than the report's top.
+    pub fn follow_tail(&mut self) {
+        self.view.follow = true;
+    }
+
+    /// Appends one fully-styled line to the report (e.g. the closing outcome
+    /// line of a `!`/`!!` escape).
+    pub fn push_spans(&mut self, spans: Vec<Span<'static>>) {
+        self.log.push_spans(spans);
+    }
+
     /// The raw report text currently shown.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -7887,6 +7909,24 @@ mod tests {
         assert!(back.contains("row 0"), "did not scroll back: {back:?}");
     }
 
+    /// A panel that streams while open (`!`/`!!` output) grows by appended
+    /// lines, keeps its scroll position, and shows the newest line when
+    /// following the tail.
+    #[test]
+    fn report_panel_streams_appended_lines() {
+        let mut panel = ReportPanel::new("! echo hi", "$ echo hi\n");
+        panel.follow_tail();
+        panel.push_line("hi");
+        panel.push_line("there");
+        assert!(panel.text().contains("hi\nthere"), "{}", panel.text());
+        // Following the tail shows the newest line.
+        assert!(panel.view.follow);
+        // Scrolling up pins the view; appending keeps the pinned position.
+        panel.scroll(-3);
+        panel.push_line("more");
+        assert!(!panel.view.follow, "a scrolled panel stays put");
+    }
+
     /// A `/usage`-style report lands in a bordered panel above the prompt
     /// rather than in the scrollback, is titled with its Esc hint, and never
     /// takes more than half the screen even when the report is long.
@@ -7953,6 +7993,49 @@ mod tests {
         assert!(!report_close_click(0, y));
         assert!(!report_close_click(4, y));
         assert!(!report_close_click(2, y + 1));
+    }
+
+    /// A streaming `!`/`!!` panel draws while the escape runs, when the frame
+    /// has no resting prompt (`draw_bang_frame` passes `None`). The panel must
+    /// still render above the status bar, with its close box and title.
+    #[test]
+    fn report_panel_draws_without_a_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut panel = ReportPanel::new("! echo hi", "$ echo hi\nstreamed line\n");
+        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &OutputLog::new(),
+                None,
+                "! echo hi (3s, Esc to stop)",
+                &mut OutputView::default(),
+                None,
+                &TaskView::default(),
+                None,
+                &RosterView::default(),
+            );
+            draw_report(f, None, &mut panel, 0);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..40).map(|x| buf[(x, y)].symbol().to_owned()).collect())
+            .collect();
+        let top = rows
+            .iter()
+            .position(|r| r.contains("! echo hi \u{b7} Esc closes"))
+            .expect("the panel title is drawn");
+        // The streamed line is visible in the panel, below the `$ cmd` header.
+        assert!(
+            rows[top + 1..].iter().any(|r| r.contains("streamed line")),
+            "got {:?}",
+            &rows[top + 1..]
+        );
+        // The close box is present for dismissing with a click.
+        let y = u16::try_from(top).unwrap();
+        assert!(report_close_click(1, y));
     }
 
     /// The colours that actually reach the screen for `input`, as

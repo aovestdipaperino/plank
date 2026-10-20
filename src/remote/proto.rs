@@ -315,6 +315,8 @@ impl From<WireStats> for GenerationStats {
             // The wire carries no speculative counters; see
             // `WireEvent::from_engine_event`.
             spec: crate::engine::SpecStats::default(),
+            prefill_tokens: 0,
+            prefill_secs: 0.0,
         }
     }
 }

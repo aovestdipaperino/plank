@@ -602,6 +602,8 @@ impl Engine for GemmaEngine {
             limit: crate::engine::pass_limit(generated, max_tokens, bound, interrupted),
             usage: None,
             spec: crate::engine::SpecStats::default(),
+            prefill_tokens: 0,
+            prefill_secs: 0.0,
         })
     }
 

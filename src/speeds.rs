@@ -113,6 +113,25 @@ pub fn note_prefill_progress(model: &str, done: i32, tps: f64) {
     });
 }
 
+/// Notes a completed prefill pass measured as a whole: `tokens` prefilled in
+/// `secs` wall-clock.
+///
+/// Local engines report prefill incrementally through [`note_prefill_progress`];
+/// online providers cannot, because their prefill happens server-side inside the
+/// time-to-first-token. They still know the prompt's token count and the time
+/// the first byte took, so they record the pass here.
+pub fn note_prefill_pass(model: &str, tokens: i32, secs: f64) {
+    if model.is_empty() || tokens <= 0 || !secs.is_finite() || secs <= 0.0 {
+        return;
+    }
+    with_entry(model, |e| {
+        e.totals.prefill_tokens += i64::from(tokens);
+        e.totals.prefill_secs += secs;
+        // The next prefill sample starts a new pass whatever its `done`.
+        e.prefill_last = None;
+    });
+}
+
 /// Notes a completed generation pass: `generated` tokens at a wall-clock rate
 /// of `tps`. Zero on either means there is nothing to time — which is what
 /// online providers report, since they do not measure local throughput.
@@ -239,6 +258,31 @@ mod tests {
         note_generation("norate", 10, 0.0);
         note_generation("norate", 0, 10.0);
         assert!(session_totals("norate").is_empty());
+    }
+
+    #[test]
+    fn a_measured_prefill_pass_records_tokens_and_seconds() {
+        // The provider shape: 1000 prompt tokens prefilled server-side in 2.0s.
+        note_prefill_pass("prov", 1000, 2.0);
+        let r = session_totals("prov");
+        assert_eq!(r.prefill_tokens, 1000);
+        assert!((r.prefill_secs - 2.0).abs() < 1e-9);
+        assert!((r.prefill_tps() - 500.0).abs() < 1e-9);
+        // Degenerate inputs are refused, exactly like the other notes.
+        note_prefill_pass("prov", 0, 2.0);
+        note_prefill_pass("prov", 1000, 0.0);
+        note_prefill_pass("prov", 1000, f64::NAN);
+        note_prefill_pass("", 1000, 2.0);
+        assert_eq!(session_totals("prov").prefill_tokens, 1000);
+    }
+
+    #[test]
+    fn a_prefill_pass_ends_the_inflight_prefill_sample() {
+        // A provider pass reports prefill as a whole; the next incremental
+        // sample must start a fresh pass rather than delta against it.
+        note_prefill_pass("split2", 1000, 2.0);
+        note_prefill_progress("split2", 1000, 500.0);
+        assert_eq!(session_totals("split2").prefill_tokens, 2000);
     }
 
     #[test]

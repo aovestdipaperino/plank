@@ -1699,6 +1699,7 @@ impl Engine for ProviderEngine {
         MAX_PARALLEL_SIDECHAINS
     }
 
+    #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,
         prompt: Prompt<'_>,
@@ -1830,10 +1831,19 @@ impl Engine for ProviderEngine {
             self.calibrate(prompt.flat(), prompt_total);
         }
         let (tps, steady_tps) = throughput(usage.output_tokens, started, first_text.get());
+        // Prefill happened server-side inside the time-to-first-token: the
+        // prompt's token count over the wall-clock until the first text byte.
+        // A tool-only pass never emits text, so its prefill time is unmeasured
+        // and stays 0 — the tokens are still counted.
+        let prefill_secs = first_text
+            .get()
+            .map_or(0.0, |t| t.duration_since(started).as_secs_f64());
         Ok(GenerationStats {
             steady_tps,
             generated: usage.output_tokens,
             tps,
+            prefill_tokens: prompt_total,
+            prefill_secs,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
             // A provider's overrun surfaces as a context-overflow error

@@ -1904,6 +1904,18 @@ without the model files).
   `usage`, never from SSE deltas: a delta is not a token. Validated against
   llama.cpp's own `print_timing` for the same turn — plank 8.5 tok/s vs
   llama-server 8.46 t/s over an identical 198-token count.
+  Two follow-ups were needed before the session exit report showed anything for
+  a provider. First, prefill: the synthetic `PrefillProgress` event a provider
+  emits carries `tps: 0.0`, which `speeds::note_prefill_progress` refuses, so
+  provider prefill never entered the session totals. The provider now records
+  its prefill as a whole pass (`GenerationStats::prefill_tokens`/`prefill_secs`,
+  the prompt's token count over the wall-clock until the first text byte) and
+  `record_usage` folds it in through `speeds::note_prefill_pass`. Second,
+  generation used `tps` — the whole-pass rate *including* time-to-first-token —
+  so a provider with a slow first token read slow even when decode was fast;
+  `record_usage` now prefers `steady_tps` (the true decode rate) and falls back
+  to `tps`. A tool-only pass emits no text, so its prefill seconds stay 0 while
+  its tokens still count.
 - **`--dspark` alone never speculates: the gate is `--temp 0`.** Both the C
   (`ds4_cli.c:600`) and plank's port fetch the draft-block size only when
   `temperature <= 0.0`, so at the default temperature of 0.7 the speculative

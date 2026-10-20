@@ -2527,6 +2527,8 @@ impl Engine for Ds4Session {
             limit: crate::engine::pass_limit(generated, max_tokens, bound, interrupted),
             usage: None,
             spec,
+            prefill_tokens: 0,
+            prefill_secs: 0.0,
         })
     }
 
@@ -3299,6 +3301,8 @@ impl Ds4HostSession {
             usage: None,
             // The host-session path does not drive the speculative entry point.
             spec: crate::engine::SpecStats::default(),
+            prefill_tokens: 0,
+            prefill_secs: 0.0,
         }
     }
 }

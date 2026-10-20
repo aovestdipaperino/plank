@@ -315,6 +315,10 @@ fn openai_generate_end_to_end() {
     assert_eq!(stats.generated, 12);
     assert_eq!(stats.ctx_used, 162); // 150 prompt + 12 completion
     assert!(!stats.interrupted);
+    // The prompt's prefill is measured server-side: tokens counted, and the
+    // wall-clock until the first text byte recorded when text arrived.
+    assert_eq!(stats.prefill_tokens, 150);
+    assert!(stats.prefill_secs > 0.0);
 
     // The request reached the server with a well-formed body.
     let body = server.next_body();

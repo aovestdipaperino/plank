@@ -925,6 +925,14 @@ pub struct GenerationStats {
     /// is the rate to quote as "how fast does this model decode"; `tps` remains
     /// the honest wall-clock rate for the pass as a whole.
     pub steady_tps: f64,
+    /// Prompt tokens prefilled this pass and the wall-clock seconds they took.
+    ///
+    /// Only online providers populate these: their prefill happens server-side
+    /// inside the time-to-first-token, so it never surfaces as local prefill
+    /// progress events. Local engines leave them at 0 and report prefill
+    /// through the event stream instead.
+    pub prefill_tokens: i32,
+    pub prefill_secs: f64,
     /// Context tokens in use after the pass.
     pub ctx_used: i32,
     /// True when generation stopped because of an interrupt.
@@ -1883,6 +1891,8 @@ impl Engine for EchoEngine {
             limit: None,
             spec: SpecStats::default(),
             usage: None,
+            prefill_tokens: 0,
+            prefill_secs: 0.0,
         })
     }
 

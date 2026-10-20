@@ -7544,7 +7544,23 @@ impl Agent<'_> {
         // Decode tokens and time for this model, reported at exit. Attributed
         // to the engine that actually ran the pass, which during a sidechain is
         // the alt engine — same rule as the token tally below.
-        crate::speeds::note_generation(&self.engine.model_name(), stats.generated, stats.tps);
+        //
+        // A provider's prefill happens server-side inside the time-to-first-
+        // token, so it never surfaces as local prefill progress events; the
+        // pass records it directly. Generation uses the steady rate when the
+        // engine measured one — it is the true decode rate, while `tps`
+        // includes the one-time time-to-first-token and reads slow on a long
+        // prompt.
+        let model = self.engine.model_name();
+        if stats.prefill_tokens > 0 {
+            crate::speeds::note_prefill_pass(&model, stats.prefill_tokens, stats.prefill_secs);
+        }
+        let gen_tps = if stats.steady_tps > 0.0 {
+            stats.steady_tps
+        } else {
+            stats.tps
+        };
+        crate::speeds::note_generation(&model, stats.generated, gen_tps);
         // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
         // updated for this pass, so the local input estimate below sees the
         // previous context size.
@@ -14974,26 +14990,20 @@ impl Agent<'_> {
                             continue;
                         }
                         log.push_user_echo(&line);
-                        let result = self.tui_bang(&cmd, &mut log, terminal, &mut view, !feedback);
+                        let (result, panel) = self.tui_bang(&cmd, &mut log, terminal, &mut view, !feedback);
                         if feedback {
                             self.session
                                 .push(Message::user(bang_transcript_entry(&cmd, &result)));
                             log.push_dim(
                                 "[recorded for the model — ask about it in your next message]",
                             );
-                        } else if let Some(text) = bang_panel_report(&cmd, &result) {
-                            // `!!` output is the operator's alone, so it goes
-                            // into the same dismissable panel `/context` and
-                            // `/usage` use instead of scrolling away inside the
-                            // conversation. Nothing about it reaches the
-                            // session — that is the whole point of `!!`.
-                            report = Some(tui::ReportPanel::new(bang_panel_title(&cmd), &text));
-                            view.follow = true;
-                        } else {
-                            // Nothing to show: an empty panel would say less
-                            // than the outcome line.
-                            bang_log_outcome(&cmd, &result, &mut log);
                         }
+                        // Both `!` and `!!` stream into the dismissable panel,
+                        // which stays open after the command finishes. `!!`
+                        // output is the operator's alone, so nothing about it
+                        // reaches the session — that is the whole point of `!!`.
+                        report = Some(panel);
+                        view.follow = true;
                     } else if line.starts_with('/') {
                         if !self.tui_slash(
                             &line,
@@ -15085,16 +15095,28 @@ impl Agent<'_> {
     /// should act on *now*, use a regular turn and let it call the `bash` tool.
     ///
     /// `quiet` is the `!!` shape: nothing is written to the scrollback — not
-    /// the streamed lines, not the closing outcome — because the caller shows
-    /// the whole thing in a [`tui::ReportPanel`] instead. The command still
-    /// runs through the same sink, so the status line keeps counting seconds
-    /// and Esc still interrupts: a slow `!!` never looks frozen.
+    /// the streamed lines, not the closing outcome — because the output goes
+    /// into a [`tui::ReportPanel`] instead. The command still runs through the
+    /// same sink, so the status line keeps counting seconds and Esc still
+    /// interrupts: a slow `!!` never looks frozen.
+    ///
+    /// Both shapes stream into a dismissable panel created up front (the same
+    /// panel `/context` and `/usage` use), which is returned so the caller can
+    /// keep it open after the command finishes. `!` still records its
+    /// transcript entry; `!!` does not.
     ///
     /// A command that asks for the GPU (`gpuyield`) gets the same cycle as a
     /// bash tool call, run here on the UI thread: the notices go into the log
     /// with a redraw each, the second run streams like the first, and the UI
     /// stays blocked through the reload, as it is when the worker runs the
     /// tool path. The outcome line is the final run's.
+    ///
+    /// Mid-turn `!!` (typed while the model is generating) does not stream
+    /// live: it runs on a background thread (`MidTurnBang`) that discards
+    /// lines, and its panel opens only when the result lands. To stream it
+    /// live, the thread would send each line over its `rx` channel (or share
+    /// the panel's `OutputLog` behind a mutex) and the turn loop would append
+    /// to the open panel on every frame, the way `TuiBang` does here.
     fn tui_bang(
         &mut self,
         cmd: &str,
@@ -15102,18 +15124,24 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         quiet: bool,
-    ) -> Result<crate::tools::bash::ImmediateOutput, String> {
+    ) -> (Result<crate::tools::bash::ImmediateOutput, String>, tui::ReportPanel) {
+        let mut panel = tui::ReportPanel::new(
+            bang_panel_title_for(if quiet { "!!" } else { "!" }, cmd),
+            &format!("\x1b[1m$ {cmd}{ANSI_RESET}\n"),
+        );
+        // Streamed output appends to the tail, so the panel follows it rather
+        // than sitting on the `$ cmd` header.
+        panel.follow_tail();
         let mut io = TuiBang {
             log,
             terminal,
             view,
             quiet,
+            panel: Some(&mut panel),
         };
         let result = self.run_bang(cmd, &mut io);
-        if !quiet {
-            bang_log_outcome(cmd, &result, io.log);
-        }
-        result
+        bang_panel_outcome(cmd, &result, &mut panel);
+        (result, panel)
     }
 
     /// Plans the KV cache tiers below the system prompt for this launch
@@ -22668,15 +22696,22 @@ struct TuiBang<'x> {
     /// The `!!` shape: streamed lines stay out of the scrollback, because the
     /// caller shows them in a panel; the status line and notices still show.
     quiet: bool,
+    /// When set, streamed lines append to this dismissable panel instead of
+    /// the scrollback, so a `!`/`!!` command's output stays in one place and
+    /// scrolls on its own (`draw_bang_frame` draws it each tick).
+    panel: Option<&'x mut tui::ReportPanel>,
 }
 
 /// Draws the TUI frame a running shell escape shows, with `status` in the
-/// status line.
+/// status line. When `panel` is set, it is drawn over the output (anchored
+/// above the input, like `/context`), so a streaming `!`/`!!` command's
+/// output is visible while it runs.
 fn draw_bang_frame(
     terminal: &mut ratatui::DefaultTerminal,
     log: &OutputLog,
     view: &mut tui::OutputView,
     status: &str,
+    panel: Option<&mut tui::ReportPanel>,
 ) {
     let _ = terminal
         .draw(|f| {
@@ -22691,6 +22726,9 @@ fn draw_bang_frame(
                 None,
                 &tui::RosterView::default(),
             );
+            if let Some(panel) = panel {
+                tui::draw_report(f, None, panel, 0);
+            }
         })
         .map(|done| crate::logo::after_draw(done.buffer));
     crate::cursor::place();
@@ -22711,7 +22749,9 @@ impl BangIo for TuiBang<'_> {
         }
         impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
             fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
-                if !self.io.quiet {
+                if let Some(panel) = self.io.panel.as_deref_mut() {
+                    panel.push_line(text);
+                } else if !self.io.quiet {
                     self.io.log.push_dim(text.to_owned());
                 }
             }
@@ -22722,7 +22762,13 @@ impl BangIo for TuiBang<'_> {
                     self.cmd,
                     self.start.elapsed().as_secs()
                 );
-                draw_bang_frame(self.io.terminal, self.io.log, self.io.view, &status);
+                draw_bang_frame(
+                    self.io.terminal,
+                    self.io.log,
+                    self.io.view,
+                    &status,
+                    self.io.panel.as_deref_mut(),
+                );
                 while event::poll(Duration::ZERO).unwrap_or(false) {
                     if let Ok(Event::Key(k)) = event::read()
                         && k.kind == KeyEventKind::Press
@@ -22747,7 +22793,13 @@ impl BangIo for TuiBang<'_> {
     fn notice(&mut self, text: &str) {
         self.log.push_dim(text.to_owned());
         self.view.follow = true;
-        draw_bang_frame(self.terminal, self.log, self.view, text);
+        draw_bang_frame(
+            self.terminal,
+            self.log,
+            self.view,
+            text,
+            self.panel.as_deref_mut(),
+        );
     }
 }
 
@@ -22786,18 +22838,51 @@ fn bang_log_outcome(
     }
 }
 
+/// Appends a finished `!`/`!!` command's outcome to its streaming panel: the
+/// interruption, or the exit status. Mirrors [`bang_log_outcome`] for the
+/// panel shape, so a failing command's red exit line lands in the panel.
+fn bang_panel_outcome(
+    cmd: &str,
+    result: &Result<crate::tools::bash::ImmediateOutput, String>,
+    panel: &mut tui::ReportPanel,
+) {
+    match result {
+        Ok(out) => {
+            if out.interrupted {
+                panel.push_line("[interrupted]");
+            } else if out.exit_code == 0 {
+                panel.push_spans(vec![ratatui::text::Span::styled(
+                    "done.",
+                    crate::tui::done_style(),
+                )]);
+            } else {
+                panel.push_spans(vec![ratatui::text::Span::styled(
+                    format!("failed (exit code {}).", out.exit_code),
+                    crate::tui::failed_style(),
+                )]);
+            }
+        }
+        Err(e) => panel.push_line(&format!("!{cmd}: {e}")),
+    }
+}
+
 /// The `!!` panel's title. The command is part of it because, unlike `/context`
 /// or `/usage`, the panel shows the output of *one specific command* and the
 /// scrollback above it may have scrolled away. Long commands are clipped so the
 /// title still fits a panel border.
 fn bang_panel_title(cmd: &str) -> String {
+    bang_panel_title_for("!!", cmd)
+}
+
+/// [`bang_panel_title`] with the escape shape (`!` or `!!`) as the prefix.
+fn bang_panel_title_for(prefix: &str, cmd: &str) -> String {
     const MAX: usize = 60;
-    let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX {
-        format!("!! {one_line}")
+    let head = format!("{prefix} {}", cmd.split_whitespace().collect::<Vec<_>>().join(" "));
+    if head.chars().count() <= MAX {
+        head
     } else {
-        let head: String = one_line.chars().take(MAX - 1).collect();
-        format!("!! {head}…")
+        let head: String = head.chars().take(MAX - 1).collect();
+        format!("{head}…")
     }
 }
 
@@ -33611,6 +33696,138 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn record_usage_records_provider_prefill_and_steady_generation() {
+        // A provider pass reports prefill as a whole (server-side, inside the
+        // time-to-first-token) and a steady decode rate; both must land in the
+        // session speed record, keyed by the engine's model name.
+        let dir = std::env::temp_dir().join(format!("plank-prov-speeds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig {
+            provider: Some(crate::config::ProviderSelector::OpenAi),
+            provider_model: Some("openai:gpt-x".to_string()),
+            ..crate::config::AgentConfig::default()
+        };
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(ScriptedEngine {
+                model: Some("openai:gpt-x".to_string()),
+                ..ScriptedEngine::default()
+            }),
+            cfg: &cfg,
+            gen_opts: cfg.generation.clone(),
+            resume_temp: crate::engine::GenerationOptions::default().temperature,
+            session: Session::new(),
+            store,
+            pending_aside: None,
+            open_reply: None,
+            hints: crate::hints::HintsState::default(),
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
+            system: String::new(),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            payload_restored: false,
+            payload_dirty: false,
+            ladder: crate::kvladder::KvLadder::new(),
+            sensor: crate::mempressure::PressureSensor::start(),
+            hysteresis: crate::mempressure::Hysteresis::new(),
+            yield_policy: crate::yieldpolicy::YieldPolicy::new(),
+            first_turn_done: false,
+            pressure_stop: false,
+            sidechain_depth: 0,
+            turn_from_remote: false,
+            alt_engine_depth: 0,
+            extract_state: crate::memextract::ExtractState::default(),
+            memory_gate: false,
+            memory_gate_percent: 60,
+            memory_jobs: std::collections::VecDeque::new(),
+            pending_memory_notice: None,
+            suggestion_pending: false,
+            suggestion: None,
+            repro_dir: test_repro_dir(),
+            quiet_tools: false,
+            guard_stopped: false,
+            pending_images: Vec::new(),
+            btw_diverged_engine: false,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
+            last_turn_interrupted: false,
+            goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            templates: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
+            remote: None,
+            remote_server: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            passes: Vec::new(),
+            last_guard: crate::insights::GuardSnapshot::default(),
+            reply_only_next: false,
+            session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
+            unnamed_subagents: 0,
+            sidechain_dumps: std::collections::VecDeque::new(),
+            alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            parked_engines: Vec::new(),
+            gpu_yield: GpuYield::default(),
+            steer_switch: None,
+            warm_note: None,
+        };
+
+        // 1000 prompt tokens prefilled in 2.0s; 200 tokens generated, with a
+        // steady decode rate of 50 tok/s (tps would be lower — it includes the
+        // 2s prefill — but the steady rate is what should be recorded).
+        let stats = crate::engine::GenerationStats {
+            generated: 200,
+            tps: 25.0, // whole-pass, dragged down by the prefill
+            steady_tps: 50.0,
+            prefill_tokens: 1000,
+            prefill_secs: 2.0,
+            ctx_used: 1200,
+            usage: Some(crate::engine::TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        agent.record_usage(&stats);
+
+        let rec = crate::speeds::session_totals("openai:gpt-x");
+        assert_eq!(rec.prefill_tokens, 1000);
+        assert!((rec.prefill_secs - 2.0).abs() < 1e-9);
+        assert!((rec.prefill_tps() - 500.0).abs() < 1e-9);
+        assert_eq!(rec.gen_tokens, 200);
+        assert!(
+            (rec.gen_secs - 4.0).abs() < 1e-9,
+            "steady rate 50 tok/s over 200 tokens is 4s"
+        );
+        assert!(
+            (rec.gen_tps() - 50.0).abs() < 1e-9,
+            "generation rate must be the steady rate"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn run_stats_count_local_passes_from_the_context_delta() {
         // No provider `usage`: input is the growth in context minus what the
         // pass generated, and compaction (context shrinking) never subtracts.
@@ -41700,6 +41917,62 @@ or the user's next message aborts before its first token"
             self.notices.push(text.to_owned());
             self.lines.push(text.to_owned());
         }
+    }
+
+    /// The `TuiBang` sink's routing: streamed lines append to the panel when
+    /// one is open, and to the log otherwise (unless quiet). This mirrors the
+    /// `Sink::line` in `TuiBang::run` without needing a terminal.
+    #[test]
+    fn bang_stream_routes_to_the_panel_when_open() {
+        // A sink that routes like `TuiBang`'s: panel first, then log.
+        struct Sink<'a> {
+            panel: Option<&'a mut tui::ReportPanel>,
+            log: &'a mut OutputLog,
+            quiet: bool,
+        }
+        impl crate::tools::bash::ImmediateSink for Sink<'_> {
+            fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                if let Some(panel) = self.panel.as_deref_mut() {
+                    panel.push_line(text);
+                } else if !self.quiet {
+                    self.log.push_dim(text.to_owned());
+                }
+            }
+            fn tick(&mut self) -> bool {
+                false
+            }
+        }
+        let mut panel = tui::ReportPanel::new("! echo hi", "$ echo hi\n");
+        panel.follow_tail();
+        let mut log = OutputLog::new();
+        let mut sink = Sink {
+            panel: Some(&mut panel),
+            log: &mut log,
+            quiet: false,
+        };
+        crate::tools::bash::run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo one; echo two",
+            &mut sink,
+        )
+        .unwrap();
+        assert!(panel.text().contains("one"), "{}", panel.text());
+        assert!(panel.text().contains("two"), "{}", panel.text());
+        assert_eq!(log.line_count(), 0, "lines went to the panel, not the log");
+        // Without a panel, lines go to the log.
+        let mut log2 = OutputLog::new();
+        let mut sink = Sink {
+            panel: None,
+            log: &mut log2,
+            quiet: false,
+        };
+        crate::tools::bash::run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo three",
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(log2.line_count(), 1, "no panel: line lands in the log");
     }
 
     /// An agent on a releasable [`GpuEngine`] ("first") with the cycle armed
