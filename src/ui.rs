@@ -13748,7 +13748,7 @@ impl Agent<'_> {
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_user_echo(initial);
             self.session.push(Message::user(initial));
-            self.tui_turn(
+            let turn = self.tui_turn(
                 terminal,
                 &mut log,
                 &mut view,
@@ -13756,7 +13756,8 @@ impl Agent<'_> {
                 &mut btw_panel,
                 &mut arcade,
                 &mut sub_pane,
-            )?;
+            );
+            Self::log_turn_failure(&mut log, turn);
             // `--prompt` runs before the loop is ever idle: restart the clock
             // so the screensaver waits out a full idle stretch afterwards.
             last_activity = Instant::now();
@@ -14127,7 +14128,7 @@ impl Agent<'_> {
                     if n > 0 {
                         log.push_dim(Self::job_wake_line(n));
                         Self::notify_jobs_finished(n);
-                        self.tui_turn(
+                        let turn = self.tui_turn(
                             terminal,
                             &mut log,
                             &mut view,
@@ -14135,7 +14136,8 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut arcade,
                             &mut sub_pane,
-                        )?;
+                        );
+                        Self::log_turn_failure(&mut log, turn);
                         last_activity = Instant::now();
                     }
                 }
@@ -15017,7 +15019,7 @@ impl Agent<'_> {
                         // every prompt (both loops clear it before returning),
                         // so this means exactly "`/goal` just started one".
                         if self.goal.is_some() {
-                            self.tui_turn(
+                            let turn = self.tui_turn(
                                 terminal,
                                 &mut log,
                                 &mut view,
@@ -15025,7 +15027,8 @@ impl Agent<'_> {
                                 &mut btw_panel,
                                 &mut arcade,
                                 &mut sub_pane,
-                            )?;
+                            );
+                            Self::log_turn_failure(&mut log, turn);
                         }
                     } else {
                         // The engine is text-only: attach pasted images as
@@ -15035,7 +15038,7 @@ impl Agent<'_> {
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_user_echo(echo);
                         self.session.push(Message::user(&message));
-                        self.tui_turn(
+                        let turn = self.tui_turn(
                             terminal,
                             &mut log,
                             &mut view,
@@ -15043,7 +15046,8 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut arcade,
                             &mut sub_pane,
-                        )?;
+                        );
+                        Self::log_turn_failure(&mut log, turn);
                     }
                 }
                 _ => {}
@@ -16853,6 +16857,18 @@ impl Agent<'_> {
         for line in leftover {
             log.commit_pending();
             self.session.push(Message::user(line));
+        }
+    }
+
+    /// Shows a failed turn's error in the log and returns to the prompt.
+    ///
+    /// A provider's HTTP error (a 401 from a bad key, a 429 once the retries
+    /// are spent) is the turn's failure, not the session's: propagating it out
+    /// of the prompt loop quit the whole TUI. A genuinely dead terminal still
+    /// ends the session, because the next draw fails.
+    fn log_turn_failure(log: &mut OutputLog, turn: Result<(), String>) {
+        if let Err(e) = turn {
+            log.push_error(format!("plank: {e}"));
         }
     }
 
