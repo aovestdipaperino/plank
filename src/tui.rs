@@ -1272,6 +1272,11 @@ impl OutputLog {
         self.push_split(&text.into(), think_style());
     }
 
+    /// Appends a line in red, for a failure the user needs to notice.
+    pub fn push_error(&mut self, text: impl Into<String>) {
+        self.push_split(&text.into(), Style::default().fg(Color::Red));
+    }
+
     /// Appends ANSI-colored text, one log line per input line.
     pub fn push_ansi(&mut self, text: &str) {
         self.retire_preview();
@@ -6537,6 +6542,19 @@ mod tests {
                 "b"
             ]
         );
+    }
+
+    /// A failed turn's error is the one log line that must not read as
+    /// ordinary output.
+    #[test]
+    fn an_error_line_is_red() {
+        use super::{Color, OutputLog};
+        let mut log = OutputLog::new();
+        log.push_error("plank: provider request failed (HTTP 429): slow down");
+        let text = log.to_text();
+        let span = &text.lines[0].spans[0];
+        assert_eq!(span.style.fg, Some(Color::Red));
+        assert!(span.content.contains("HTTP 429"));
     }
 
     #[test]
