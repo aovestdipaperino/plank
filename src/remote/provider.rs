@@ -1812,7 +1812,18 @@ impl Engine for ProviderEngine {
             return Err(EngineError::new(err));
         }
 
-        translator.finish(on_event);
+        // Flush the translator through the same first-text tap, so a tool-only
+        // pass — whose only output is the synthesized DSML stanza, emitted here —
+        // still gets its prefill clock and steady decode rate. Without this the
+        // pass reads as zero text, `prefill_secs` stays 0, and the prefill
+        // tokens are dropped by `note_prefill_pass`'s `secs > 0` guard.
+        let mut tap = |ev: EngineEvent| {
+            if first_text.get().is_none() && matches!(ev, EngineEvent::Text(_)) {
+                first_text.set(Some(Instant::now()));
+            }
+            on_event(ev);
+        };
+        translator.finish(&mut tap);
         let usage = translator.usage().unwrap_or(ProviderUsage {
             input_tokens: total,
             output_tokens: 0,

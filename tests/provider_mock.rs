@@ -482,6 +482,38 @@ fn openai_multiturn_tool_id_threading_over_socket() {
     assert_eq!(result["content"], "file body");
 }
 
+/// A tool-only pass (no visible text, just a synthesized DSML stanza) must
+/// still record its prefill and its steady decode rate: the stanza is the
+/// pass's only output, emitted at finalization, so the first-text clock has
+/// to see it or `prefill_secs` stays 0 and the prefill tokens are dropped.
+#[test]
+fn tool_only_pass_still_records_prefill_and_steady_generation() {
+    let server = FakeProvider::start(vec![OPENAI_TOOL_ONLY.to_string()]);
+    let mut engine = ProviderEngine::new(
+        ProviderKind::OpenAi,
+        Some(server.base_url.clone()),
+        "test-key".to_string(),
+        "gpt-x".to_string(),
+        0,
+        true,
+    )
+    .expect("engine builds");
+
+    let messages = vec![ChatMessage::new(ChatRole::User, "read a.rs")];
+    let (text, stats) = run_turn(&mut engine, "sys", &messages, &[read_tool()]);
+
+    // The synthesized DSML stanza is the only output.
+    assert_eq!(parse_dsml(&text).len(), 1);
+    // Prompt tokens counted, and the wall-clock until the first output byte —
+    // the DSML stanza — recorded.
+    assert_eq!(stats.prefill_tokens, 20);
+    assert!(stats.prefill_secs > 0.0, "prefill_secs must be measured");
+    // The steady decode rate is measured from that same first byte, so it is
+    // not dragged down by the prefill wait.
+    assert!(stats.steady_tps > 0.0, "steady_tps must be measured");
+    assert_eq!(stats.generated, 4);
+}
+
 /// A request whose prompt plus output cap overruns the window (the prompt
 /// was larger than plank estimated) is retried once without the cap, and the
 /// server then generates into whatever room is left.
