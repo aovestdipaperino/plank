@@ -13,6 +13,14 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.8
+
+**Sub-agents fan out wider.** Against an online provider, plank now runs up to
+32 sub-agents at once by default, where it used to stop at 4. The
+`agents.maxParallel` setting accepts up to 32, and lowering it is the way out if
+your provider starts rate limiting a wide fan-out. A local model still runs its
+sub-agents one at a time.
+
 ### 7.0.7
 
 **Repro dumps show the prefills.** A `/repro` dump now lists every prefill the

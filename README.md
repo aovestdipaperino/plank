@@ -201,7 +201,7 @@ A few keys cannot take effect until you restart, because what they configure is 
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
-  "agents": { "autoRoute": true, "maxParallel": 4 },
+  "agents": { "autoRoute": true, "maxParallel": 32 },
   "git":    { "signCommits": true },
   "worktree": { "sparsePaths": ["src", "docs"],
                 "symlinkDirectories": ["target"], "isolateAgents": false }
@@ -234,7 +234,7 @@ A few keys cannot take effect until you restart, because what they configure is 
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
 | `agents` | `autoRoute` | `true` | Whether the model may select a sub-agent definition on its own initiative. |
-| | `maxParallel` | 4 | How many sub-agents may run concurrently (clamped to 16). |
+| | `maxParallel` | 32 | How many sub-agents may run concurrently (clamped to 32). |
 | `git` | `signCommits` | `true` | Ask the model to end each commit message it writes with a blank line and `--Co-Authored by Plank (https://plank-agent.dev)`. `false` drops the instruction and leaves commit messages to your repository's own conventions. |
 | `worktree` | `sparsePaths` | `[]` | Cone-mode sparse-checkout paths for a new worktree. Empty checks out everything; set it when a second full checkout of the repo is painful. |
 | | `symlinkDirectories` | `[]` | Directories symlinked from the main checkout rather than duplicated, e.g. `target` or `node_modules`. A name that could climb out of the worktree is ignored. |

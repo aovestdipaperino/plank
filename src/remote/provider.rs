@@ -904,7 +904,7 @@ const MAX_ATTEMPTS: u32 = 5;
 /// provider's rate limit, and exceeding it converts would-be parallelism into
 /// 429s and retry backoff — slower than running serially. The user's
 /// `agents.maxParallel` is minimised against this.
-const MAX_PARALLEL_SIDECHAINS: usize = 8;
+const MAX_PARALLEL_SIDECHAINS: usize = 32;
 
 /// Whether an HTTP error status is worth retrying. Request-timeout (408),
 /// rate-limit (429) and any 5xx server error are transient; auth/permission

@@ -28,7 +28,7 @@ Hierarchical like the MCP config: `~/.plank/settings.json` applies everywhere, `
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
   "update": { "check": true },
-  "agents": { "autoRoute": true, "maxParallel": 4 },
+  "agents": { "autoRoute": true, "maxParallel": 32 },
   "git":    { "signCommits": true },
   "worktree": { "sparsePaths": ["src", "docs"],
                 "symlinkDirectories": ["target"], "isolateAgents": false }
@@ -118,7 +118,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `ask.maxOptions` | 7 | most options the `ask` tool may offer in one question (minimum is fixed at 2) |
 | `update.check` | `true` | check GitHub Releases at startup for a newer version |
 | `agents.autoRoute` | `true` | let the model pick a subagent definition on its own |
-| `agents.maxParallel` | 4 | how many subagents may run at once (capped at 16) |
+| `agents.maxParallel` | 32 | how many subagents may run at once (capped at 32) |
 
 ### `git`
 

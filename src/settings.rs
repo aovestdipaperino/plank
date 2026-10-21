@@ -291,7 +291,7 @@ impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             auto_route: true,
-            max_parallel: 4,
+            max_parallel: 32,
         }
     }
 }
@@ -406,7 +406,7 @@ impl Default for ToolsSettings {
 }
 
 /// Ceiling on `agents.maxParallel`; a higher configured value clamps to this.
-pub const AGENT_MAX_PARALLEL: usize = 16;
+pub const AGENT_MAX_PARALLEL: usize = 32;
 
 /// The whole of `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2714,7 +2714,7 @@ mod tests {
     fn agent_settings_default_and_round_trip() {
         let d = Settings::default();
         assert!(d.agents.auto_route, "model routing on by default");
-        assert_eq!(d.agents.max_parallel, 4);
+        assert_eq!(d.agents.max_parallel, 32);
 
         let s = from_json(r#"{"agents":{"autoRoute":false,"maxParallel":8}}"#);
         assert!(!s.agents.auto_route);
@@ -2762,7 +2762,7 @@ mod tests {
             from_json(r#"{"agents":{"maxParallel":"lots"}}"#)
                 .agents
                 .max_parallel,
-            4
+            32
         );
     }
 

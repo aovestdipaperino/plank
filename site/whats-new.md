@@ -7,6 +7,11 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.8 beta: sub-agents fan out wider.** Against an online provider,
+plank now runs up to 32 sub-agents at once by default, where it used to stop at
+4. `agents.maxParallel` accepts up to 32; lower it if your provider starts rate
+limiting a wide fan-out. A local model still runs its sub-agents one at a time.
+
 **v7.0.7 beta: repro dumps show the prefills.** A `/repro` dump now lists every
 prefill the engine did, from the warm-up before the first turn onward, with its
 size and how much of the context was reused. Micro-compaction only fires when

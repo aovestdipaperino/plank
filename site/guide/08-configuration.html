@@ -153,7 +153,7 @@ need not exist, and any subset of keys works.</p>
   &quot;mcp&quot;:    { &quot;timeoutSecs&quot;: 30 },
   &quot;ask&quot;:    { &quot;maxOptions&quot;: 7 },
   &quot;update&quot;: { &quot;check&quot;: true },
-  &quot;agents&quot;: { &quot;autoRoute&quot;: true, &quot;maxParallel&quot;: 4 },
+  &quot;agents&quot;: { &quot;autoRoute&quot;: true, &quot;maxParallel&quot;: 32 },
   &quot;git&quot;:    { &quot;signCommits&quot;: true },
   &quot;worktree&quot;: { &quot;sparsePaths&quot;: [&quot;src&quot;, &quot;docs&quot;],
                 &quot;symlinkDirectories&quot;: [&quot;target&quot;], &quot;isolateAgents&quot;: false }
@@ -490,8 +490,8 @@ dropped along with all its tools.</td>
 </tr>
 <tr>
 <td><code>agents.maxParallel</code></td>
-<td>4</td>
-<td>how many subagents may run at once (capped at 16)</td>
+<td>32</td>
+<td>how many subagents may run at once (capped at 32)</td>
 </tr>
 </tbody>
 </table>

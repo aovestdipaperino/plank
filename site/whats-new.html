@@ -139,6 +139,11 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>v7.0.8 beta: sub-agents fan out wider.</strong> Against an
+online provider, plank now runs up to 32 sub-agents at once by default,
+where it used to stop at 4. <code>agents.maxParallel</code> accepts up
+to 32; lower it if your provider starts rate limiting a wide fan-out. A
+local model still runs its sub-agents one at a time.</p>
 <p><strong>v7.0.7 beta: repro dumps show the prefills.</strong> A
 <code>/repro</code> dump now lists every prefill the engine did, from
 the warm-up before the first turn onward, with its size and how much of

@@ -157,6 +157,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Sub-agents fan out up to 32 wide by default.** `agents.maxParallel` now
+  defaults to 32 (it was 4) and clamps at 32 (it was 16), and a provider
+  engine serves up to 32 concurrent sidechains (it was 8). Local engines still
+  run sub-agents one at a time. Against an online provider a wide fan-out can
+  hit rate limits sooner; lower `agents.maxParallel` if it does.
+
 - **Micro-compaction gives back a share of the transcript that depends on
   where its edit sits.** An opportunistic pass must reclaim 20% of the
   transcript's tokens when its first edit is in the newest tenth, nothing from
