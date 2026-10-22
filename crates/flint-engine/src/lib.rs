@@ -9,6 +9,9 @@
 mod attention;
 pub mod config;
 #[cfg(feature = "candle")]
+#[allow(dead_code)] // loaded by the model in a later task
+mod ffn;
+#[cfg(feature = "candle")]
 pub mod file;
 pub mod gguf;
 pub mod nvfp4;
