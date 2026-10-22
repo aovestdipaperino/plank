@@ -1,10 +1,11 @@
-//! A live Gemma 4 session: the token history and the KV cache that matches it.
+//! A live session: the token history and the KV cache that matches it, over any [`SessionModel`].
 //!
 //! The cache is prefix-truncatable, so a new turn that shares a prefix with
 //! the last one only prefills the suffix. A snapshot is
 //! `b"PLGK"`, format `2u32`, the model signature (32 bytes), dtype `0u8`
 //! (f32), `n_tokens: u32`, the tokens as `u32` LE, then the
-//! [`KvCache`] body.
+//! [`KvCache`] body. The magic is the model family's
+//! [`SessionModel::SNAPSHOT_MAGIC`] (`PLGK` for Gemma).
 //!
 //! Format 2 keeps only the last `sliding_window + SNAPSHOT_SLACK` positions
 //! of each sliding layer (a later query reaches only its window; the slack
@@ -17,11 +18,12 @@
 
 use std::sync::Arc;
 
+use candle_core::Device;
+
 use crate::kv::KvCache;
 use crate::model::Model;
 use crate::{Error, Result};
 
-const MAGIC: &[u8; 4] = b"PLGK";
 const FORMAT: u32 = 2;
 const DTYPE_F32: u8 = 0;
 /// magic + format + signature + dtype + `n_tokens`.
@@ -43,10 +45,72 @@ const CHUNK: usize = 512;
 /// 42 MB on the 12B, against ~0.67 GB for its 1024-position window.
 pub const SNAPSHOT_SLACK: usize = 64;
 
-/// One conversation's tokens and KV cache over a shared [`Model`].
+/// What a [`Session`] needs from a model: one forward over a KV cache, and
+/// the facts that make a snapshot safe to restore.
+///
+/// gemma-engine's [`Model`] implements it; so does flint-engine's, which is
+/// why the session, the cache and the snapshot format live in one place.
+pub trait SessionModel: std::fmt::Debug {
+    /// Four bytes that open a snapshot of this model family, so a blob from
+    /// another family is refused before its signature is even compared.
+    const SNAPSHOT_MAGIC: [u8; 4];
+
+    /// Runs `tokens` at positions `offset..`, extending `cache`, and returns
+    /// the logits of the last position. On an error the cache may hold part
+    /// of this forward; the session truncates it back to `offset`.
+    ///
+    /// # Errors
+    /// Any model failure.
+    fn forward(&self, tokens: &[u32], offset: usize, cache: &mut KvCache) -> Result<Vec<f32>>;
+
+    /// Positions the model can attend over.
+    fn context_length(&self) -> usize;
+
+    /// A hash of the model's shape, never its weights.
+    fn signature(&self) -> [u8; 32];
+
+    /// `(kv_heads, head_dim)` for each KV layer, in cache order.
+    fn kv_shape(&self) -> Vec<(usize, usize)>;
+
+    /// The sliding window of each KV layer: `Some` for a sliding layer.
+    fn kv_windows(&self) -> Vec<Option<usize>>;
+
+    /// The device the cache lives on.
+    fn device(&self) -> &Device;
+}
+
+impl SessionModel for Model {
+    const SNAPSHOT_MAGIC: [u8; 4] = *b"PLGK";
+
+    fn forward(&self, tokens: &[u32], offset: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        Model::forward(self, tokens, offset, cache)
+    }
+
+    fn context_length(&self) -> usize {
+        Model::context_length(self)
+    }
+
+    fn signature(&self) -> [u8; 32] {
+        Model::signature(self)
+    }
+
+    fn kv_shape(&self) -> Vec<(usize, usize)> {
+        Model::kv_shape(self)
+    }
+
+    fn kv_windows(&self) -> Vec<Option<usize>> {
+        Model::kv_windows(self)
+    }
+
+    fn device(&self) -> &Device {
+        Model::device(self)
+    }
+}
+
+/// One conversation's tokens and KV cache over a shared model.
 #[derive(Debug)]
-pub struct Session {
-    model: Arc<Model>,
+pub struct Session<M: SessionModel = Model> {
+    model: Arc<M>,
     cache: KvCache,
     tokens: Vec<u32>,
     ctx: usize,
@@ -57,11 +121,11 @@ pub struct Session {
     slack: usize,
 }
 
-impl Session {
+impl<M: SessionModel> Session<M> {
     /// An empty session holding at most `ctx` tokens (never more than the
     /// model's [`Model::context_length`]).
     #[must_use]
-    pub fn new(model: Arc<Model>, ctx: usize) -> Self {
+    pub fn new(model: Arc<M>, ctx: usize) -> Self {
         let n = model.kv_shape().len();
         let ctx = ctx.min(model.context_length());
         let windows = model.kv_windows();
@@ -185,7 +249,7 @@ impl Session {
             ))
         })?;
         let mut out = Vec::with_capacity(HEADER + 4 * self.tokens.len() + body.len());
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&M::SNAPSHOT_MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&self.model.signature());
         out.push(DTYPE_F32);
@@ -210,7 +274,7 @@ impl Session {
                 bytes.len()
             )));
         }
-        if &bytes[0..4] != MAGIC {
+        if bytes[0..4] != M::SNAPSHOT_MAGIC {
             return Err(Error("snapshot: bad magic".into()));
         }
         let format = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);

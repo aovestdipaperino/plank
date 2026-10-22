@@ -2192,12 +2192,17 @@ dependencies = [
  "block2",
  "candle-core",
  "candle-metal-kernels",
+ "candle-nn",
+ "gemma-engine",
  "libc",
  "memmap2",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "rayon",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokenizers",
 ]
 
 [[package]]
