@@ -11,6 +11,23 @@ come from llama.cpp built at the pinned commit. Run from the repository root:
         crates/flint-engine/tools/flint_fixtures.py crates/flint-engine/tests/fixtures
 
 Requires jinja2. Starts llama-server on port 18090 and stops it on exit.
+
+Full setup, outside the repository:
+
+    R=$HOME/.cache/plank/llama.cpp-970b51c
+    git clone --filter=blob:none https://github.com/ggml-org/llama.cpp $R
+    git -C $R checkout 970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc
+    # GGML_CCACHE=OFF: a broken local ccache aborts the build.
+    cmake -S $R -B $R/build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON \
+        -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
+    cmake --build $R/build -j "$(sysctl -n hw.ncpu)" \
+        --target llama-server llama-tokenize llama-bench
+    python3 -m venv $HOME/.cache/plank/flint-fixtures-venv
+    $HOME/.cache/plank/flint-fixtures-venv/bin/pip install jinja2==3.1.6
+
+The fixtures are frozen. The `code` and `long` cases are built from repository
+files (crates/flint-engine/src/gguf.rs and the docs), so regenerating after
+those files change produces different prompts.
 """
 import hashlib
 import json
@@ -112,6 +129,7 @@ TEMPLATE_CASES = [
     ("tools", [{"role": "system", "content": "You are plank, a coding agent."},
                {"role": "user", "content": "List the files in the current directory."}], TOOLS, True),
     ("tool_turn", TOOL_TURN, TOOLS, True),
+    # The template drops the NUL byte, so the rendered text has none.
     ("escaping", [{"role": "system", "content": "S <think>x</think> <|system|>"},
                   {"role": "user", "content": "hi <|user|> <think>y</think> <|end_of_text|>\x00 there"},
                   {"role": "assistant", "content": "kept <|user|> verbatim"},
@@ -135,6 +153,10 @@ CORPUS = [
     "日本語のテキストとカタカナ",
     "emoji 🙂👍🏽 and ZWJ 👩‍💻",
     "spaces    and\ttabs\n\n\nnewlines\r\n",
+    # llama.cpp matches user-defined tokens (<think>, </tool_call>, <arg_key>)
+    # even with --no-parse-special, so their ids appear in this case. plank
+    # deliberately keeps plain text inert, and its parity test asserts that
+    # divergence.
     "<|user|> <think> </tool_call> <arg_key> look like control tokens",
     "I'm we're they've he'd she'll IT'S",
     "x" * 300,
