@@ -179,6 +179,9 @@ fn no_copy(dev: &MetalDevice, file: &MappedFile) -> Option<Arc<Buffer>> {
     });
     // SAFETY: `ptr..ptr+len` is the page-aligned mapping rounded up to its
     // last page, all of it mapped and read-only for the mapping's lifetime.
+    // Metal may run the deallocator on any thread. That is sound only because
+    // the block captures nothing but an `Arc<Mmap>`, which is `Send + Sync`:
+    // do not add captures to it.
     // That lifetime covers the buffer's: the deallocator block above holds an
     // `Arc` of the `Mmap`, released only when Metal frees the buffer. Metal
     // never writes the memory (no kernel binds a weight for writing) and the
@@ -306,6 +309,8 @@ pub(crate) fn matmul(
             grid(MM_THREADS, 1),
         );
     }
+    // Each encoder must end before the next `command_encoder()`, or candle
+    // hands out a different pool command buffer and the passes lose order.
     drop(enc);
     Ok((
         MetalStorage::new(out, dev.clone(), tokens * n, DType::F32),
@@ -360,6 +365,9 @@ pub(crate) fn moe(
     let h = dev.new_buffer(slots * ffn, DType::F32, "nvfp4_moe_h")?;
     let ys = dev.new_buffer(slots * hidden, DType::F32, "nvfp4_moe_ys")?;
     let out = dev.new_buffer(tokens * hidden, DType::F32, "nvfp4_moe_out")?;
+    // Each scoped encoder below ends before the next `command_encoder()`;
+    // otherwise candle hands out a different pool command buffer and the
+    // three passes lose their order.
     {
         let enc = dev.command_encoder()?;
         enc.set_label("nvfp4_moe_gate_up");
@@ -377,6 +385,7 @@ pub(crate) fn moe(
             grid(MV_THREADS, 1),
         );
     }
+    // gate/up's encoder has ended (see above).
     {
         let enc = dev.command_encoder()?;
         enc.set_label("nvfp4_moe_down");
@@ -393,6 +402,7 @@ pub(crate) fn moe(
             grid(MV_THREADS, 1),
         );
     }
+    // down's encoder has ended (see above).
     {
         let enc = dev.command_encoder()?;
         enc.set_label("nvfp4_moe_sum");
@@ -438,5 +448,27 @@ mod tests {
         for literal in ["e += 128", "* 256 + tid", "sb += 32", "tid >> 2"] {
             assert!(!SOURCE.contains(literal), "{literal:?} is hard-coded");
         }
+    }
+
+    /// Prints the device's `maxBufferLength`: a file larger than this cannot
+    /// be one no-copy buffer and falls back to copying every weight.
+    #[test]
+    #[ignore = "prints a device limit for FINDINGS.md"]
+    // A display figure; precision loss in the GiB conversion is irrelevant.
+    #[allow(clippy::cast_precision_loss)]
+    fn print_max_buffer_length() {
+        let Ok(dev) = candle_core::Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let candle_core::Device::Metal(dev) = dev else {
+            return;
+        };
+        let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
+        let n = raw.maxBufferLength();
+        println!(
+            "maxBufferLength = {n} bytes ({:.2} GiB)",
+            n as f64 / f64::from(1u32 << 30)
+        );
     }
 }

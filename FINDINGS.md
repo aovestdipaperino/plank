@@ -3663,3 +3663,20 @@ stream from memory, so 410 GB/s is the only figure here that plausibly
 reflects memory bandwidth. The prefill figure counts weight bytes only and is
 not a bandwidth measure. We have not measured why attn_q and the MoE both land
 near 250 GB/s, and we have not measured this chip's peak bandwidth.
+
+On Metal an out-of-range expert id contributes zero to its token's output,
+while the CPU path returns an error.
+
+This machine's Metal `maxBufferLength` is 86,586,540,032 bytes (80.64 GiB),
+printed by the ignored `print_max_buffer_length` test in
+`crates/flint-engine/src/nvfp4/metal.rs`. The 22.9 GB Flint file fits under
+it, so the whole mapping becomes one no-copy buffer (`GgufFile::metal_no_copy`
+reports `Some(true)`). On a file larger than that limit the crate falls back
+to copying every weight into a buffer of its own, which doubles resident
+memory.
+
+The Rust decoder agrees with upstream's own Python one. Row 0 of
+`blk.0.attn_q.weight` from the real file, dequantized by
+`NVFP4.dequantize_blocks` in gguf-py's `quants.py` at llama.cpp `970b51c` and
+by `block::dequant_row`, matched bit for bit on all 2048 values, before the
+tensor scale.

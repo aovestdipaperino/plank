@@ -27,9 +27,9 @@ pub struct NvWeight {
     rows: usize,
     experts: usize,
     scales: Vec<f32>,
-    /// The Metal buffers this weight is bound to, made on first use.
-    /// Declared before `bytes` so it is dropped first: a binding may be a
-    /// no-copy buffer over the mapping `bytes` keeps alive.
+    /// The Metal buffers this weight is bound to, made on first use. Field
+    /// order does not matter for soundness: a no-copy binding's deallocator
+    /// owns its own clone of the mapping.
     #[cfg(target_os = "macos")]
     pub(crate) metal: Mutex<Option<crate::nvfp4::metal::Binding>>,
     bytes: Bytes,
@@ -128,7 +128,8 @@ impl NvWeight {
         &self.bytes()[start..start + rb]
     }
 
-    /// The output scale of expert `expert` (0 for a dense weight).
+    /// The output scale of expert `expert`; a dense weight's one scale is
+    /// expert index 0.
     ///
     /// # Panics
     /// When `expert` is out of range.

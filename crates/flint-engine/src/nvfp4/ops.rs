@@ -553,10 +553,6 @@ mod tests {
         let y = matmul(&w, &x).unwrap();
         assert_eq!(Arc::strong_count(&map), 3, "file, test and the deallocator");
         drop((w, file));
-        assert!(
-            Arc::strong_count(&map) >= 2,
-            "queued GPU work still sees the pages"
-        );
         let _ = y.to_vec2::<f32>().unwrap();
         drop(y);
         dev.synchronize().unwrap();

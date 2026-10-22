@@ -63,8 +63,12 @@ impl GgufFile {
     /// The file cannot be opened or mapped, or its header does not parse.
     pub fn open(path: &Path) -> Result<Self> {
         let f = File::open(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
-        // SAFETY: plank never writes a model file in place; installs replace
-        // it by rename, which leaves this mapping on the old inode.
+        // SAFETY: the mapping assumes nothing truncates or modifies the file
+        // in place while it is mapped: a truncation would SIGBUS on the next
+        // read of a lost page, and an in-place write would change bytes under
+        // a `&[u8]` (and under the GPU). plank never writes a model file in
+        // place; installs replace it by rename, which leaves this mapping on
+        // the old inode.
         let map = unsafe { Mmap::map(&f) }?;
         Self::from_map(map)
     }

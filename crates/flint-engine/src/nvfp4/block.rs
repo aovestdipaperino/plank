@@ -76,8 +76,9 @@ pub fn f32_to_ue4m3(x: f32) -> u8 {
 }
 
 /// Decodes whole blocks into `out`, one value per weight, unscaled by the
-/// tensor scale. `out` must hold `blocks.len() / 36 * 64` values; extra
-/// blocks or values are left alone.
+/// tensor scale. `blocks` must be whole 36-byte blocks and `out` must hold
+/// exactly `blocks.len() / 36 * 64` values; debug builds assert both, and a
+/// release build decodes only as many blocks as both sides cover.
 pub fn dequant_row(blocks: &[u8], out: &mut [f32]) {
     debug_assert_eq!(blocks.len() % BLOCK_BYTES, 0);
     debug_assert_eq!(out.len(), blocks.len() / BLOCK_BYTES * QK);
