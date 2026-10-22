@@ -4,6 +4,7 @@
 //! tested without a model. Everything that touches tensors sits behind the
 //! `candle` feature.
 
+pub mod config;
 #[cfg(feature = "candle")]
 pub mod file;
 pub mod gguf;
