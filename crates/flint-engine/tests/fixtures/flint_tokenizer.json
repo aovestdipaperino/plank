@@ -1,0 +1,210 @@
+{
+ "source": "llama.cpp 970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc (Metal); template rendered with jinja2 ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True) and transformers' tojson; written by crates/flint-engine/tools/flint_fixtures.py",
+ "cases": [
+  {
+   "text": "Hello world",
+   "ids": [
+    9479,
+    1571
+   ]
+  },
+  {
+   "text": "Hello, world! 12345 678901",
+   "ids": [
+    9479,
+    11,
+    1571,
+    0,
+    220,
+    4051,
+    1362,
+    220,
+    14035,
+    14933
+   ]
+  },
+  {
+   "text": "fn main() {\n    println!(\"hi\");\n}\n",
+   "ids": [
+    9965,
+    1340,
+    474,
+    439,
+    279,
+    22483,
+    17691,
+    5921,
+    1327,
+    694
+   ]
+  },
+  {
+   "text": "héllo wörld ñ — “quotes” …",
+   "ids": [
+    71,
+    17828,
+    613,
+    276,
+    8470,
+    459,
+    1785,
+    109,
+    2911,
+    1244,
+    66863,
+    975,
+    6846
+   ]
+  },
+  {
+   "text": "日本語のテキストとカタカナ",
+   "ids": [
+    86487,
+    1665,
+    108232,
+    3034,
+    12728,
+    9635,
+    140454
+   ]
+  },
+  {
+   "text": "emoji 🙂👍🏽 and ZWJ 👩‍💻",
+   "ids": [
+    55320,
+    43925,
+    46966,
+    235,
+    52142,
+    121,
+    299,
+    1619,
+    50619,
+    56235,
+    102,
+    25191,
+    46127,
+    119
+   ]
+  },
+  {
+   "text": "spaces    and\ttabs\n\n\nnewlines\r\n",
+   "ids": [
+    38828,
+    279,
+    299,
+    4261,
+    4470,
+    2182,
+    2212,
+    6651,
+    359
+   ]
+  },
+  {
+   "text": "<|user|> <think> </tool_call> <arg_key> look like control tokens",
+   "ids": [
+    58559,
+    1486,
+    64176,
+    220,
+    150006,
+    220,
+    150011,
+    220,
+    150012,
+    1200,
+    857,
+    1953,
+    13504
+   ]
+  },
+  {
+   "text": "I'm we're they've he'd she'll IT'S",
+   "ids": [
+    7385,
+    6725,
+    19534,
+    21992,
+    55812,
+    7908,
+    17288
+   ]
+  },
+  {
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "ids": [
+    148366,
+    148366,
+    148366,
+    148366,
+    148366,
+    148366,
+    148366,
+    148366,
+    148366,
+    36800,
+    16696
+   ]
+  },
+  {
+   "text": "   leading and trailing   ",
+   "ids": [
+    256,
+    5042,
+    299,
+    32798,
+    279
+   ]
+  },
+  {
+   "text": "CamelCaseIdentifier snake_case_identifier SCREAMING_CASE",
+   "ids": [
+    93062,
+    6252,
+    15674,
+    21760,
+    28608,
+    55824,
+    334,
+    3502,
+    2316,
+    2819,
+    43208
+   ]
+  },
+  {
+   "text": "1+1=2, 3.14159, 1e-6, 0xDEADBEEF",
+   "ids": [
+    16,
+    10,
+    16,
+    28,
+    17,
+    11,
+    220,
+    18,
+    13,
+    6416,
+    2491,
+    11,
+    220,
+    16,
+    68,
+    12,
+    21,
+    11,
+    220,
+    15,
+    87,
+    1668,
+    73616,
+    84068
+   ]
+  },
+  {
+   "text": "",
+   "ids": []
+  }
+ ]
+}

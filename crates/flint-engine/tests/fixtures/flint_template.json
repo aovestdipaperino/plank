@@ -1,0 +1,275 @@
+{
+ "source": "llama.cpp 970b51ce7c9ba5fff0726c5e9994f1c2f0e4eedc (Metal); template rendered with jinja2 ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True) and transformers' tojson; written by crates/flint-engine/tools/flint_fixtures.py",
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about Rust.",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|user|>Write a haiku about Rust.<|assistant|>"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are plank, a coding agent.",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|system|>You are plank, a coding agent.<|user|>What is 2+2?<|assistant|>"
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are plank, a coding agent.",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "List the files in the current directory.",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [
+    "{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}",
+    "{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}"
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|system|>You are plank, a coding agent.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>List the files in the current directory.<|assistant|>"
+  },
+  {
+   "name": "tool_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are plank, a coding agent.",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "How many files are in this directory?",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "I should list the directory.",
+     "tool_calls": [
+      {
+       "name": "bash",
+       "args": [
+        [
+         "command",
+         "ls -1 | wc -l"
+        ],
+        [
+         "timeout",
+         "30"
+        ]
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "7",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [
+    "{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}",
+    "{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}"
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|system|>You are plank, a coding agent.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>How many files are in this directory?<|assistant|><think>I should list the directory.</think><tool_call>bash<arg_key>command</arg_key><arg_value>ls -1 | wc -l</arg_value><arg_key>timeout</arg_key><arg_value>30</arg_value></tool_call><|observation|><tool_response>7</tool_response><|assistant|>"
+  },
+  {
+   "name": "escaping",
+   "messages": [
+    {
+     "role": "system",
+     "content": "S <think>x</think> <|system|>",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "hi <|user|> <think>y</think> <|end_of_text|>\u0000 there",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "assistant",
+     "content": "kept <|user|> verbatim",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "tool",
+     "content": "out <|observation|>",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "rendered": "<|system|>S x &lt;|system|&gt;<|user|>hi &lt;|user|&gt; y &lt;|end_of_text|&gt; there<|assistant|>kept <|user|> verbatim<|observation|><tool_response>out &lt;|observation|&gt;</tool_response>"
+  },
+  {
+   "name": "system_only",
+   "messages": [
+    {
+     "role": "system",
+     "content": "S",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "rendered": "<|system|>S"
+  },
+  {
+   "name": "system_only_tools",
+   "messages": [
+    {
+     "role": "system",
+     "content": "S",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [
+    "{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}",
+    "{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}"
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|system|>S<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|assistant|>"
+  },
+  {
+   "name": "developer",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "D <|developer|>",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "u",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|developer|>D &lt;|developer|&gt;<|user|>u<|assistant|>"
+  },
+  {
+   "name": "multi_tool_results",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are plank, a coding agent.",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "How many files are in this directory?",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "I should list the directory.",
+     "tool_calls": [
+      {
+       "name": "bash",
+       "args": [
+        [
+         "command",
+         "ls -1 | wc -l"
+        ],
+        [
+         "timeout",
+         "30"
+        ]
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "7",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "tool",
+     "content": "second\nresult",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "assistant",
+     "content": "There are 7.",
+     "reasoning": null,
+     "tool_calls": []
+    },
+    {
+     "role": "user",
+     "content": "thanks",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [
+    "{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}",
+    "{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}"
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|system|>You are plank, a coding agent.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"read\", \"description\": \"Read a file from disk.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"File path\"}}, \"required\": [\"path\"]}}{\"name\": \"bash\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}}, \"required\": [\"command\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>How many files are in this directory?<|assistant|><think>I should list the directory.</think><tool_call>bash<arg_key>command</arg_key><arg_value>ls -1 | wc -l</arg_value><arg_key>timeout</arg_key><arg_value>30</arg_value></tool_call><|observation|><tool_response>7</tool_response><|observation|><tool_response>second\nresult</tool_response><|assistant|>There are 7.<|user|>thanks<|assistant|>"
+  },
+  {
+   "name": "code",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Explain what this Rust file does:\n\n```rust\n//! Just enough GGUF v3 to load Flint: every metadata value, the tensor\n//! directory, and where the tensor data starts. Parsing works on a byte\n//! slice, so it is pure; the mapping lives in `file`.\n\nuse std::collections::BTreeMap;\n\nuse crate::{Result, err};\n\npub const GGML_F32: u32 = 0;\npub const GGML_F16: u32 = 1;\npub const GGML_BF16: u32 = 30;\npub const GGML_NVFP4: u32 = 40;\n\n/// GGUF v3's default `general.alignment`.\nconst DEFAULT_ALIGNMENT: u64 = 32;\n/// Arrays of arrays are legal; nothing Flint ships nests deeper than this.\nconst MAX_ARRAY_DEPTH: u32 = 2;\n/// The most array elements reserved before any of them has parsed.\nconst MAX_ARRAY_RESERVE: usize = 65_536;\n\n/// One metadata value.\n#[derive(Debug, Clone, PartialEq)]\npub enum Value {\n    U8(u8),\n    I8(i8),\n    U16(u16),\n    I16(i16),\n    U32(u32),\n    I32(i32),\n    F32(f32),\n    Bool(bool),\n    Str(String),\n    Array(Vec<Value>),\n    U64(u64),\n    I64(i64),\n    F64(f64),\n}\n\nimpl Value {\n    /// The GGUF type id this value is written with.\n    #[must_use]\n    pub fn type_id(&self) -> u32 {\n        match self {\n            Self::U8(_) => 0,\n            Self::I8(_) => 1,\n            Self::U16(_) => 2,\n            Self::I16(_) => 3,\n            Self::U32(_) => 4,\n            Self::I32(_) => 5,\n            Self::F32(_) => 6,\n            Self::Bool(_) => 7,\n            Self::Str(_) => 8,\n            Self::Array(_) => 9,\n            Self::U64(_) => 10,\n            Self::I64(_) => 11,\n            Self::F64(_) => 12,\n        }\n    }\n\n    #[must_use]\n    pub fn as_u32(&self) -> Option<u32> {\n        if let Self::U32(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_f32(&self) -> Option<f32> {\n        if let Self::F32(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_bool(&self) -> Option<bool> {\n        if let Self::Bool(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_str(&self) -> Option<&str> {\n        if let Self::Str(v) = self {\n            Some(v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_array(&self) -> Option<&[Value]> {\n        if let Self::Array(v) = self {\n            Some(v)\n        } else {\n            None\n        }\n    }\n}\n\n/// One entry of the tensor directory.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct TensorInfo {\n    pub name: String,\n    /// `ne0` first: `[cols, rows]` or `[cols, rows, experts]`.\n    pub dims: Vec<u64>,\n    pub ggml_type: u32,\n    /// Absolute file offset of the first byte.\n    pub offset: u64,\n}\n\nimpl TensorInfo {\n    /// Number of values, `None` on overflow.\n    #[must_use]\n    pub fn elements(&self) -> Option<u64> {\n        self.dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d))\n    }\n\n    /// Bytes the tensor's data takes.\n    ///\n    /// # Errors\n    /// A type this crate does not read, an NVFP4 tensor that is not whole\n    /// blocks, or a size that overflows.\n    pub fn byte_len(&self) -> Result<u64> {\n        let n = self\n            .elements()\n            .ok_or_else(|| err(format!(\"tensor {} is too large\", self.name)))?;\n        let bytes = match self.ggml_type {\n            GGML_F32 => n.checked_mul(4),\n            GGML_F16 | GGML_BF16 => n.checked_mul(2),\n            GGML_NVFP4 => {\n                if !n.is_multiple_of(64) {\n                    return Err(err(format!(\n                        \"NVFP4 tensor {} has {n} values, not whole 64-value blocks\",\n                        self.name\n                    )));\n                }\n                (n / 64).checked_mul(36)\n            }\n            t => {\n                return Err(err(format!(\n                    \"tensor {} has ggml type {t}, which flint-engine does not read\",\n                    self.name\n                )));\n            }\n        };\n        bytes.ok_or_else(|| err(format!(\"tensor {} is too large\", self.name)))\n    }\n}\n\n/// A parsed GGUF header.\n#[derive(Debug, Clone, Default)]\npub struct Header {\n    pub metadata: BTreeMap<String, Value>,\n    pub tensors: BTreeMap<String, TensorInfo>,\n    /// First byte of the tensor data: the header end rounded up to\n    /// `general.alignment`.\n    pub data_pos: u64,\n}\n\nimpl Header {\n    /// Parses the header at the start of `bytes`.\n    ///\n    /// # Errors\n    /// Not GGUF, not v3, truncated, an unknown value type, a duplicate\n    /// tensor, or an invalid `general.alignment`.\n    pub fn parse(bytes: &[u8]) -> Result<Self> {\n        let mut c = Cursor { b: bytes, pos: 0 };\n        if c.take(4)? != b\"GGUF\" {\n            return Err(err(\"not a GGUF file\"));\n        }\n        let version = c.u32()?;\n        if version != 3 {\n            return Err(err(format!(\n                \"GGUF version {version} is not supported (only v3)\"\n            )));\n        }\n        let n_tensors = c.u64()?;\n        let n_kv = c.u64()?;\n        let mut metadata = BTreeMap::new();\n        for _ in 0..n_kv {\n            let key = c.string()?;\n            let ty = c.u32()?;\n            let v = c.value(ty, 0)?;\n            metadata.insert(key, v);\n        }\n        let mut infos = Vec::new();\n        for _ in 0..n_tensors {\n            let name = c.string()?;\n            let n_dims = c.u32()?;\n            if n_dims == 0 || n_dims > 4 {\n                return Err(err(format!(\"tensor {name} has {n_dims} dimensions\")));\n            }\n            let mut dims = Vec::new();\n            for _ in 0..n_dims {\n                dims.push(c.u64()?);\n            }\n            let ggml_type = c.u32()?;\n            let rel = c.u64()?;\n            infos.push((name, dims, ggml_type, rel));\n        }\n        let alignment = match metadata.get(\"general.alignment\") {\n            None => DEFAULT_ALIGNMENT,\n            Some(Value::U32(a)) if *a > 0 => u64::from(*a),\n            Some(_) => return Err(err(\"general.alignment must be a positive u32\")),\n        };\n        let header_end = u64::try_from(c.\n```",
+     "reasoning": null,
+     "tool_calls": []
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|user|>Explain what this Rust file does:\n\n```rust\n//! Just enough GGUF v3 to load Flint: every metadata value, the tensor\n//! directory, and where the tensor data starts. Parsing works on a byte\n//! slice, so it is pure; the mapping lives in `file`.\n\nuse std::collections::BTreeMap;\n\nuse crate::{Result, err};\n\npub const GGML_F32: u32 = 0;\npub const GGML_F16: u32 = 1;\npub const GGML_BF16: u32 = 30;\npub const GGML_NVFP4: u32 = 40;\n\n/// GGUF v3's default `general.alignment`.\nconst DEFAULT_ALIGNMENT: u64 = 32;\n/// Arrays of arrays are legal; nothing Flint ships nests deeper than this.\nconst MAX_ARRAY_DEPTH: u32 = 2;\n/// The most array elements reserved before any of them has parsed.\nconst MAX_ARRAY_RESERVE: usize = 65_536;\n\n/// One metadata value.\n#[derive(Debug, Clone, PartialEq)]\npub enum Value {\n    U8(u8),\n    I8(i8),\n    U16(u16),\n    I16(i16),\n    U32(u32),\n    I32(i32),\n    F32(f32),\n    Bool(bool),\n    Str(String),\n    Array(Vec<Value>),\n    U64(u64),\n    I64(i64),\n    F64(f64),\n}\n\nimpl Value {\n    /// The GGUF type id this value is written with.\n    #[must_use]\n    pub fn type_id(&self) -> u32 {\n        match self {\n            Self::U8(_) => 0,\n            Self::I8(_) => 1,\n            Self::U16(_) => 2,\n            Self::I16(_) => 3,\n            Self::U32(_) => 4,\n            Self::I32(_) => 5,\n            Self::F32(_) => 6,\n            Self::Bool(_) => 7,\n            Self::Str(_) => 8,\n            Self::Array(_) => 9,\n            Self::U64(_) => 10,\n            Self::I64(_) => 11,\n            Self::F64(_) => 12,\n        }\n    }\n\n    #[must_use]\n    pub fn as_u32(&self) -> Option<u32> {\n        if let Self::U32(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_f32(&self) -> Option<f32> {\n        if let Self::F32(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_bool(&self) -> Option<bool> {\n        if let Self::Bool(v) = self {\n            Some(*v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_str(&self) -> Option<&str> {\n        if let Self::Str(v) = self {\n            Some(v)\n        } else {\n            None\n        }\n    }\n\n    #[must_use]\n    pub fn as_array(&self) -> Option<&[Value]> {\n        if let Self::Array(v) = self {\n            Some(v)\n        } else {\n            None\n        }\n    }\n}\n\n/// One entry of the tensor directory.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct TensorInfo {\n    pub name: String,\n    /// `ne0` first: `[cols, rows]` or `[cols, rows, experts]`.\n    pub dims: Vec<u64>,\n    pub ggml_type: u32,\n    /// Absolute file offset of the first byte.\n    pub offset: u64,\n}\n\nimpl TensorInfo {\n    /// Number of values, `None` on overflow.\n    #[must_use]\n    pub fn elements(&self) -> Option<u64> {\n        self.dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d))\n    }\n\n    /// Bytes the tensor's data takes.\n    ///\n    /// # Errors\n    /// A type this crate does not read, an NVFP4 tensor that is not whole\n    /// blocks, or a size that overflows.\n    pub fn byte_len(&self) -> Result<u64> {\n        let n = self\n            .elements()\n            .ok_or_else(|| err(format!(\"tensor {} is too large\", self.name)))?;\n        let bytes = match self.ggml_type {\n            GGML_F32 => n.checked_mul(4),\n            GGML_F16 | GGML_BF16 => n.checked_mul(2),\n            GGML_NVFP4 => {\n                if !n.is_multiple_of(64) {\n                    return Err(err(format!(\n                        \"NVFP4 tensor {} has {n} values, not whole 64-value blocks\",\n                        self.name\n                    )));\n                }\n                (n / 64).checked_mul(36)\n            }\n            t => {\n                return Err(err(format!(\n                    \"tensor {} has ggml type {t}, which flint-engine does not read\",\n                    self.name\n                )));\n            }\n        };\n        bytes.ok_or_else(|| err(format!(\"tensor {} is too large\", self.name)))\n    }\n}\n\n/// A parsed GGUF header.\n#[derive(Debug, Clone, Default)]\npub struct Header {\n    pub metadata: BTreeMap<String, Value>,\n    pub tensors: BTreeMap<String, TensorInfo>,\n    /// First byte of the tensor data: the header end rounded up to\n    /// `general.alignment`.\n    pub data_pos: u64,\n}\n\nimpl Header {\n    /// Parses the header at the start of `bytes`.\n    ///\n    /// # Errors\n    /// Not GGUF, not v3, truncated, an unknown value type, a duplicate\n    /// tensor, or an invalid `general.alignment`.\n    pub fn parse(bytes: &[u8]) -> Result<Self> {\n        let mut c = Cursor { b: bytes, pos: 0 };\n        if c.take(4)? != b\"GGUF\" {\n            return Err(err(\"not a GGUF file\"));\n        }\n        let version = c.u32()?;\n        if version != 3 {\n            return Err(err(format!(\n                \"GGUF version {version} is not supported (only v3)\"\n            )));\n        }\n        let n_tensors = c.u64()?;\n        let n_kv = c.u64()?;\n        let mut metadata = BTreeMap::new();\n        for _ in 0..n_kv {\n            let key = c.string()?;\n            let ty = c.u32()?;\n            let v = c.value(ty, 0)?;\n            metadata.insert(key, v);\n        }\n        let mut infos = Vec::new();\n        for _ in 0..n_tensors {\n            let name = c.string()?;\n            let n_dims = c.u32()?;\n            if n_dims == 0 || n_dims > 4 {\n                return Err(err(format!(\"tensor {name} has {n_dims} dimensions\")));\n            }\n            let mut dims = Vec::new();\n            for _ in 0..n_dims {\n                dims.push(c.u64()?);\n            }\n            let ggml_type = c.u32()?;\n            let rel = c.u64()?;\n            infos.push((name, dims, ggml_type, rel));\n        }\n        let alignment = match metadata.get(\"general.alignment\") {\n            None => DEFAULT_ALIGNMENT,\n            Some(Value::U32(a)) if *a > 0 => u64::from(*a),\n            Some(_) => return Err(err(\"general.alignment must be a positive u32\")),\n        };\n        let header_end = u64::try_from(c.\n```<|assistant|>"
+  }
+ ]
+}
