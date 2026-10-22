@@ -15,6 +15,8 @@ pub const GGML_NVFP4: u32 = 40;
 const DEFAULT_ALIGNMENT: u64 = 32;
 /// Arrays of arrays are legal; nothing Flint ships nests deeper than this.
 const MAX_ARRAY_DEPTH: u32 = 2;
+/// The most array elements reserved before any of them has parsed.
+const MAX_ARRAY_RESERVE: usize = 65_536;
 
 /// One metadata value.
 #[derive(Debug, Clone, PartialEq)]
@@ -309,10 +311,13 @@ impl<'a> Cursor<'a> {
                     return Err(err("GGUF arrays nest too deeply"));
                 }
                 let et = self.u32()?;
-                // Every element takes at least one byte, so `len` bounds the
-                // allocation by what is left of the file.
+                // `len` only bounds the count by the bytes left in the file,
+                // and each `Value` is far larger than its encoded byte, so a
+                // corrupt count could still ask for hundreds of GB. Reserve
+                // at most a modest prefix and let the vector grow as
+                // elements actually parse.
                 let n = self.len()?;
-                let mut items = Vec::with_capacity(n);
+                let mut items = Vec::with_capacity(n.min(MAX_ARRAY_RESERVE));
                 for _ in 0..n {
                     items.push(self.value(et, depth + 1)?);
                 }
@@ -429,5 +434,27 @@ mod tests {
         let at = 4 + 4 + 16 + 8 + 1 + 4 + 4;
         b[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(Header::parse(&b).is_err());
+    }
+
+    #[test]
+    fn a_huge_array_count_inside_a_large_buffer_is_truncated_not_preallocated() {
+        let b = Builder::new()
+            .kv("k", &Value::Array(vec![Value::Str(String::new())]))
+            .bytes();
+        // Same layout as above; the count is followed by the first element.
+        let at = 4 + 4 + 16 + 8 + 1 + 4 + 4;
+        let mut b = b[..at + 8].to_vec();
+        // 16 MiB of 0xFF: the count fits in what is left, but the first
+        // string claims u64::MAX bytes, so parsing stops at once. Reserving
+        // the full count up front would ask for 16 Mi values (512 MiB).
+        let tail = 16 << 20;
+        b[at..at + 8].copy_from_slice(&u64::try_from(tail).unwrap().to_le_bytes());
+        b.resize(b.len() + tail, 0xFF);
+        let (res, largest) = crate::testalloc::largest_allocation(|| Header::parse(&b));
+        assert!(res.unwrap_err().0.contains("truncated"));
+        assert!(
+            largest <= MAX_ARRAY_RESERVE * std::mem::size_of::<Value>(),
+            "parsing asked for {largest} bytes at once"
+        );
     }
 }

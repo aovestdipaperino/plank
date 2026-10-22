@@ -3,23 +3,33 @@
 
 use std::sync::Arc;
 
-use candle_core::{CpuStorage, CustomOp1, CustomOp3, Layout, Shape, Tensor, bail};
+use candle_core::{CpuStorage, CustomOp1, CustomOp3, DType, Layout, Shape, Tensor, bail};
 
 use crate::nvfp4::cpu;
 use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 
 /// `x [tokens, cols]` (f32, contiguous) times a dense NVFP4 weight, scaled:
-/// `[tokens, rows]`.
+/// `[tokens, rows]`. Zero tokens give an empty `[0, rows]` without touching
+/// the device.
 ///
 /// # Errors
 /// `x` not `[tokens, cols]` f32 contiguous, a weight with several experts,
 /// or a device failure.
 pub fn matmul(w: &Arc<NvWeight>, x: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = mat_dims(w, x.layout())?;
+    if dims.tokens == 0 {
+        // Nothing to compute: an empty result, without binding or dispatching.
+        if x.dtype() != DType::F32 {
+            bail!("nvfp4 matmul wants f32 input");
+        }
+        return Tensor::zeros((0, w.rows()), DType::F32, x.device());
+    }
     x.apply_op1_no_bwd(&MatmulOp { w: Arc::clone(w) })
 }
 
 /// The gathered `MoE` over `x [tokens, hidden]` with `ids [tokens, k]` (u32)
-/// and `route [tokens, k]` (f32): `[tokens, hidden]`.
+/// and `route [tokens, k]` (f32): `[tokens, hidden]`. With no tokens or no
+/// experts per token (`k == 0`) the result is zeros, computed on no device.
 ///
 /// # Errors
 /// Shapes or dtypes that do not match, an id past the last expert (checked
@@ -31,6 +41,15 @@ pub fn moe(
     ids: &Tensor,
     route: &Tensor,
 ) -> candle_core::Result<Tensor> {
+    let dims = moe_dims(m, x.layout(), ids.layout(), route.layout())?;
+    if dims.tokens == 0 || dims.k_used == 0 {
+        // No slots: every output row is an empty sum, so zero, without
+        // binding or dispatching.
+        if x.dtype() != DType::F32 || ids.dtype() != DType::U32 || route.dtype() != DType::F32 {
+            bail!("moe wants f32 x, u32 ids and f32 route");
+        }
+        return Tensor::zeros((dims.tokens, m.hidden()), DType::F32, x.device());
+    }
     x.apply_op3_no_bwd(ids, route, &MoeOp { m: m.clone() })
 }
 
@@ -283,6 +302,57 @@ mod tests {
         let ids = Tensor::zeros((1, 2), candle_core::DType::U32, &dev).unwrap();
         let r = Tensor::zeros((2, 2), candle_core::DType::F32, &dev).unwrap();
         assert!(moe(&m, &x, &ids, &r).is_err(), "ids rows != tokens");
+    }
+
+    /// Zero tokens, and zero experts per token, on `dev`: empty or zero
+    /// outputs of the right shape, on the input's device.
+    fn zero_size_case(dev: &Device) {
+        let mut rng = Rng::new(14);
+        let w = Arc::new(weight(&mut rng, 64, 5, 1));
+        let x = Tensor::zeros((0, 64), candle_core::DType::F32, dev).unwrap();
+        let y = matmul(&w, &x).unwrap();
+        assert_eq!(y.dims(), &[0, 5]);
+        assert!(y.device().same_device(dev));
+        let wide = Tensor::zeros((0, 128), candle_core::DType::F32, dev).unwrap();
+        assert!(matmul(&w, &wide).is_err(), "still checks the width");
+
+        let m = experts(&mut rng, 64, 64, 2);
+        let f32z = |s: (usize, usize)| Tensor::zeros(s, candle_core::DType::F32, dev).unwrap();
+        let u32z = |s: (usize, usize)| Tensor::zeros(s, candle_core::DType::U32, dev).unwrap();
+        let y = moe(&m, &f32z((0, 64)), &u32z((0, 6)), &f32z((0, 6))).unwrap();
+        assert_eq!(y.dims(), &[0, 64]);
+        let x = Tensor::from_vec(rng.vec(3 * 64), (3, 64), dev).unwrap();
+        let y = moe(&m, &x, &u32z((3, 0)), &f32z((3, 0))).unwrap();
+        assert_eq!(y.dims(), &[3, 64]);
+        assert!(y.device().same_device(dev));
+        let got: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(got.iter().all(|v| *v == 0.0), "no experts, no output");
+    }
+
+    #[test]
+    fn zero_size_inputs_on_cpu() {
+        zero_size_case(&Device::Cpu);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zero_size_inputs_on_metal() {
+        let Some(dev) = metal() else { return };
+        zero_size_case(&dev);
+        // Nothing was dispatched, so nothing was bound either.
+        let mut rng = Rng::new(15);
+        let w = Arc::new(weight(&mut rng, 64, 5, 1));
+        let x = Tensor::zeros((0, 64), candle_core::DType::F32, &dev).unwrap();
+        matmul(&w, &x).unwrap();
+        assert!(w.metal.lock().unwrap().is_none(), "matmul bound the weight");
+        let m = experts(&mut rng, 64, 64, 2);
+        let x = Tensor::zeros((2, 64), candle_core::DType::F32, &dev).unwrap();
+        let none = Tensor::zeros((2, 0), candle_core::DType::U32, &dev).unwrap();
+        let route = Tensor::zeros((2, 0), candle_core::DType::F32, &dev).unwrap();
+        moe(&m, &x, &none, &route).unwrap();
+        for p in [m.gate(), m.up(), m.down()] {
+            assert!(p.metal.lock().unwrap().is_none(), "moe bound an expert");
+        }
     }
 
     #[cfg(target_os = "macos")]

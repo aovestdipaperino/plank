@@ -158,6 +158,8 @@ impl NvWeight {
     }
 
     /// The mapping and offset this weight borrows, when it comes from a file.
+    /// Only the Metal binding needs it.
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn mapping(&self) -> Option<(&Arc<MappedFile>, usize)> {
         match &self.bytes {
             Bytes::Owned(_) => None,
@@ -197,9 +199,9 @@ fn check(cols: usize, rows: usize, experts: usize, len: usize, scales: &[f32]) -
 /// `[experts, ffn, hidden]`, down is `[experts, hidden, ffn]`.
 #[derive(Debug, Clone)]
 pub struct MoeExperts {
-    pub gate: Arc<NvWeight>,
-    pub up: Arc<NvWeight>,
-    pub down: Arc<NvWeight>,
+    gate: Arc<NvWeight>,
+    up: Arc<NvWeight>,
+    down: Arc<NvWeight>,
 }
 
 impl MoeExperts {
@@ -225,6 +227,24 @@ impl MoeExperts {
             )));
         }
         Ok(Self { gate, up, down })
+    }
+
+    /// The gate projection, `[experts, ffn, hidden]`.
+    #[must_use]
+    pub fn gate(&self) -> &Arc<NvWeight> {
+        &self.gate
+    }
+
+    /// The up projection, `[experts, ffn, hidden]`.
+    #[must_use]
+    pub fn up(&self) -> &Arc<NvWeight> {
+        &self.up
+    }
+
+    /// The down projection, `[experts, hidden, ffn]`.
+    #[must_use]
+    pub fn down(&self) -> &Arc<NvWeight> {
+        &self.down
     }
 
     /// Model width (`d`).
@@ -262,5 +282,14 @@ mod tests {
         assert!(MoeExperts::new(w(128, 64, 4), w(128, 64, 3), w(64, 128, 4)).is_err());
         assert!(MoeExperts::new(w(128, 64, 4), w(128, 64, 4), w(128, 64, 4)).is_err());
         assert!(MoeExperts::new(w(128, 64, 4), w(128, 128, 4), w(64, 128, 4)).is_err());
+    }
+
+    #[test]
+    fn moe_experts_hands_back_the_tensors_it_was_built_from() {
+        let (g, u, d) = (w(128, 64, 4), w(128, 64, 4), w(64, 128, 4));
+        let m = MoeExperts::new(Arc::clone(&g), Arc::clone(&u), Arc::clone(&d)).unwrap();
+        assert!(Arc::ptr_eq(m.gate(), &g));
+        assert!(Arc::ptr_eq(m.up(), &u));
+        assert!(Arc::ptr_eq(m.down(), &d));
     }
 }

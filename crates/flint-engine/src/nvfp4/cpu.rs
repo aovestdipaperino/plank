@@ -79,15 +79,15 @@ pub fn moe(
         let xt = &x[t * d..(t + 1) * d];
         for j in 0..k_used {
             let e = ids[t * k_used + j] as usize;
-            let (gs, us, ds) = (m.gate.scale(e), m.up.scale(e), m.down.scale(e));
+            let (gs, us, ds) = (m.gate().scale(e), m.up().scale(e), m.down().scale(e));
             h.par_iter_mut().enumerate().for_each(|(r, hv)| {
-                let g = gs * dot_row(m.gate.row(e, r), xt);
-                let u = us * dot_row(m.up.row(e, r), xt);
+                let g = gs * dot_row(m.gate().row(e, r), xt);
+                let u = us * dot_row(m.up().row(e, r), xt);
                 *hv = silu(g) * u;
             });
             out.par_iter_mut()
                 .enumerate()
-                .for_each(|(r, o)| *o = ds * dot_row(m.down.row(e, r), &h));
+                .for_each(|(r, o)| *o = ds * dot_row(m.down().row(e, r), &h));
             let rw = route[t * k_used + j];
             for (acc, v) in y[t * d..(t + 1) * d].iter_mut().zip(&out) {
                 *acc += rw * v;

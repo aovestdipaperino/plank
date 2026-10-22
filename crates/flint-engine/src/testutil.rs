@@ -96,10 +96,10 @@ pub(crate) fn naive_moe(
         let xt = &x[t * d..(t + 1) * d];
         for j in 0..k_used {
             let e = ids[t * k_used + j] as usize;
-            let g = naive_matmul(&m.gate, e, xt, 1);
-            let u = naive_matmul(&m.up, e, xt, 1);
+            let g = naive_matmul(m.gate(), e, xt, 1);
+            let u = naive_matmul(m.up(), e, xt, 1);
             let h: Vec<f32> = g.iter().zip(&u).map(|(g, u)| silu(*g) * u).collect();
-            let o = naive_matmul(&m.down, e, &h, 1);
+            let o = naive_matmul(m.down(), e, &h, 1);
             for (acc, v) in y[t * d..(t + 1) * d].iter_mut().zip(&o) {
                 *acc += route[t * k_used + j] * v;
             }

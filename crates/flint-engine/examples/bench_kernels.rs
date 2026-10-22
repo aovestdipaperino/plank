@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xm = Tensor::ones((1, m.hidden()), DType::F32, &dev)?;
     let ids = Tensor::new(&[[3u32, 17, 42, 99, 128, 250]], &dev)?;
     let route = Tensor::new(&[[0.3f32, 0.2, 0.2, 0.1, 0.1, 0.1]], &dev)?;
-    let moe_bytes = 6 * (m.gate.expert_bytes() + m.up.expert_bytes() + m.down.expert_bytes());
+    let moe_bytes = 6 * (m.gate().expert_bytes() + m.up().expert_bytes() + m.down().expert_bytes());
     bench("moe decode (6 experts)", moe_bytes, 200, &dev, || {
         ops::moe(&m, &xm, &ids, &route).map(drop)
     })?;

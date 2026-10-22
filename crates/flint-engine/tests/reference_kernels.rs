@@ -162,10 +162,10 @@ fn cpu_moe_matches_a_hand_composed_layer() {
     let mut want = vec![0f32; 2048];
     for (slot, &e) in ids.iter().enumerate() {
         let e = e as usize;
-        let gate = matvec(&m.gate.dequant(e), m.gate.cols(), &x);
-        let up = matvec(&m.up.dequant(e), m.up.cols(), &x);
+        let gate = matvec(&m.gate().dequant(e), m.gate().cols(), &x);
+        let up = matvec(&m.up().dequant(e), m.up().cols(), &x);
         let hid: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-        let down = matvec(&m.down.dequant(e), m.down.cols(), &hid);
+        let down = matvec(&m.down().dequant(e), m.down().cols(), &hid);
         for (acc, v) in want.iter_mut().zip(&down) {
             *acc += route[slot] * v;
         }

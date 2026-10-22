@@ -285,9 +285,9 @@ pub(crate) fn moe(
     }
     let dev = x.device();
     let pipes = pipelines(dev)?;
-    let (gate, gate_off, gate_scales) = binding(dev, &m.gate)?;
-    let (up, up_off, up_scales) = binding(dev, &m.up)?;
-    let (down, down_off, down_scales) = binding(dev, &m.down)?;
+    let (gate, gate_off, gate_scales) = binding(dev, m.gate())?;
+    let (up, up_off, up_scales) = binding(dev, m.up())?;
+    let (down, down_off, down_scales) = binding(dev, m.down())?;
     let (tokens, hidden, ffn) = (dims.tokens, m.hidden(), m.ffn());
     let slots = tokens * dims.k_used;
     let params = MoeParams {
@@ -296,10 +296,10 @@ pub(crate) fn moe(
         slots: u32_of(slots)?,
         k_used: u32_of(dims.k_used)?,
         experts: u32_of(m.count())?,
-        gu_row_bytes: u32_of(m.gate.row_bytes())?,
-        gu_expert_bytes: u32_of(m.gate.expert_bytes())?,
-        down_row_bytes: u32_of(m.down.row_bytes())?,
-        down_expert_bytes: u32_of(m.down.expert_bytes())?,
+        gu_row_bytes: u32_of(m.gate().row_bytes())?,
+        gu_expert_bytes: u32_of(m.gate().expert_bytes())?,
+        down_row_bytes: u32_of(m.down().row_bytes())?,
+        down_expert_bytes: u32_of(m.down().expert_bytes())?,
     };
     let h = dev.new_buffer(slots * ffn, DType::F32, "nvfp4_moe_h")?;
     let ys = dev.new_buffer(slots * hidden, DType::F32, "nvfp4_moe_ys")?;

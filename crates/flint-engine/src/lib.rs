@@ -8,6 +8,8 @@
 pub mod file;
 pub mod gguf;
 pub mod nvfp4;
+#[cfg(test)]
+mod testalloc;
 #[cfg(any(test, feature = "testgguf"))]
 pub mod testgguf;
 #[cfg(all(test, feature = "candle"))]
