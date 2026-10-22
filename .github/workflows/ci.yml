@@ -106,6 +106,17 @@ jobs:
       - name: Test the local inference crate
         run: cargo test --release -p local-inference-engine
 
+      # Also a workspace member the steps above miss, and its kernels sit
+      # behind the `candle` feature, which neither the default clippy run nor
+      # the pre-commit hook enables. The Metal tests skip themselves when the
+      # runner has no GPU; the real-GGUF checks live in tests/ and need the
+      # model, so `--lib` leaves them out.
+      - name: Lint the Flint engine crate
+        run: cargo clippy -p flint-engine --all-targets --features candle -- -D warnings
+
+      - name: Test the Flint engine crate
+        run: cargo test --release -p flint-engine --features candle --lib
+
   # `plugins` is on by default now, so the default job above covers it. This
   # job guards the other direction: the lean build, without the WASM host. That
   # configuration is the one that can rot unnoticed — every `#[cfg(feature =
