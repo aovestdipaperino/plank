@@ -10,10 +10,13 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use block2::RcBlock;
 use candle_core::backend::BackendStorage;
 use candle_core::{DType, MetalDevice, MetalStorage, Shape};
-use candle_metal_kernels::metal::{Buffer, ComputePipeline};
-use objc2_metal::{MTLDevice, MTLResourceOptions, MTLSize};
+use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
 
 use crate::file::MappedFile;
 use crate::nvfp4::ops::MatDims;
@@ -28,8 +31,11 @@ pub(crate) const MM_MIN_TOKENS: usize = 8;
 const MV_ROWS_PER_TG: usize = 8;
 /// `32 * MV_SG_PER_TG`.
 const MV_THREADS: usize = 64;
+/// The simdgroup width every kernel assumes.
+const SIMD_WIDTH: usize = 32;
 
 /// The compiled kernels of one device.
+#[derive(Debug)]
 pub(crate) struct Pipelines {
     pub mv: ComputePipeline,
 }
@@ -40,22 +46,34 @@ fn metal_err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::msg(format!("nvfp4 metal: {e}"))
 }
 
-/// The kernels for `dev`, compiled on first use.
+/// The kernels for `dev`, compiled on first use. Compiler and pipeline
+/// failures come back as errors (never a panic, which would also poison the
+/// cache lock).
 pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>> {
     let id = dev.device().registry_id();
     let mut cache = PIPELINES.lock().map_err(metal_err)?;
     if let Some((_, p)) = cache.iter().find(|(i, _)| *i == id) {
         return Ok(Arc::clone(p));
     }
-    let lib = dev
-        .device()
-        .new_library_with_source(SOURCE, None)
-        .map_err(metal_err)?;
+    let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
+    let lib = raw
+        .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
+        .map_err(|e| metal_err(format!("nvfp4.metal does not compile: {e}")))?;
+    let lib = Library::new(lib);
     let get = |name: &str| -> candle_core::Result<ComputePipeline> {
         let f = lib.get_function(name, None).map_err(metal_err)?;
-        dev.device()
-            .new_compute_pipeline_state_with_function(&f)
-            .map_err(metal_err)
+        let pipe = raw
+            .newComputePipelineStateWithFunction_error(f.as_ref())
+            .map_err(|e| metal_err(format!("{name}: {e}")))?;
+        // The kernels reduce with `simd_sum` over 32 lanes and size their
+        // threadgroups in multiples of 32.
+        let width = pipe.threadExecutionWidth();
+        if width != SIMD_WIDTH {
+            return Err(metal_err(format!(
+                "{name}: simdgroups are {width} wide, the kernels need {SIMD_WIDTH}"
+            )));
+        }
+        Ok(ComputePipeline::new(pipe))
     };
     let p = Arc::new(Pipelines {
         mv: get("mv_nvfp4")?,
@@ -93,22 +111,31 @@ fn no_copy(dev: &MetalDevice, file: &MappedFile) -> Option<Arc<Buffer>> {
     let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
     // The mapping is page-aligned and extends to the end of its last page.
     let len = bytes.len().div_ceil(page) * page;
-    let raw: &objc2::runtime::ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
+    let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
     if len > raw.maxBufferLength() {
         return None;
     }
     let ptr = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())?;
-    // SAFETY: `ptr..ptr+len` is the page-rounded mapping, which outlives the
-    // buffer: `MappedFile` drops its `metal` slot before its `map`, and each
-    // `NvWeight` drops its binding (a clone of this buffer) before the
-    // `Arc<MappedFile>` it holds. No deallocator, so Metal never frees the
-    // mapping.
+    // The deallocator owns a clone of the mapping. Metal keeps the block
+    // until it frees the buffer, which is after every command buffer that
+    // retained the buffer has completed, so the pages stay mapped for as
+    // long as the GPU can read them, however early the file is dropped.
+    let keep = Arc::clone(file.map());
+    let release = RcBlock::new(move |_: NonNull<c_void>, _: usize| {
+        let _ = &keep;
+    });
+    // SAFETY: `ptr..ptr+len` is the page-aligned mapping rounded up to its
+    // last page, all of it mapped and read-only for the mapping's lifetime.
+    // That lifetime covers the buffer's: the deallocator block above holds an
+    // `Arc` of the `Mmap`, released only when Metal frees the buffer. Metal
+    // never writes the memory (no kernel binds a weight for writing) and the
+    // deallocator does not free it, the `Mmap` drop does.
     let raw_buf = unsafe {
         raw.newBufferWithBytesNoCopy_length_options_deallocator(
             ptr,
             len,
             MTLResourceOptions::StorageModeShared,
-            None,
+            Some(&release),
         )
     }?;
     Some(Arc::new(Buffer::new(raw_buf)))

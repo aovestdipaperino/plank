@@ -17,6 +17,8 @@ candle = [
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
     "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:block2",
     "dep:libc",
 ]
 testgguf = ["candle"]
@@ -31,6 +33,8 @@ candle-core = { version = "0.9", optional = true, features = ["metal"] }
 candle-metal-kernels = { version = "0.9", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
 libc = { version = "0.2", optional = true }
 
 [lints]

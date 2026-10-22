@@ -2189,11 +2189,13 @@ dependencies = [
 name = "flint-engine"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "candle-core",
  "candle-metal-kernels",
  "libc",
  "memmap2",
  "objc2",
+ "objc2-foundation",
  "objc2-metal",
  "rayon",
 ]

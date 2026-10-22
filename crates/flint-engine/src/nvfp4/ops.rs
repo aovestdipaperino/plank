@@ -341,4 +341,97 @@ mod tests {
             "the mapping became one no-copy buffer"
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_decodes_edge_case_scales_like_the_cpu() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(31);
+        // Zero, the 0x7F NaN code (decodes to 0), a subnormal, and bit 7 set
+        // (ignored), in every sub-block position across the rows.
+        let edge = [0x00u8, 0x7F, 0x03, 0xB8];
+        let rows = 4;
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for s in 0..4 {
+                data.push(edge[(r + s) % 4]);
+            }
+            data.extend((0..32).map(|_| u8::try_from(rng.below(256)).unwrap()));
+        }
+        let w = Arc::new(NvWeight::owned(64, rows, 1, data, vec![1.25]).unwrap());
+        let xv = rng.vec(2 * 64);
+        let cpu = matmul(
+            &w,
+            &Tensor::from_vec(xv.clone(), (2, 64), &Device::Cpu).unwrap(),
+        )
+        .unwrap();
+        let gpu = matmul(&w, &Tensor::from_vec(xv.clone(), (2, 64), &dev).unwrap()).unwrap();
+        let want: Vec<f32> = cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = gpu.flatten_all().unwrap().to_vec1().unwrap();
+        assert_close(&got, &want, 1e-5);
+        assert_close(&got, &naive_matmul(&w, 0, &xv, 2), 1e-5);
+        assert!(
+            want.iter().any(|v| *v != 0.0),
+            "the subnormal and 0xB8 scales contribute"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_matmul_reads_a_narrowed_input_at_its_offset() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(32);
+        let w = Arc::new(weight(&mut rng, 192, 11, 1));
+        let xv = rng.vec(5 * 192);
+        let x = Tensor::from_vec(xv.clone(), (5, 192), &dev)
+            .unwrap()
+            .narrow(0, 2, 3)
+            .unwrap();
+        let got: Vec<f32> = matmul(&w, &x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_close(&got, &naive_matmul(&w, 0, &xv[2 * 192..], 3), 1e-3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_no_copy_buffer_keeps_the_mapping_alive_until_metal_frees_it() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(33);
+        let src = weight(&mut rng, 64, 2, 1);
+        let bytes = crate::testgguf::Builder::new()
+            .tensor("w.weight", &[64, 2], crate::gguf::GGML_NVFP4, src.bytes())
+            .tensor(
+                "w.scale",
+                &[1],
+                crate::gguf::GGML_F32,
+                &src.scale(0).to_le_bytes(),
+            )
+            .bytes();
+        let file = crate::file::GgufFile::from_bytes(&bytes).unwrap();
+        let map = Arc::clone(file.mapped_file().map());
+        let w = Arc::new(file.nv_weight("w").unwrap());
+        let x = Tensor::from_vec(rng.vec(64), (1, 64), &dev).unwrap();
+        let y = matmul(&w, &x).unwrap();
+        assert_eq!(Arc::strong_count(&map), 3, "file, test and the deallocator");
+        drop((w, file));
+        assert!(
+            Arc::strong_count(&map) >= 2,
+            "queued GPU work still sees the pages"
+        );
+        let _ = y.to_vec2::<f32>().unwrap();
+        drop(y);
+        dev.synchronize().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&map) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Metal never released the mapping"
+            );
+            std::thread::yield_now();
+        }
+    }
 }

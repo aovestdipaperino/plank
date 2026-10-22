@@ -17,11 +17,12 @@ use crate::{Result, err};
 pub struct MappedFile {
     /// On macOS, one no-copy Metal buffer over the whole mapping, built on
     /// first use: outer `None` until tried, `Some(None)` when Metal refused.
-    /// Declared before `map` so it is dropped first, since it points into it.
+    /// Declared before `map` so it is dropped first; the buffer itself also
+    /// owns a clone of `map`, so the mapping outlives any GPU use of it.
     #[cfg(target_os = "macos")]
     #[allow(clippy::option_option)] // outer None = untried, Some(None) = refused
     pub(crate) metal: Mutex<Option<Option<Arc<candle_metal_kernels::metal::Buffer>>>>,
-    map: Mmap,
+    map: Arc<Mmap>,
 }
 
 impl MappedFile {
@@ -29,13 +30,19 @@ impl MappedFile {
         Self {
             #[cfg(target_os = "macos")]
             metal: Mutex::new(None),
-            map,
+            map: Arc::new(map),
         }
     }
 
     /// The whole file.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
+        &self.map
+    }
+
+    /// The shared mapping, for a no-copy GPU buffer to keep alive.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn map(&self) -> &Arc<Mmap> {
         &self.map
     }
 }
