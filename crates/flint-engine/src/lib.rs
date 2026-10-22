@@ -16,6 +16,8 @@ mod testalloc;
 pub mod testgguf;
 #[cfg(all(test, feature = "candle"))]
 mod testutil;
+#[cfg(feature = "candle")]
+pub mod tokenizer;
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
