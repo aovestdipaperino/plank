@@ -1,0 +1,573 @@
+//! The Flint model: loading every tensor from a mapped GGUF, and one forward
+//! pass over a prefix-truncatable KV cache (`llama_model_flint::graph`).
+//!
+//! The hidden state is `[t, hidden]` f32 throughout. Each layer adds
+//! attention over `rmsnorm(h, attn_norm)`, then the FFN over
+//! `rmsnorm(h, ffn_norm)`: a dense `SwiGLU` on the leading layers, the routed
+//! experts plus the shared expert on the rest. The head runs on the last
+//! position only. The embedding is gathered from the mapped BF16 rows on
+//! the CPU, so it never occupies device memory.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use candle_core::{Device, Tensor};
+use gemma_engine::kv::KvCache;
+use gemma_engine::session::SessionModel;
+use sha2::{Digest, Sha256};
+
+use crate::attention::{Attention, causal_mask};
+use crate::config::FlintConfig;
+use crate::ffn::{Dense, Moe};
+use crate::file::GgufFile;
+use crate::gguf::{GGML_BF16, Header};
+use crate::nvfp4::ops;
+use crate::nvfp4::tensor::{MoeExperts, NvWeight};
+use crate::rope::Rope;
+use crate::{Result, err};
+
+#[derive(Debug)]
+enum Ffn {
+    Dense(Dense),
+    Moe(Moe),
+}
+
+#[derive(Debug)]
+struct Layer {
+    attn_norm: Tensor,
+    attn: Attention,
+    ffn_norm: Tensor,
+    ffn: Ffn,
+}
+
+/// A loaded Flint model.
+#[derive(Debug)]
+pub struct Model {
+    config: FlintConfig,
+    file: GgufFile,
+    /// Byte range of `token_embd.weight` in the mapping.
+    embd: (usize, usize),
+    vocab: usize,
+    layers: Vec<Layer>,
+    output_norm: Tensor,
+    output: Arc<NvWeight>,
+    rope: Rope,
+    device: Device,
+    context_length: usize,
+    signature: [u8; 32],
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// SHA-256 over the file's shape: every metadata key with its value's
+/// debug form, and every tensor's name, shape and type. Never the weights.
+fn signature(h: &Header) -> [u8; 32] {
+    let mut s = Sha256::new();
+    s.update(b"flint-engine model v1\n");
+    for (k, v) in &h.metadata {
+        if k.starts_with("tokenizer.") {
+            continue;
+        }
+        s.update(format!("{k}={v:?}\n").as_bytes());
+    }
+    for (name, t) in &h.tensors {
+        s.update(format!("{name} {:?} {}\n", t.dims, t.ggml_type).as_bytes());
+    }
+    s.finalize().into()
+}
+
+struct Loader<'a> {
+    file: &'a GgufFile,
+    device: &'a Device,
+}
+
+impl Loader<'_> {
+    fn f32s(&self, name: &str, len: usize) -> Result<Tensor> {
+        let v = self.file.f32_tensor(name)?;
+        if v.len() != len {
+            return Err(err(format!("{name} holds {} values, want {len}", v.len())));
+        }
+        Ok(Tensor::from_vec(v, len, self.device)?)
+    }
+
+    fn bf16_matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Tensor> {
+        let t = self.file.header.tensor(name)?;
+        if t.ggml_type != GGML_BF16 || t.dims != [cols as u64, rows as u64] {
+            return Err(err(format!(
+                "{name} is {:?} type {}, want BF16 [{cols}, {rows}]",
+                t.dims, t.ggml_type
+            )));
+        }
+        let v: Vec<f32> = self
+            .file
+            .tensor_bytes(name)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
+            .collect();
+        Ok(Tensor::from_vec(v, (rows, cols), self.device)?)
+    }
+
+    fn nv(&self, prefix: &str, cols: usize, rows: usize, experts: usize) -> Result<Arc<NvWeight>> {
+        let w = self.file.nv_weight(prefix)?;
+        if (w.cols(), w.rows(), w.experts()) != (cols, rows, experts) {
+            return Err(err(format!(
+                "{prefix} is [{}, {}, {}], want [{cols}, {rows}, {experts}]",
+                w.cols(),
+                w.rows(),
+                w.experts()
+            )));
+        }
+        Ok(Arc::new(w))
+    }
+
+    fn dense(&self, p: &str, suffix: &str, hidden: usize, ffn: usize) -> Result<Dense> {
+        Ok(Dense {
+            gate: self.nv(&format!("{p}.ffn_gate{suffix}"), hidden, ffn, 1)?,
+            up: self.nv(&format!("{p}.ffn_up{suffix}"), hidden, ffn, 1)?,
+            down: self.nv(&format!("{p}.ffn_down{suffix}"), ffn, hidden, 1)?,
+        })
+    }
+
+    fn layer(&self, c: &FlintConfig, l: usize) -> Result<Layer> {
+        let p = format!("blk.{l}");
+        let (qd, kd) = (c.heads * c.head_dim, c.kv_heads * c.head_dim);
+        let attn = Attention {
+            q: self.nv(&format!("{p}.attn_q"), c.hidden, qd, 1)?,
+            k: self.nv(&format!("{p}.attn_k"), c.hidden, kd, 1)?,
+            v: self.nv(&format!("{p}.attn_v"), c.hidden, kd, 1)?,
+            o: self.nv(&format!("{p}.attn_output"), qd, c.hidden, 1)?,
+            q_norm: self.f32s(&format!("{p}.attn_q_norm.weight"), c.head_dim)?,
+            k_norm: self.f32s(&format!("{p}.attn_k_norm.weight"), c.head_dim)?,
+            sinks: self.f32s(&format!("{p}.attn_sinks.weight"), c.heads)?,
+            heads: c.heads,
+            kv_heads: c.kv_heads,
+            head_dim: c.head_dim,
+            window: c.window(l),
+            rope: c.rope[l],
+            eps: c.rms_eps,
+        };
+        let ffn = if c.is_moe(l) {
+            let experts = MoeExperts::new(
+                self.nv(
+                    &format!("{p}.ffn_gate_exps"),
+                    c.hidden,
+                    c.expert_ffn,
+                    c.experts,
+                )?,
+                self.nv(
+                    &format!("{p}.ffn_up_exps"),
+                    c.hidden,
+                    c.expert_ffn,
+                    c.experts,
+                )?,
+                self.nv(
+                    &format!("{p}.ffn_down_exps"),
+                    c.expert_ffn,
+                    c.hidden,
+                    c.experts,
+                )?,
+            )?;
+            Ffn::Moe(Moe {
+                router: self.bf16_matrix(
+                    &format!("{p}.ffn_gate_inp.weight"),
+                    c.experts,
+                    c.hidden,
+                )?,
+                experts,
+                shared: self.dense(&p, "_shexp", c.hidden, c.shared_ffn)?,
+                k: c.experts_used,
+                norm: c.weights_norm,
+                scale: c.weights_scale,
+            })
+        } else {
+            Ffn::Dense(self.dense(&p, "", c.hidden, c.ffn)?)
+        };
+        Ok(Layer {
+            attn_norm: self.f32s(&format!("{p}.attn_norm.weight"), c.hidden)?,
+            attn,
+            ffn_norm: self.f32s(&format!("{p}.ffn_norm.weight"), c.hidden)?,
+            ffn,
+        })
+    }
+}
+
+impl Model {
+    /// Opens the GGUF at `path` with its full context.
+    ///
+    /// # Errors
+    /// As [`Self::from_file`], or the file cannot be mapped.
+    pub fn open(path: &Path, device: &Device) -> Result<Arc<Self>> {
+        Self::open_with_ctx(path, device, usize::MAX)
+    }
+
+    /// Opens the GGUF at `path`, attending over at most `ctx_cap` positions.
+    ///
+    /// # Errors
+    /// As [`Self::from_file`], or the file cannot be mapped.
+    pub fn open_with_ctx(path: &Path, device: &Device, ctx_cap: usize) -> Result<Arc<Self>> {
+        Self::from_file(GgufFile::open(path)?, device, ctx_cap)
+    }
+
+    /// Loads every tensor of an already mapped file.
+    ///
+    /// # Errors
+    /// A config [`FlintConfig::from_header`] refuses, a missing tensor, or a
+    /// tensor whose type or shape is not the one Flint has.
+    pub fn from_file(file: GgufFile, device: &Device, ctx_cap: usize) -> Result<Arc<Self>> {
+        let config = FlintConfig::from_header(&file.header)?;
+        let embd = file.header.tensor("token_embd.weight")?;
+        let [cols, rows] = embd.dims[..] else {
+            return Err(err(format!("token_embd.weight has shape {:?}", embd.dims)));
+        };
+        if embd.ggml_type != GGML_BF16 || cols != config.hidden as u64 {
+            return Err(err(format!(
+                "token_embd.weight is type {} [{cols}, {rows}]",
+                embd.ggml_type
+            )));
+        }
+        let vocab = usize::try_from(rows).map_err(|_| err("vocab too large"))?;
+        let start = usize::try_from(embd.offset).map_err(|_| err("embedding offset too large"))?;
+        let embd = (start, start + file.tensor_bytes("token_embd.weight")?.len());
+        let loader = Loader {
+            file: &file,
+            device,
+        };
+        let layers = (0..config.layers)
+            .map(|l| loader.layer(&config, l))
+            .collect::<Result<Vec<_>>>()?;
+        let output_norm = loader.f32s("output_norm.weight", config.hidden)?;
+        let output = loader.nv("output", config.hidden, vocab, 1)?;
+        let context_length = config.context_length.min(ctx_cap);
+        let rope = Rope::new(config.head_dim, config.rope_base, context_length, device)?;
+        let signature = signature(&file.header);
+        Ok(Arc::new(Self {
+            config,
+            file,
+            embd,
+            vocab,
+            layers,
+            output_norm,
+            output,
+            rope,
+            device: device.clone(),
+            context_length,
+            signature,
+        }))
+    }
+
+    /// The hyperparameters read from the GGUF metadata.
+    #[must_use]
+    pub fn config(&self) -> &FlintConfig {
+        &self.config
+    }
+
+    /// The header, for building the tokenizer from the same file.
+    #[must_use]
+    pub fn header(&self) -> &Header {
+        &self.file.header
+    }
+
+    /// Rows in the token embedding: the vocab size.
+    #[must_use]
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Positions the model can attend over: the file's context length,
+    /// capped at open.
+    #[must_use]
+    pub fn context_length(&self) -> usize {
+        self.context_length
+    }
+
+    /// SHA-256 over the file's metadata and tensor shapes, never its
+    /// weights: what a snapshot must match to be restored.
+    #[must_use]
+    pub fn signature(&self) -> [u8; 32] {
+        self.signature
+    }
+
+    /// `(kv_heads, head_dim)` per layer: every Flint layer owns its KV.
+    #[must_use]
+    pub fn kv_shape(&self) -> Vec<(usize, usize)> {
+        vec![(self.config.kv_heads, self.config.head_dim); self.config.layers]
+    }
+
+    /// Each layer's sliding window, `None` for a global layer.
+    #[must_use]
+    pub fn kv_windows(&self) -> Vec<Option<usize>> {
+        (0..self.config.layers)
+            .map(|l| self.config.window(l))
+            .collect()
+    }
+
+    /// Bytes one position adds to the cache: K and V, f32, every layer.
+    #[must_use]
+    pub fn kv_bytes_per_token(&self) -> usize {
+        self.config.layers * 2 * self.config.kv_heads * self.config.head_dim * 4
+    }
+
+    /// The device every tensor and the KV cache live on.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Tensor> {
+        let d = self.config.hidden;
+        let bytes = &self.file.mapped_file().bytes()[self.embd.0..self.embd.1];
+        let mut out = Vec::with_capacity(tokens.len() * d);
+        for &t in tokens {
+            let i = t as usize;
+            if i >= self.vocab {
+                return Err(err(format!(
+                    "token {t} is outside the {}-token vocab",
+                    self.vocab
+                )));
+            }
+            out.extend(
+                bytes[i * d * 2..(i + 1) * d * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| bf16_to_f32(u16::from_le_bytes(*c))),
+            );
+        }
+        Ok(Tensor::from_vec(out, (tokens.len(), d), &self.device)?)
+    }
+
+    /// Runs `tokens` at positions `offset..`, extending `cache`, and returns
+    /// the last position's logits.
+    ///
+    /// # Errors
+    /// An empty `tokens`, a token outside the vocab, a cache that does not
+    /// match the model, or a device failure. On an error the cache may hold
+    /// part of this forward; the caller truncates it back to `offset`.
+    pub fn forward(&self, tokens: &[u32], offset: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        let t = tokens.len();
+        if t == 0 {
+            return Err(err("forward over no tokens"));
+        }
+        if cache.layers.len() != self.layers.len() {
+            return Err(err(format!(
+                "cache has {} layers, model {}",
+                cache.layers.len(),
+                self.layers.len()
+            )));
+        }
+        if offset + t > self.context_length {
+            return Err(err(format!(
+                "{} positions exceed the context of {}",
+                offset + t,
+                self.context_length
+            )));
+        }
+        let eps = self.config.rms_eps;
+        let (global, sliding) = if t > 1 {
+            let w = self.config.sliding_window;
+            let start = (offset + 1).saturating_sub(w);
+            (
+                Some(causal_mask(t, offset, 0, offset + t, None, &self.device)?),
+                Some(causal_mask(
+                    t,
+                    offset,
+                    start,
+                    offset + t - start,
+                    Some(w),
+                    &self.device,
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+        let mut hidden = self.embed(tokens)?;
+        for (layer, kv) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            let mask = if layer.attn.window.is_some() {
+                sliding.as_ref()
+            } else {
+                global.as_ref()
+            };
+            let attn_out = layer.attn.forward(
+                &candle_nn::ops::rms_norm(&hidden, &layer.attn_norm, eps)?,
+                offset,
+                kv,
+                &self.rope,
+                mask,
+            )?;
+            let h1 = (hidden + attn_out)?;
+            let normed = candle_nn::ops::rms_norm(&h1, &layer.ffn_norm, eps)?;
+            let ffn_out = match &layer.ffn {
+                Ffn::Dense(d) => d.forward(&normed)?,
+                Ffn::Moe(m) => m.forward(&normed)?,
+            };
+            hidden = (h1 + ffn_out)?;
+        }
+        let last = candle_nn::ops::rms_norm(
+            &hidden.narrow(0, t - 1, 1)?.contiguous()?,
+            &self.output_norm,
+            eps,
+        )?;
+        Ok(ops::matmul(&self.output, &last)?
+            .squeeze(0)?
+            .to_vec1::<f32>()?)
+    }
+}
+
+impl SessionModel for Model {
+    const SNAPSHOT_MAGIC: [u8; 4] = *b"PLFK";
+
+    fn forward(
+        &self,
+        tokens: &[u32],
+        offset: usize,
+        cache: &mut KvCache,
+    ) -> gemma_engine::Result<Vec<f32>> {
+        Model::forward(self, tokens, offset, cache).map_err(|e| gemma_engine::Error(e.0))
+    }
+
+    fn context_length(&self) -> usize {
+        Model::context_length(self)
+    }
+
+    fn signature(&self) -> [u8; 32] {
+        Model::signature(self)
+    }
+
+    fn kv_shape(&self) -> Vec<(usize, usize)> {
+        Model::kv_shape(self)
+    }
+
+    fn kv_windows(&self) -> Vec<Option<usize>> {
+        Model::kv_windows(self)
+    }
+
+    fn device(&self) -> &Device {
+        Model::device(self)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_config;
+    use crate::testgguf::tiny_flint;
+    use gemma_engine::session::Session;
+
+    const VOCAB: usize = 256;
+
+    fn model_on(device: &Device, sink: f32, window: usize) -> Arc<Model> {
+        let mut c = test_config();
+        c.sliding_window = window;
+        let file = GgufFile::from_bytes(&tiny_flint(&c, VOCAB, sink, 7)).unwrap();
+        Model::from_file(file, device, 64).unwrap()
+    }
+
+    fn model() -> Arc<Model> {
+        model_on(&Device::Cpu, 0.5, 4)
+    }
+
+    fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| (x - y).abs() <= tol * (1.0 + y.abs()))
+    }
+
+    const PROMPT: [u32; 9] = [12, 200, 201, 202, 203, 17, 99, 5, 255];
+
+    #[test]
+    fn forward_gives_finite_logits_over_the_vocab() {
+        let m = model();
+        let mut s = Session::new(m, 64);
+        let logits = s.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        assert_eq!(logits.len(), VOCAB);
+        assert!(logits.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn decoding_step_by_step_equals_one_prefill() {
+        let m = model();
+        let mut one = Session::new(m.clone(), 64);
+        let want = one.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        let mut step = Session::new(m, 64);
+        step.prefill(&PROMPT[..1], &|| false).unwrap();
+        let mut got = Vec::new();
+        for &t in &PROMPT[1..] {
+            got = step.step(t).unwrap();
+        }
+        assert!(close(&got, &want, 1e-4));
+    }
+
+    #[test]
+    fn truncating_and_reprefilling_equals_a_fresh_prefill() {
+        let m = model();
+        let mut fresh = Session::new(m.clone(), 64);
+        let want = fresh.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        let mut s = Session::new(m, 64);
+        s.prefill(&[12, 200, 201, 202, 7, 7, 7], &|| false).unwrap();
+        assert_eq!(s.truncate(4), 4);
+        let got = s.prefill(&PROMPT[4..], &|| false).unwrap().unwrap();
+        assert!(close(&got, &want, 1e-4));
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_same_next_logits() {
+        let m = model();
+        let mut a = Session::new(m.clone(), 64);
+        a.prefill(&PROMPT, &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        assert_eq!(&blob[..4], b"PLFK");
+        let mut b = Session::new(m, 64);
+        b.restore(&blob).unwrap();
+        assert!(close(&b.step(3).unwrap(), &a.step(3).unwrap(), 1e-5));
+    }
+
+    #[test]
+    fn the_window_and_the_sinks_change_the_logits() {
+        let base = Session::new(model(), 64)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        let wide = Session::new(model_on(&Device::Cpu, 0.5, 64), 64)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        let sunk = Session::new(model_on(&Device::Cpu, 4.0, 4), 64)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !close(&base, &wide, 1e-4),
+            "9 tokens cross a 4-token window"
+        );
+        assert!(!close(&base, &sunk, 1e-4), "the sink logit takes mass");
+    }
+
+    #[test]
+    fn a_token_outside_the_vocab_is_an_error() {
+        let mut s = Session::new(model(), 64);
+        assert!(s.prefill(&[300], &|| false).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_matches_the_cpu() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let cpu = Session::new(model(), 64)
+            .prefill(&PROMPT, &|| false)
+            .unwrap()
+            .unwrap();
+        let mut s = Session::new(model_on(&dev, 0.5, 4), 64);
+        let gpu = s.prefill(&PROMPT, &|| false).unwrap().unwrap();
+        assert!(close(&gpu, &cpu, 1e-3));
+        let mut c = Session::new(model(), 64);
+        c.prefill(&PROMPT, &|| false).unwrap();
+        assert!(close(&s.step(42).unwrap(), &c.step(42).unwrap(), 1e-3));
+    }
+}

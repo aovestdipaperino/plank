@@ -73,17 +73,20 @@ impl Attention {
         } else {
             (q, k)
         };
+        // Checked before the append, so a refused call leaves the cache as
+        // it was.
+        if cache.len() != offset {
+            bail!(
+                "Flint KV cache holds {}..{}, expected ..{offset}",
+                cache.base(),
+                cache.len()
+            )
+        }
         cache.append(&k, &v).map_err(kv_err)?;
         let Some((keys, values)) = cache.view().map_err(kv_err)? else {
             bail!("Flint KV cache is empty after an append")
         };
         let (base, stored) = (cache.base(), cache.len());
-        if stored != offset + t {
-            bail!(
-                "Flint KV cache holds {base}..{stored}, expected ..{}",
-                offset + t
-            )
-        }
         // A sliding layer's earliest query sees no key before
         // `offset + 1 - window`; drop those before scoring.
         let start = self.window.map_or(0, |w| (offset + 1).saturating_sub(w));
@@ -114,7 +117,8 @@ impl Attention {
 /// `softmax([q·kᵀ·scale + mask, sink]) · v` without the sink's column.
 ///
 /// `query` is `[1, heads, t, d]`, `key`/`value` `[1, kv_heads, keys, d]`,
-/// `sinks` `[heads]`, `mask` (when given) `[1, 1, t, keys]` of 0 and -inf.
+/// `sinks` `[heads]`, `mask` `[1, 1, t, keys]` of 0 and -inf, required when
+/// `t > 1` (a single query attends to every key it is given).
 /// Query head `h` reads KV head `h / (heads / kv_heads)`.
 pub(crate) fn attend(
     query: &Tensor,
@@ -132,6 +136,9 @@ pub(crate) fn attend(
         .matmul(&key.transpose(2, 3)?.contiguous()?)?
         .reshape((1, heads, t, keys))?;
     scores = (scores * scale)?;
+    if mask.is_none() && t > 1 {
+        bail!("attention over {t} queries needs a causal mask")
+    }
     if let Some(mask) = mask {
         if mask.dims() != [1, 1, t, keys] {
             bail!(
@@ -318,5 +325,52 @@ mod tests {
             .unwrap();
         assert!((a[0] - 1.0).abs() < 1e-6, "no sink: values average to 1");
         assert!(b[0] < 1e-6, "a dominant sink leaves almost nothing");
+    }
+
+    fn tiny_attention() -> Attention {
+        use crate::testutil::{Rng, weight};
+        let (hidden, heads, kv_heads, head_dim) = (64, 2, 1, 64);
+        let mut rng = Rng::new(11);
+        let dev = Device::Cpu;
+        let ones = |n: usize| Tensor::ones(n, candle_core::DType::F32, &dev).unwrap();
+        Attention {
+            q: Arc::new(weight(&mut rng, hidden, heads * head_dim, 1)),
+            k: Arc::new(weight(&mut rng, hidden, kv_heads * head_dim, 1)),
+            v: Arc::new(weight(&mut rng, hidden, kv_heads * head_dim, 1)),
+            o: Arc::new(weight(&mut rng, heads * head_dim, hidden, 1)),
+            q_norm: ones(head_dim),
+            k_norm: ones(head_dim),
+            sinks: ones(heads),
+            heads,
+            kv_heads,
+            head_dim,
+            window: None,
+            rope: true,
+            eps: 1e-6,
+        }
+    }
+
+    #[test]
+    fn a_cache_that_does_not_end_at_the_offset_is_refused_and_left_unchanged() {
+        let dev = Device::Cpu;
+        let attn = tiny_attention();
+        let rope = Rope::new(64, 10_000.0, 16, &dev).unwrap();
+        let mut cache = LayerKv::default();
+        let x = Tensor::from_vec(rand(2 * 64, 4), (2, 64), &dev).unwrap();
+        let mask = causal_mask(2, 0, 0, 2, None, &dev).unwrap();
+        attn.forward(&x, 0, &mut cache, &rope, Some(&mask)).unwrap();
+        assert_eq!(cache.len(), 2);
+        let one = x.narrow(0, 0, 1).unwrap();
+        assert!(attn.forward(&one, 5, &mut cache, &rope, None).is_err());
+        assert_eq!(cache.len(), 2, "a refused forward appends nothing");
+    }
+
+    #[test]
+    fn several_queries_without_a_mask_are_refused() {
+        let dev = Device::Cpu;
+        let q = Tensor::ones((1, 1, 2, 4), candle_core::DType::F32, &dev).unwrap();
+        let k = Tensor::ones((1, 1, 2, 4), candle_core::DType::F32, &dev).unwrap();
+        let s = Tensor::new(&[0f32], &dev).unwrap();
+        assert!(attend(&q, &k, &k, &s, None, 1.0).is_err());
     }
 }

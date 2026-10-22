@@ -5,18 +5,17 @@
 //! `candle` feature.
 
 #[cfg(feature = "candle")]
-#[allow(dead_code)] // loaded by the model in a later task
 mod attention;
 pub mod config;
 #[cfg(feature = "candle")]
-#[allow(dead_code)] // loaded by the model in a later task
 mod ffn;
 #[cfg(feature = "candle")]
 pub mod file;
 pub mod gguf;
+#[cfg(feature = "candle")]
+pub mod model;
 pub mod nvfp4;
 #[cfg(feature = "candle")]
-#[allow(dead_code)] // loaded by the model in a later task
 mod rope;
 pub mod template;
 #[cfg(test)]
@@ -27,6 +26,11 @@ pub mod testgguf;
 mod testutil;
 #[cfg(feature = "candle")]
 pub mod tokenizer;
+
+#[cfg(feature = "candle")]
+pub use gemma_engine::sample::Sampler;
+#[cfg(feature = "candle")]
+pub use gemma_engine::session::{Session, SessionModel};
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
