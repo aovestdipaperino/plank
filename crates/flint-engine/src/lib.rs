@@ -10,6 +10,8 @@ pub mod gguf;
 pub mod nvfp4;
 #[cfg(any(test, feature = "testgguf"))]
 pub mod testgguf;
+#[cfg(all(test, feature = "candle"))]
+mod testutil;
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
