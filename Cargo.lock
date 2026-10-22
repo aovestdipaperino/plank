@@ -2186,6 +2186,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-engine"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-metal-kernels",
+ "libc",
+ "memmap2",
+ "objc2-metal",
+ "rayon",
+]
+
+[[package]]
 name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
