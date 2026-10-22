@@ -9,6 +9,7 @@ pub mod config;
 pub mod file;
 pub mod gguf;
 pub mod nvfp4;
+pub mod template;
 #[cfg(test)]
 mod testalloc;
 #[cfg(any(test, feature = "testgguf"))]
