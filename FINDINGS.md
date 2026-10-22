@@ -3626,3 +3626,37 @@ switch. The C overwrites GPU tensors with a plain `memcpy` into shared storage,
 so it calls `ds4_gpu_synchronize` first. A GPU-yield reopen comes back on the
 launch direction, so `Agent::gpu_reopen_into` re-applies `steer_switch` before
 `set_kv`, or the restored KV would key under the wrong direction.
+
+## Flint's NVFP4 is upstream ggml type 40, and its scales multiply the output
+
+Flint's GGUF (`flint-nvfp4.gguf`) stores every projection as ggml type 40,
+`block_nvfp4` in llama.cpp `970b51c`: 64 values in 36 bytes, four UE4M3
+scales then 32 bytes of codes. Within the 16-value run `s`, byte `j` holds
+value `j` in its low nibble and value `j + 8` in its high nibble, not the
+interleaving a reader might guess. The codes index E2M1 *doubled*
+(`kvalues_fp4`), and `ggml_ue4m3_to_fp32` returns half the scale to undo it.
+That decoder maps `0x7F` (E4M3's NaN) to 0 and ignores bit 7; its encoder
+saturates exponent 15 to `0x7E`. `crates/flint-engine/src/nvfp4/block.rs`
+ports both verbatim and pins the corner values in its tests.
+
+Every weight also has a sibling `<name>.scale` f32 tensor. It is not folded
+into the blocks: `build_lora_mm` multiplies the matmul *output* by it.
+Expert tensors carry one scale per expert (`{n_expert}`), applied to each
+expert's gate, up and down outputs separately, so the gate is scaled before
+the SiLU. `general.tensor_extra.prec_a4` is false for all 485 weights, so
+activations stay full precision.
+
+Kernel throughput on an Apple M5 Max with 128 GiB, from `bench_kernels`:
+
+```
+attn_q decode                     18.9 us    250.0 GB/s
+attn_q prefill x512              959.7 us      4.9 GB/s
+lm_head decode                   421.5 us    410.4 GB/s
+moe decode (6 experts)            42.4 us    250.2 GB/s
+```
+
+The M5 Max's unified memory peaks at roughly 460 to 610 GB/s depending on the
+GPU core count, so the large lm_head decode reaches most of the bandwidth
+while the small attn_q and MoE decodes, at under 50 us, are bound by dispatch
+latency rather than memory. The prefill figure counts weight bytes only and
+is compute bound, so it is not a bandwidth number.
