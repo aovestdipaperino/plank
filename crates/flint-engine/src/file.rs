@@ -20,7 +20,6 @@ pub struct MappedFile {
     /// Declared before `map` so it is dropped first, since it points into it.
     #[cfg(target_os = "macos")]
     #[allow(clippy::option_option)] // outer None = untried, Some(None) = refused
-    #[allow(dead_code)] // bound by the Metal kernels in a later task
     pub(crate) metal: Mutex<Option<Option<Arc<candle_metal_kernels::metal::Buffer>>>>,
     map: Mmap,
 }

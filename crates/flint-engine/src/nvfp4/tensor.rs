@@ -3,6 +3,8 @@
 //! is the one-expert case.
 
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 
 use crate::file::MappedFile;
 use crate::nvfp4::block::{BLOCK_BYTES, QK, dequant_row};
@@ -25,6 +27,11 @@ pub struct NvWeight {
     rows: usize,
     experts: usize,
     scales: Vec<f32>,
+    /// The Metal buffers this weight is bound to, made on first use.
+    /// Declared before `bytes` so it is dropped first: a binding may be a
+    /// no-copy buffer over the mapping `bytes` keeps alive.
+    #[cfg(target_os = "macos")]
+    pub(crate) metal: Mutex<Option<crate::nvfp4::metal::Binding>>,
     bytes: Bytes,
 }
 
@@ -48,6 +55,8 @@ impl NvWeight {
             experts,
             scales,
             bytes: Bytes::Owned(data),
+            #[cfg(target_os = "macos")]
+            metal: Mutex::new(None),
         })
     }
 
@@ -67,6 +76,8 @@ impl NvWeight {
             experts,
             scales,
             bytes: Bytes::Mapped { file, offset, len },
+            #[cfg(target_os = "macos")]
+            metal: Mutex::new(None),
         })
     }
 
@@ -147,7 +158,6 @@ impl NvWeight {
     }
 
     /// The mapping and offset this weight borrows, when it comes from a file.
-    #[allow(dead_code)] // bound by the Metal kernels in a later task
     pub(crate) fn mapping(&self) -> Option<(&Arc<MappedFile>, usize)> {
         match &self.bytes {
             Bytes::Owned(_) => None,

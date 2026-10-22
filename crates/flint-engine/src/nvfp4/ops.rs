@@ -134,6 +134,16 @@ impl CustomOp1 for MatmulOp {
             Shape::from((dims.tokens, self.w.rows())),
         ))
     }
+
+    #[cfg(target_os = "macos")]
+    fn metal_fwd(
+        &self,
+        s: &candle_core::MetalStorage,
+        l: &Layout,
+    ) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        let dims = mat_dims(&self.w, l)?;
+        crate::nvfp4::metal::matmul(&self.w, s, dims)
+    }
 }
 
 #[derive(Debug)]
@@ -259,5 +269,76 @@ mod tests {
         let ids = Tensor::zeros((1, 2), candle_core::DType::U32, &dev).unwrap();
         let r = Tensor::zeros((2, 2), candle_core::DType::F32, &dev).unwrap();
         assert!(moe(&m, &x, &ids, &r).is_err(), "ids rows != tokens");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metal() -> Option<Device> {
+        match Device::new_metal(0) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("no Metal device ({e}); skipped");
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metal_matmul_case(seed: u64, cols: usize, rows: usize, tokens: usize) {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(seed);
+        let w = Arc::new(weight(&mut rng, cols, rows, 1));
+        let xv = rng.vec(tokens * cols);
+        let cpu = matmul(
+            &w,
+            &Tensor::from_vec(xv.clone(), (tokens, cols), &Device::Cpu).unwrap(),
+        )
+        .unwrap();
+        let gpu = matmul(&w, &Tensor::from_vec(xv, (tokens, cols), &dev).unwrap()).unwrap();
+        let want: Vec<f32> = cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = gpu.flatten_all().unwrap().to_vec1().unwrap();
+        assert_close(&got, &want, 1e-3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_matvec_matches_cpu() {
+        for (i, (cols, rows, tokens)) in [(64, 1, 1), (192, 33, 3), (2048, 100, 1), (512, 7, 7)]
+            .into_iter()
+            .enumerate()
+        {
+            metal_matmul_case(20 + u64::try_from(i).unwrap(), cols, rows, tokens);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mapped_weight_binds_the_whole_file_without_copying() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(30);
+        let src = weight(&mut rng, 128, 9, 1);
+        let bytes = crate::testgguf::Builder::new()
+            .tensor("w.weight", &[128, 9], crate::gguf::GGML_NVFP4, src.bytes())
+            .tensor(
+                "w.scale",
+                &[1],
+                crate::gguf::GGML_F32,
+                &src.scale(0).to_le_bytes(),
+            )
+            .bytes();
+        let file = crate::file::GgufFile::from_bytes(&bytes).unwrap();
+        let w = Arc::new(file.nv_weight("w").unwrap());
+        let xv = rng.vec(128);
+        let got: Vec<f32> = matmul(&w, &Tensor::from_vec(xv.clone(), (1, 128), &dev).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_close(&got, &naive_matmul(&w, 0, &xv, 1), 1e-3);
+        let slot = file.mapped_file().metal.lock().unwrap();
+        assert!(
+            matches!(*slot, Some(Some(_))),
+            "the mapping became one no-copy buffer"
+        );
     }
 }

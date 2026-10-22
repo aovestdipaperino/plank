@@ -2193,6 +2193,7 @@ dependencies = [
  "candle-metal-kernels",
  "libc",
  "memmap2",
+ "objc2",
  "objc2-metal",
  "rayon",
 ]

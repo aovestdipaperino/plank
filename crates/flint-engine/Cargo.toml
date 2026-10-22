@@ -16,6 +16,7 @@ candle = [
     "dep:rayon",
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
+    "dep:objc2",
     "dep:libc",
 ]
 testgguf = ["candle"]
@@ -29,6 +30,7 @@ rayon = { version = "1", optional = true }
 candle-core = { version = "0.9", optional = true, features = ["metal"] }
 candle-metal-kernels = { version = "0.9", optional = true }
 objc2-metal = { version = "0.3", optional = true }
+objc2 = { version = "0.6", optional = true }
 libc = { version = "0.2", optional = true }
 
 [lints]
