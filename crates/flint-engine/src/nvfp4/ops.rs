@@ -423,6 +423,7 @@ mod tests {
             .bytes();
         let file = crate::file::GgufFile::from_bytes(&bytes).unwrap();
         let w = Arc::new(file.nv_weight("w").unwrap());
+        assert_eq!(file.metal_no_copy(), None, "not bound before first use");
         let xv = rng.vec(128);
         let got: Vec<f32> = matmul(&w, &Tensor::from_vec(xv.clone(), (1, 128), &dev).unwrap())
             .unwrap()
@@ -431,11 +432,49 @@ mod tests {
             .to_vec1()
             .unwrap();
         assert_close(&got, &naive_matmul(&w, 0, &xv, 1), 1e-3);
-        let slot = file.mapped_file().metal.lock().unwrap();
-        assert!(
-            matches!(*slot, Some(Some(_))),
+        assert_eq!(
+            file.metal_no_copy(),
+            Some(true),
             "the mapping became one no-copy buffer"
         );
+    }
+
+    /// A file with one weight, `w`, of 64 columns by 3 rows.
+    #[cfg(target_os = "macos")]
+    fn one_weight_file(rng: &mut Rng) -> crate::file::GgufFile {
+        let src = weight(rng, 64, 3, 1);
+        let bytes = crate::testgguf::Builder::new()
+            .tensor("w.weight", &[64, 3], crate::gguf::GGML_NVFP4, src.bytes())
+            .tensor(
+                "w.scale",
+                &[1],
+                crate::gguf::GGML_F32,
+                &src.scale(0).to_le_bytes(),
+            )
+            .bytes();
+        crate::file::GgufFile::from_bytes(&bytes).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_binding_made_for_another_device_is_refused() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(34);
+        let file = one_weight_file(&mut rng);
+        let x = Tensor::from_vec(rng.vec(64), (1, 64), &dev).unwrap();
+        let w = Arc::new(file.nv_weight("w").unwrap());
+        matmul(&w, &x).unwrap();
+        // Pretend the weight was bound on some other GPU.
+        w.metal.lock().unwrap().as_mut().unwrap().device ^= 1;
+        let e = matmul(&w, &x).unwrap_err().to_string();
+        assert!(e.contains("another Metal device"), "{e}");
+
+        // A fresh weight from the same file binds through the file's shared
+        // no-copy buffer, which is refused the same way.
+        let fresh = Arc::new(file.nv_weight("w").unwrap());
+        file.mapped_file().metal.lock().unwrap().as_mut().unwrap().0 ^= 1;
+        let e = matmul(&fresh, &x).unwrap_err().to_string();
+        assert!(e.contains("another Metal device"), "{e}");
     }
 
     #[cfg(target_os = "macos")]

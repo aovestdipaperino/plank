@@ -98,6 +98,12 @@ fn metal_matches_cpu_on_real_tensors() {
                 &run(&w, &x, tokens, &Device::Cpu),
                 1e-3,
             );
+            // Each weight would otherwise silently cost a private copy.
+            assert_eq!(
+                f.metal_no_copy(),
+                Some(true),
+                "the whole file binds as one no-copy buffer"
+            );
         }
     }
     let m = MoeExperts::new(

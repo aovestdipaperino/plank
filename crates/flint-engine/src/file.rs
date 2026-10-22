@@ -16,12 +16,14 @@ use crate::{Result, err};
 #[derive(Debug)]
 pub struct MappedFile {
     /// On macOS, one no-copy Metal buffer over the whole mapping, built on
-    /// first use: outer `None` until tried, `Some(None)` when Metal refused.
-    /// Declared before `map` so it is dropped first; the buffer itself also
-    /// owns a clone of `map`, so the mapping outlives any GPU use of it.
+    /// first use: `None` until tried, then the `registry_id` of the device it
+    /// was tried on with the buffer, or `None` when Metal refused. A mapping
+    /// binds to one device; using it on another is an error, not a buffer
+    /// from the wrong GPU. Field order does not matter for soundness: the
+    /// buffer's deallocator owns its own clone of `map`, so the mapping
+    /// outlives any GPU use of it whichever field drops first.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::option_option)] // outer None = untried, Some(None) = refused
-    pub(crate) metal: Mutex<Option<Option<Arc<candle_metal_kernels::metal::Buffer>>>>,
+    pub(crate) metal: Mutex<Option<(u64, Option<Arc<candle_metal_kernels::metal::Buffer>>)>>,
     map: Arc<Mmap>,
 }
 
@@ -90,6 +92,22 @@ impl GgufFile {
     #[must_use]
     pub fn mapped_file(&self) -> &Arc<MappedFile> {
         &self.file
+    }
+
+    /// Which Metal path this file's weights took: `None` until a weight from
+    /// it is first used on Metal, `Some(true)` when the whole mapping became
+    /// one no-copy buffer, `Some(false)` when Metal refused one (the file is
+    /// larger than `maxBufferLength`, say) and each weight is copied into a
+    /// buffer of its own, which doubles their resident memory.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn metal_no_copy(&self) -> Option<bool> {
+        let slot = self
+            .file
+            .metal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_ref().map(|(_, buf)| buf.is_some())
     }
 
     /// The data bytes of tensor `name`.

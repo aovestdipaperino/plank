@@ -3,6 +3,10 @@
 // (halved on decode) then 32 bytes of codes into the doubled E2M1 table.
 // Activations and accumulation are f32. Every kernel multiplies its output
 // by the weight's tensor scale (per expert for the MoE kernels).
+//
+// The launch constants (SIMD_WIDTH, MV_ROWS_PER_SG, MV_SG_PER_TG, MM_TN,
+// MM_TT, MM_THREADS, SUM_THREADS) are not defined here: metal.rs prepends
+// them from the Rust constants its dispatches use.
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -43,11 +47,8 @@ struct MatParams {
     float scale;
 };
 
-#define MV_ROWS_PER_SG 4
-#define MV_SG_PER_TG 2
-
 // One token per threadgroup row of the grid; each simdgroup computes
-// MV_ROWS_PER_SG rows, its 32 lanes splitting the row's 16-value runs.
+// MV_ROWS_PER_SG rows, its SIMD_WIDTH lanes splitting the row's 16-value runs.
 kernel void mv_nvfp4(
     device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]],
@@ -68,7 +69,7 @@ kernel void mv_nvfp4(
         }
         device const uchar *wr = w + (ulong)row * p.row_bytes;
         float acc = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += 32) {
+        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
             acc += sub_dot(wr, sb, xt);
         }
         acc = simd_sum(acc);
@@ -78,13 +79,15 @@ kernel void mv_nvfp4(
     }
 }
 
-#define MM_TN 32 // weight rows per tile
-#define MM_TT 32 // tokens per tile
+// Each thread loads one 16-value run (of four per block) of one row and one
+// token, so the threads cover the tile's MM_TN rows and MM_TT tokens.
+static_assert(MM_THREADS == 4 * MM_TN && MM_TN == MM_TT, "mm_nvfp4 thread mapping");
+static_assert(MM_TN == 32, "mm_nvfp4 uses a 2x2 grid of 16x16 simdgroup patches");
 
-// 128 threads = 4 simdgroups in a 2x2 arrangement, each owning a 16x16
-// patch of the 32x32 (rows x tokens) output tile as 2x2 8x8 f32 matrices.
-// Each step decodes one 64-value block column of 32 weight rows into
-// threadgroup memory next to the matching 32 tokens of x.
+// MM_THREADS threads = 4 simdgroups in a 2x2 arrangement, each owning a
+// 16x16 patch of the MM_TN x MM_TT (rows x tokens) output tile as 2x2 8x8
+// f32 matrices. Each step decodes one 64-value block column of MM_TN weight
+// rows into threadgroup memory next to the matching MM_TT tokens of x.
 kernel void mm_nvfp4(
     device const uchar *w [[buffer(0)]],
     device const float *x [[buffer(1)]],
@@ -107,8 +110,8 @@ kernel void mm_nvfp4(
             acc[i][j] = simdgroup_float8x8(0.0f);
         }
     }
-    uint r = tid >> 2; // 0..31: the weight row / token this thread loads
-    uint s = tid & 3;  // 0..3: which 16-value run
+    uint r = tid / 4; // 0..MM_TN-1: the weight row / token this thread loads
+    uint s = tid % 4; // 0..3: which 16-value run
     uint nb = p.k / 64;
     for (uint b = 0; b < nb; ++b) {
         threadgroup float *wd = ws + r * 64 + s * 16;
@@ -166,7 +169,7 @@ kernel void mm_nvfp4(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < MM_TT * MM_TN; e += 128) {
+    for (uint e = tid; e < MM_TT * MM_TN; e += MM_THREADS) {
         uint tt = e / MM_TN;
         uint nn = e % MM_TN;
         uint t = t0 + tt;
@@ -228,7 +231,7 @@ kernel void moe_gate_up(
         device const uchar *ru = wu + base + (ulong)row * p.gu_row_bytes;
         float g = 0.0f;
         float u = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += 32) {
+        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
             g += sub_dot(rg, sb, xt);
             u += sub_dot(ru, sb, xt);
         }
@@ -275,7 +278,7 @@ kernel void moe_down(
         }
         device const uchar *rw = wd + base + (ulong)row * p.down_row_bytes;
         float acc = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += 32) {
+        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
             acc += sub_dot(rw, sb, hs);
         }
         acc = simd_sum(acc);
@@ -294,7 +297,7 @@ kernel void moe_sum(
     uint tid [[thread_index_in_threadgroup]])
 {
     uint t = tg.y;
-    uint i = tg.x * 256 + tid;
+    uint i = tg.x * SUM_THREADS + tid;
     if (i >= p.d) {
         return;
     }
