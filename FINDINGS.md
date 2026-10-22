@@ -3655,8 +3655,11 @@ lm_head decode                   421.5 us    410.4 GB/s
 moe decode (6 experts)            42.4 us    250.2 GB/s
 ```
 
-The M5 Max's unified memory peaks at roughly 460 to 610 GB/s depending on the
-GPU core count, so the large lm_head decode reaches most of the bandwidth
-while the small attn_q and MoE decodes, at under 50 us, are bound by dispatch
-latency rather than memory. The prefill figure counts weight bytes only and
-is compute bound, so it is not a bandwidth number.
+The attn_q weight is about 4.7 MB and the six experts about 10.6 MB. The
+bench re-reads the same fixed weights with all-ones activations and one fixed
+expert set, so those two figures are likely cache-warm best cases and not DRAM
+bandwidth. The lm_head weight, about 173 MB, is the only one large enough to
+stream from memory, so 410 GB/s is the only figure here that plausibly
+reflects memory bandwidth. The prefill figure counts weight bytes only and is
+not a bandwidth measure. We have not measured why attn_q and the MoE both land
+near 250 GB/s, and we have not measured this chip's peak bandwidth.
