@@ -19,8 +19,8 @@ use objc2_foundation::NSString;
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
 
 use crate::file::MappedFile;
-use crate::nvfp4::ops::MatDims;
-use crate::nvfp4::tensor::NvWeight;
+use crate::nvfp4::ops::{MatDims, MoeDims};
+use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 
 const SOURCE: &str = include_str!("nvfp4.metal");
 
@@ -42,6 +42,9 @@ const SIMD_WIDTH: usize = 32;
 pub(crate) struct Pipelines {
     pub mv: ComputePipeline,
     pub mm: ComputePipeline,
+    pub moe_gate_up: ComputePipeline,
+    pub moe_down: ComputePipeline,
+    pub moe_sum: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -82,6 +85,9 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
     let p = Arc::new(Pipelines {
         mv: get("mv_nvfp4")?,
         mm: get("mm_nvfp4")?,
+        moe_gate_up: get("moe_gate_up")?,
+        moe_down: get("moe_down")?,
+        moe_sum: get("moe_sum")?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -245,5 +251,106 @@ pub(crate) fn matmul(
     Ok((
         MetalStorage::new(out, dev.clone(), tokens * n, DType::F32),
         Shape::from((tokens, n)),
+    ))
+}
+
+/// Mirrors `MoeParams` in the shader.
+#[repr(C)]
+struct MoeParams {
+    d: u32,
+    f: u32,
+    slots: u32,
+    k_used: u32,
+    experts: u32,
+    gu_row_bytes: u32,
+    gu_expert_bytes: u32,
+    down_row_bytes: u32,
+    down_expert_bytes: u32,
+}
+
+/// Threads per `moe_sum` threadgroup, one output column each.
+const SUM_THREADS: usize = 256;
+
+/// The gathered `MoE` on the GPU: gate/up per slot, down per slot weighted
+/// by the route, then the slots summed in order.
+pub(crate) fn moe(
+    m: &MoeExperts,
+    x: &MetalStorage,
+    ids: &MetalStorage,
+    route: &MetalStorage,
+    dims: MoeDims,
+) -> candle_core::Result<(MetalStorage, Shape)> {
+    if x.dtype() != DType::F32 || ids.dtype() != DType::U32 || route.dtype() != DType::F32 {
+        candle_core::bail!("moe wants f32 x, u32 ids and f32 route");
+    }
+    let dev = x.device();
+    let pipes = pipelines(dev)?;
+    let (gate, gate_off, gate_scales) = binding(dev, &m.gate)?;
+    let (up, up_off, up_scales) = binding(dev, &m.up)?;
+    let (down, down_off, down_scales) = binding(dev, &m.down)?;
+    let (tokens, hidden, ffn) = (dims.tokens, m.hidden(), m.ffn());
+    let slots = tokens * dims.k_used;
+    let params = MoeParams {
+        d: u32_of(hidden)?,
+        f: u32_of(ffn)?,
+        slots: u32_of(slots)?,
+        k_used: u32_of(dims.k_used)?,
+        experts: u32_of(m.count())?,
+        gu_row_bytes: u32_of(m.gate.row_bytes())?,
+        gu_expert_bytes: u32_of(m.gate.expert_bytes())?,
+        down_row_bytes: u32_of(m.down.row_bytes())?,
+        down_expert_bytes: u32_of(m.down.expert_bytes())?,
+    };
+    let h = dev.new_buffer(slots * ffn, DType::F32, "nvfp4_moe_h")?;
+    let ys = dev.new_buffer(slots * hidden, DType::F32, "nvfp4_moe_ys")?;
+    let out = dev.new_buffer(tokens * hidden, DType::F32, "nvfp4_moe_out")?;
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_gate_up");
+        enc.set_compute_pipeline_state(&pipes.moe_gate_up);
+        enc.set_buffer(0, Some(&gate), gate_off);
+        enc.set_buffer(1, Some(&up), up_off);
+        enc.set_buffer(2, Some(x.buffer()), dims.x_start * 4);
+        enc.set_buffer(3, Some(ids.buffer()), dims.ids_start * 4);
+        enc.set_buffer(4, Some(&gate_scales), 0);
+        enc.set_buffer(5, Some(&up_scales), 0);
+        enc.set_buffer(6, Some(&h), 0);
+        enc.set_bytes(7, &params);
+        enc.dispatch_thread_groups(
+            grid(ffn.div_ceil(MV_ROWS_PER_TG), slots),
+            grid(MV_THREADS, 1),
+        );
+    }
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_down");
+        enc.set_compute_pipeline_state(&pipes.moe_down);
+        enc.set_buffer(0, Some(&down), down_off);
+        enc.set_buffer(1, Some(&h), 0);
+        enc.set_buffer(2, Some(ids.buffer()), dims.ids_start * 4);
+        enc.set_buffer(3, Some(&down_scales), 0);
+        enc.set_buffer(4, Some(route.buffer()), dims.route_start * 4);
+        enc.set_buffer(5, Some(&ys), 0);
+        enc.set_bytes(6, &params);
+        enc.dispatch_thread_groups(
+            grid(hidden.div_ceil(MV_ROWS_PER_TG), slots),
+            grid(MV_THREADS, 1),
+        );
+    }
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_sum");
+        enc.set_compute_pipeline_state(&pipes.moe_sum);
+        enc.set_buffer(0, Some(&ys), 0);
+        enc.set_buffer(1, Some(&out), 0);
+        enc.set_bytes(2, &params);
+        enc.dispatch_thread_groups(
+            grid(hidden.div_ceil(SUM_THREADS), tokens),
+            grid(SUM_THREADS, 1),
+        );
+    }
+    Ok((
+        MetalStorage::new(out, dev.clone(), tokens * hidden, DType::F32),
+        Shape::from((tokens, hidden)),
     ))
 }

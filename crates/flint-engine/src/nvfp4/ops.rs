@@ -186,6 +186,20 @@ impl CustomOp3 for MoeOp {
         .map_err(to_candle)?;
         Ok((CpuStorage::F32(y), Shape::from((t, d))))
     }
+
+    #[cfg(target_os = "macos")]
+    fn metal_fwd(
+        &self,
+        s1: &candle_core::MetalStorage,
+        l1: &Layout,
+        s2: &candle_core::MetalStorage,
+        l2: &Layout,
+        s3: &candle_core::MetalStorage,
+        l3: &Layout,
+    ) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        let dims = moe_dims(&self.m, l1, l2, l3)?;
+        crate::nvfp4::metal::moe(&self.m, s1, s2, s3, dims)
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +458,33 @@ mod tests {
                 "Metal never released the mapping"
             );
             std::thread::yield_now();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_moe_matches_cpu() {
+        let Some(dev) = metal() else { return };
+        let mut rng = Rng::new(50);
+        let m = experts(&mut rng, 256, 128, 16);
+        for (tokens, k_used) in [(1, 6), (5, 6), (9, 2)] {
+            let xv = rng.vec(tokens * 256);
+            let idv: Vec<u32> = (0..tokens * k_used).map(|_| rng.below(16)).collect();
+            let rv: Vec<f32> = (0..tokens * k_used).map(|_| rng.uniform().abs()).collect();
+            let run = |d: &Device| -> Vec<f32> {
+                moe(
+                    &m,
+                    &Tensor::from_vec(xv.clone(), (tokens, 256), d).unwrap(),
+                    &Tensor::from_vec(idv.clone(), (tokens, k_used), d).unwrap(),
+                    &Tensor::from_vec(rv.clone(), (tokens, k_used), d).unwrap(),
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+            };
+            assert_close(&run(&dev), &run(&Device::Cpu), 1e-3);
         }
     }
 }

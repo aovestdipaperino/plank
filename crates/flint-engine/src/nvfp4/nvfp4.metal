@@ -176,3 +176,131 @@ kernel void mm_nvfp4(
         }
     }
 }
+
+struct MoeParams {
+    uint d;                 // model width (gate/up columns, down rows)
+    uint f;                 // expert FFN width (gate/up rows, down columns)
+    uint slots;             // tokens * k_used
+    uint k_used;
+    uint experts;
+    uint gu_row_bytes;
+    uint gu_expert_bytes;
+    uint down_row_bytes;
+    uint down_expert_bytes;
+};
+
+// h[slot][r] = silu(gs[e] * gate_e[r].x) * (us[e] * up_e[r].x), e = ids[slot].
+kernel void moe_gate_up(
+    device const uchar *wg [[buffer(0)]],
+    device const uchar *wu [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device const uint *ids [[buffer(3)]],
+    device const float *gs [[buffer(4)]],
+    device const float *us [[buffer(5)]],
+    device float *h [[buffer(6)]],
+    constant MoeParams &p [[buffer(7)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint slot = tg.y;
+    uint e = ids[slot];
+    uint row0 = (tg.x * MV_SG_PER_TG + sg) * MV_ROWS_PER_SG;
+    device float *hs = h + (ulong)slot * p.f;
+    if (e >= p.experts) {
+        // Out-of-range slot: contributes nothing (the CPU path errors instead).
+        if (lane == 0) {
+            for (uint r = 0; r < MV_ROWS_PER_SG && row0 + r < p.f; ++r) {
+                hs[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+    device const float *xt = x + (ulong)(slot / p.k_used) * p.d;
+    ulong base = (ulong)e * p.gu_expert_bytes;
+    uint nsub = p.d / 16;
+    for (uint r = 0; r < MV_ROWS_PER_SG; ++r) {
+        uint row = row0 + r;
+        if (row >= p.f) {
+            break;
+        }
+        device const uchar *rg = wg + base + (ulong)row * p.gu_row_bytes;
+        device const uchar *ru = wu + base + (ulong)row * p.gu_row_bytes;
+        float g = 0.0f;
+        float u = 0.0f;
+        for (uint sb = lane; sb < nsub; sb += 32) {
+            g += sub_dot(rg, sb, xt);
+            u += sub_dot(ru, sb, xt);
+        }
+        g = simd_sum(g) * gs[e];
+        u = simd_sum(u) * us[e];
+        if (lane == 0) {
+            hs[row] = g / (1.0f + exp(-g)) * u;
+        }
+    }
+}
+
+// ys[slot][r] = (ds[e] * down_e[r].h[slot]) * route[slot].
+kernel void moe_down(
+    device const uchar *wd [[buffer(0)]],
+    device const float *h [[buffer(1)]],
+    device const uint *ids [[buffer(2)]],
+    device const float *ds [[buffer(3)]],
+    device const float *route [[buffer(4)]],
+    device float *ys [[buffer(5)]],
+    constant MoeParams &p [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint slot = tg.y;
+    uint e = ids[slot];
+    uint row0 = (tg.x * MV_SG_PER_TG + sg) * MV_ROWS_PER_SG;
+    device float *yo = ys + (ulong)slot * p.d;
+    if (e >= p.experts) {
+        if (lane == 0) {
+            for (uint r = 0; r < MV_ROWS_PER_SG && row0 + r < p.d; ++r) {
+                yo[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+    device const float *hs = h + (ulong)slot * p.f;
+    ulong base = (ulong)e * p.down_expert_bytes;
+    uint nsub = p.f / 16;
+    for (uint r = 0; r < MV_ROWS_PER_SG; ++r) {
+        uint row = row0 + r;
+        if (row >= p.d) {
+            break;
+        }
+        device const uchar *rw = wd + base + (ulong)row * p.down_row_bytes;
+        float acc = 0.0f;
+        for (uint sb = lane; sb < nsub; sb += 32) {
+            acc += sub_dot(rw, sb, hs);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            yo[row] = acc * ds[e] * route[slot];
+        }
+    }
+}
+
+// out[t][i] = sum over j in slot order of ys[t * k_used + j][i].
+kernel void moe_sum(
+    device const float *ys [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant MoeParams &p [[buffer(2)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    uint t = tg.y;
+    uint i = tg.x * 256 + tid;
+    if (i >= p.d) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint j = 0; j < p.k_used; ++j) {
+        acc += ys[((ulong)t * p.k_used + j) * p.d + i];
+    }
+    out[(ulong)t * p.d + i] = acc;
+}
