@@ -4,11 +4,17 @@
 //! tested without a model. Everything that touches tensors sits behind the
 //! `candle` feature.
 
+#[cfg(feature = "candle")]
+#[allow(dead_code)] // loaded by the model in a later task
+mod attention;
 pub mod config;
 #[cfg(feature = "candle")]
 pub mod file;
 pub mod gguf;
 pub mod nvfp4;
+#[cfg(feature = "candle")]
+#[allow(dead_code)] // loaded by the model in a later task
+mod rope;
 pub mod template;
 #[cfg(test)]
 mod testalloc;
