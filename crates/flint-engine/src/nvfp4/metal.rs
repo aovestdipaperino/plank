@@ -25,12 +25,15 @@ use crate::nvfp4::tensor::NvWeight;
 const SOURCE: &str = include_str!("nvfp4.metal");
 
 /// From this many tokens up, a matmul runs the tiled `mm_nvfp4` kernel.
-#[allow(dead_code)] // the dispatch switch arrives with `mm_nvfp4` in Task 7
 pub(crate) const MM_MIN_TOKENS: usize = 8;
 /// `MV_ROWS_PER_SG * MV_SG_PER_TG` in the shader.
 const MV_ROWS_PER_TG: usize = 8;
 /// `32 * MV_SG_PER_TG`.
 const MV_THREADS: usize = 64;
+/// Weight rows and tokens per `mm_nvfp4` tile (`MM_TN`, `MM_TT`).
+const MM_TILE: usize = 32;
+/// Four simdgroups.
+const MM_THREADS: usize = 128;
 /// The simdgroup width every kernel assumes.
 const SIMD_WIDTH: usize = 32;
 
@@ -38,6 +41,7 @@ const SIMD_WIDTH: usize = 32;
 #[derive(Debug)]
 pub(crate) struct Pipelines {
     pub mv: ComputePipeline,
+    pub mm: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -77,6 +81,7 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
     };
     let p = Arc::new(Pipelines {
         mv: get("mv_nvfp4")?,
+        mm: get("mm_nvfp4")?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -223,11 +228,19 @@ pub(crate) fn matmul(
     enc.set_buffer(1, Some(x.buffer()), dims.start * 4);
     enc.set_buffer(2, Some(&out), 0);
     enc.set_bytes(3, &params);
-    enc.set_compute_pipeline_state(&pipes.mv);
-    enc.dispatch_thread_groups(
-        grid(n.div_ceil(MV_ROWS_PER_TG), tokens),
-        grid(MV_THREADS, 1),
-    );
+    if tokens < MM_MIN_TOKENS {
+        enc.set_compute_pipeline_state(&pipes.mv);
+        enc.dispatch_thread_groups(
+            grid(n.div_ceil(MV_ROWS_PER_TG), tokens),
+            grid(MV_THREADS, 1),
+        );
+    } else {
+        enc.set_compute_pipeline_state(&pipes.mm);
+        enc.dispatch_thread_groups(
+            grid(n.div_ceil(MM_TILE), tokens.div_ceil(MM_TILE)),
+            grid(MM_THREADS, 1),
+        );
+    }
     drop(enc);
     Ok((
         MetalStorage::new(out, dev.clone(), tokens * n, DType::F32),

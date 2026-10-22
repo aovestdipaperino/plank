@@ -312,6 +312,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_tiled_matmul_matches_cpu_with_ragged_edges() {
+        // 8 is the first tiled size; 37 tokens and 45 rows leave partial tiles.
+        for (i, (cols, rows, tokens)) in [(64, 32, 8), (192, 45, 37), (2048, 64, 64), (512, 1, 9)]
+            .into_iter()
+            .enumerate()
+        {
+            metal_matmul_case(40 + u64::try_from(i).unwrap(), cols, rows, tokens);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn a_mapped_weight_binds_the_whole_file_without_copying() {
         let Some(dev) = metal() else { return };
         let mut rng = Rng::new(30);
