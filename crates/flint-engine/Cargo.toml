@@ -39,3 +39,7 @@ libc = { version = "0.2", optional = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "bench_kernels"
+required-features = ["candle"]
