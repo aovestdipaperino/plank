@@ -4,6 +4,8 @@
 //! tested without a model. Everything that touches tensors sits behind the
 //! `candle` feature.
 
+#[cfg(feature = "candle")]
+pub mod file;
 pub mod gguf;
 pub mod nvfp4;
 #[cfg(any(test, feature = "testgguf"))]
@@ -23,6 +25,13 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
+        Self(e.to_string())
+    }
+}
+
+#[cfg(feature = "candle")]
+impl From<candle_core::Error> for Error {
+    fn from(e: candle_core::Error) -> Self {
         Self(e.to_string())
     }
 }
