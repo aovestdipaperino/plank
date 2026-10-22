@@ -4,4 +4,6 @@ pub mod block;
 #[cfg(feature = "candle")]
 pub mod cpu;
 #[cfg(feature = "candle")]
+pub mod ops;
+#[cfg(feature = "candle")]
 pub mod tensor;
