@@ -4,7 +4,10 @@
 //! tested without a model. Everything that touches tensors sits behind the
 //! `candle` feature.
 
+pub mod gguf;
 pub mod nvfp4;
+#[cfg(any(test, feature = "testgguf"))]
+pub mod testgguf;
 
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +29,6 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[allow(dead_code)] // first used by the tensor loaders in a later task
 pub(crate) fn err(msg: impl Into<String>) -> Error {
     Error(msg.into())
 }
