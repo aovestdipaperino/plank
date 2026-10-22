@@ -179,13 +179,13 @@ fn no_copy(dev: &MetalDevice, file: &MappedFile) -> Option<Arc<Buffer>> {
     });
     // SAFETY: `ptr..ptr+len` is the page-aligned mapping rounded up to its
     // last page, all of it mapped and read-only for the mapping's lifetime.
-    // Metal may run the deallocator on any thread. That is sound only because
-    // the block captures nothing but an `Arc<Mmap>`, which is `Send + Sync`:
-    // do not add captures to it.
     // That lifetime covers the buffer's: the deallocator block above holds an
     // `Arc` of the `Mmap`, released only when Metal frees the buffer. Metal
     // never writes the memory (no kernel binds a weight for writing) and the
     // deallocator does not free it, the `Mmap` drop does.
+    // Metal may run the deallocator on any thread. That is sound only because
+    // the block captures nothing but an `Arc<Mmap>`, which is `Send + Sync`:
+    // do not add captures to it.
     let raw_buf = unsafe {
         raw.newBufferWithBytesNoCopy_length_options_deallocator(
             ptr,
