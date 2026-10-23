@@ -3995,3 +3995,15 @@ command `bash_status`; that wording is the C's and stays for the other
 dialects, but for Flint (`ToolContext::flint_hints`) the hint now names the
 `bash_status` and `bash_stop` tools. Its habit of drafting whole files while
 thinking gets a prompt line of its own (`FLINT_NO_DRAFT_LINE`).
+
+## The flint catalog entry shipped without a catalog version bump
+
+`engines.json` gained the `flint` engine with its top-level `version` left at
+2. Released 7.0.8 and older adopt the remote catalog when its version is
+strictly higher, and their fit rule and routing treat any family other than
+`gemma` as a DeepSeek engine: a bump would have offered them Flint as a ds4
+model, which their C engine cannot open. New builds carry the entry compiled
+in, so they see it without the bump. The next catalog bump must wait until
+the 7.0.x clients have aged out, or the old fit rule has to be reckoned with
+(`enginefit.rs` in v7.0.8, `raw_str(entry, "family") == Some("gemma")`).
+

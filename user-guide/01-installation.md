@@ -47,7 +47,7 @@ cargo build --release
 ```
 
 - **With `refs/ds4` present** — `build.rs` compiles `libds4core.a` from the Metal-backend objects, links Foundation and Metal, and enables real inference.
-- **Without it** — plank still builds and runs Gemma 4 for real, on plank's own Rust engine, which compiles no C. DeepSeek and Qwen are unavailable; a build with neither falls back to the echo stub, which is fine for working on the UI and tools. `PLANK_NO_DS4=1 cargo build --release` gives you this build even with the submodule checked out.
+- **Without it** — plank still builds and runs Gemma 4 and Flint for real, on plank's own Rust engine, which compiles no C. DeepSeek and Qwen are unavailable; a build with neither falls back to the echo stub, which is fine for working on the UI and tools. `PLANK_NO_DS4=1 cargo build --release` gives you this build even with the submodule checked out.
 
 ## Getting the model
 
@@ -60,6 +60,7 @@ plank knows its models as named *engines*: a main model plus the companions it r
 | `qwen` | Qwen3.8-Flash-Next. | ~177 GB |
 | `gemma4-e4b` | Gemma 4 E4B instruct (Q4_K_M), on plank's own Rust engine. | ~5 GB |
 | `gemma4-12b` | Gemma 4 12B instruct (QAT Q4_0), on the same engine. | ~7 GB |
+| `flint` | Flint, Recursive's 40B mixture-of-experts (NVFP4), on plank's own Rust engine. | ~23 GB |
 
 Pick one with `--model <name>`, for example `plank --model gemma4-e4b`. Real inference with no choice at all runs the default engine. On first run, with nothing at its path (`~/.plank/ds4vision.gguf`), plank opens an engine menu on a terminal: every engine is listed, the ones this machine cannot run are dimmed with the reason beside them (not enough RAM, not enough free disk, not in this build), and the one you pick downloads in the background while a wait screen shows its progress. When it finishes, plank installs it and records it as your `engine.model`. Esc leaves the download running; a later launch tells you once it has finished, and picking it then installs it. With `--model` on the command line plank offers just that engine, and with no terminal it exits with instructions. `--pick-engine` opens the menu even when the selected engine is installed, and `/engines` restarts into it from a running session.
 
@@ -69,9 +70,13 @@ Downloads come from Hugging Face. With `HF_API_KEY` set, plank authenticates to 
 
 Gemma is the small, portable choice. It runs on Metal on a Mac and on the CPU elsewhere, on a Rust engine that needs neither the `refs/ds4` submodule nor macOS, so a plain `cargo build` does real inference with it. Tool calls, thinking, sessions, sub-agents, memory and KV reuse all work as they do on DeepSeek; vision, speculative decoding and the System-1 memory gate do not exist for it yet.
 
-With no `-c`, Gemma sizes its context from the RAM: the largest window whose KV fits a third of memory, never below 8,192 tokens and never past what the model was trained for. On a 128 GB Mac that is the full 131,072 tokens for E4B and about 66,000 for 12B; a 16 GB machine gives 12B the 8,192 floor. plank prints the size it chose and what it costs at startup.
+With no `-c`, Gemma opens the model's whole trained window when its KV fits in half of memory; otherwise it takes the largest window whose KV fits a third of memory, never below 8,192 tokens. On a 128 GB Mac that is the full 131,072 tokens for E4B and about 66,000 for 12B; a 16 GB machine gives 12B the 8,192 floor. plank prints the size it chose and what it costs at startup.
 
 Its sessions are a family of their own (`.gemma.kv`), so switching between Gemma and DeepSeek keeps both histories. Any Gemma 4 GGUF also works by path, `plank -m ~/models/gemma-4-E4B-it-Q4_K_M.gguf`, recognised from the file's own architecture field.
+
+### Flint
+
+Flint is Recursive's 40B mixture-of-experts model, quantised to NVFP4. It runs on the same Rust engine as Gemma, with NVFP4 kernels of its own, so it needs neither the submodule nor any C; on a Mac it decodes on Metal at speeds close to Ollama's on the same machine. `plank --model flint` fetches the 23 GB file. With no `-c` it opens its whole 262,144-token window when the KV (about 100 KB a token) fits in half of memory, as Gemma does. Its sessions are their own family (`.flint.kv`), and it has no vision or speculative decoding. A Flint GGUF also works by path, recognised from its architecture field. The details are in `docs/FLINT.md`.
 
 DeepSeek V4.1 Flash is a family of its own, with its own tool-call dialect and its own `.ds41.kv` transcripts. `--model ds41` fetches and runs it; pointing `--model` at a V4.1 GGUF path works too, and the family and dialect follow from the file's own architecture field. It is large enough that plank will usually turn on SSD streaming for you.
 
@@ -127,13 +132,13 @@ Without a model file, or in a build with no engine that can load it, plank runs 
 
 | Path | What |
 |---|---|
-| `~/.plank/<engine>.gguf` | an engine's main model, for example `ds4vision.gguf` (the default), `ds41.gguf`, `qwen.gguf` or `gemma4-e4b.gguf` |
+| `~/.plank/<engine>.gguf` | an engine's main model, for example `ds4vision.gguf` (the default), `ds41.gguf`, `qwen.gguf`, `gemma4-e4b.gguf` or `flint.gguf` |
 | `~/.plank/<engine>.mtp.gguf` | an engine's drafter, for speculation (`--mtp`): `ds4vision.mtp.gguf` is DeepSeek V4's DSpark model |
 | `~/.plank/<engine>.vision.gguf` | an engine's vision encoder. `qwen.vision.gguf` is installed with the engine, but plank does not load one for Qwen yet |
 | `~/.plank/engines/` | one `<engine>.installed.json` per installed engine, recording which version is on disk |
 | `~/.plank/engines.local.json` | your own engines and default, layered over the catalog |
 | `~/.plank/staging/<engine>/` | background downloads in progress, installed at the next launch |
-| `~/.plank/kvcache/` | saved sessions (`<name>.<family>.kv`, such as `.ds4.kv` or `.gemma.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
+| `~/.plank/kvcache/` | saved sessions (`<name>.<family>.kv`, such as `.ds4.kv`, `.gemma.kv` or `.flint.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |
 | `~/.plank/hooks.json` | global hooks |

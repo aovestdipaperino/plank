@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Flint, a native engine.** `plank --model flint` downloads and runs
+  Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
+  Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the
+  CPU over gemma-engine's session, KV cache and sampler. No C and no
+  `refs/ds4` needed. Its transcripts are a family of their own (`.flint.kv`),
+  its tool calls use Flint's `<tool_call>`/`<arg_key>`/`<arg_value>` dialect,
+  and its KV truncates exactly, as Gemma's does. On Metal a token decodes
+  through one command encoder (`decode.rs`) over an f16 KV cache, and prefill
+  runs grouped experts and fused FlashAttention-style kernels in f16. On an
+  M5 Max it decodes at about 165 tok/s on a short context, ahead of Ollama up
+  to about 9K tokens and 7% behind at 18K; prefill is 1.7 to 3.2 times slower
+  than Ollama. See `docs/FLINT.md`.
+
+- **Ignored tool arguments are named.** A tool call carrying an argument the
+  tool does not take now gets a note in its result naming it and the
+  arguments the tool does take (for `bash`, also the folder commands run in),
+  instead of the argument being dropped silently.
+
 - **Prefill and KV events in `/repro` dumps.** Every dump has a `## KV events`
   section listing, oldest first, the warm-up prefill before the first turn,
   each generation's prefill size and reuse (with a `full rebuild` note when
@@ -93,6 +111,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Flint edits that repeat `path` are accepted.** Flint often gives `path`
+  again at the end of an `edit` call; a key repeated with the same value is
+  now dropped instead of rejecting the call. Two different values are still
+  refused, with a message asking for each argument once.
+
+- **No more Qwen parse errors on Flint's tool calls in `/btw` and the tdk
+  console.** The `/btw` aside rendered Flint's tool calls as Qwen's; it now
+  uses the model's own dialect, and trace-stream 0.1.9 recognises Flint's
+  calls for renderers that are not told the dialect. Tests no longer write to
+  the real `~/.plank/tool-call-errors.log`.
+
 - **A turn stuck re-issuing a refused tool call now ends on its own.** The
   loop guard blocked a call repeated with identical arguments, but ended the
   turn only after three refused stanzas in a row, which a single real call
@@ -156,6 +185,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile builds its prompt cache once more on the next launch.
 
 ### Changed
+
+- **A native engine opens the model's own context by default.** With no
+  `-c`, Gemma and Flint open the file's whole trained window when its KV fits
+  in half of RAM, and otherwise the window whose KV fits a third of RAM.
+
+- **Flint gets tool hints in its own terms.** A running job's hint names the
+  `bash_status` and `bash_stop` tools (Flint ran `bash_status` as a shell
+  command), and its system prompt asks it to put code straight into a write
+  or edit call rather than drafting it while thinking.
+
+- **The memory pass asks for a quick answer.** The background extraction
+  prompt tells the model not to overthink a short background task.
 
 - **Sub-agents fan out up to 32 wide by default.** `agents.maxParallel` now
   defaults to 32 (it was 4) and clamps at 32 (it was 16), and a provider

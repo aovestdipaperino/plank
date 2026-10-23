@@ -167,14 +167,14 @@ One limitation: settings come from the directory plank launches in, so project s
 
 | Flag | What |
 |---|---|
-| `-m, --model NAME\|PATH` | run a named engine (`ds4vision`, `ds41`, `qwen`, `gemma4-e4b`, `gemma4-12b`, or one of yours from `~/.plank/engines.local.json`) with its companions, or load a GGUF file on its own |
+| `-m, --model NAME\|PATH` | run a named engine (`ds4vision`, `ds41`, `qwen`, `gemma4-e4b`, `gemma4-12b`, `flint`, or one of yours from `~/.plank/engines.local.json`) with its companions, or load a GGUF file on its own |
 | `--model:NAME` | run a named engine, and fail rather than read `NAME` as a path |
 | `--pick-engine` | open the engine menu at launch even when the selected engine is installed |
 | `-t, --threads N` | worker thread count |
 | `--backend NAME` | `metal`, `cuda`, or `cpu` |
 | `--metal` / `--cuda` / `--cpu` | the same, as switches |
 | `--power N` | GPU power cap percent (1..100) |
-| `-c, --ctx N` | context window in tokens, or with a `k`/`m` suffix: `-c 128k`, `-c 1m`. Without it, Gemma sizes its window from the RAM |
+| `-c, --ctx N` | context window in tokens, or with a `k`/`m` suffix: `-c 128k`, `-c 1m`. Without it, Gemma and Flint open the model's own window when its KV fits in half of RAM, else the window a third of RAM holds |
 | `-n, --tokens N` | maximum tokens to generate (default 50000) |
 | `--quality` | quality mode |
 | `--warm-weights` | touch all weights at load |

@@ -13,6 +13,18 @@ it.
 Install with `brew install aovestdipaperino/tap/plank-agent-beta`. Everything
 the betas below carried is in stable 7.0.0.
 
+### 7.0.9
+
+**Flint joins the engines.** `plank --model flint` downloads Recursive's
+Flint, a 40B mixture-of-experts model in NVFP4, and runs it on plank's own Rust
+engine, with no C to build. On an M5 Max it decodes at about 165 tokens a
+second on a short context, a little ahead of Ollama on the same machine up to
+about 9K tokens of context. Its sessions are a family of their own, and plank
+smooths over its tool-call habits: a repeated `path` on an edit is accepted,
+arguments a tool does not take are named back to it, and job hints name the
+tools to call. Gemma and Flint now open their model's whole window by default
+when the KV fits in half of your RAM.
+
 ### 7.0.8
 
 **Sub-agents fan out wider.** Against an online provider, plank now runs up to

@@ -7,6 +7,16 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.9 beta: Flint, on plank's own engine.** `plank --model flint`
+downloads Recursive's Flint, a 40B mixture-of-experts model in NVFP4 (about
+23 GB), and runs it on the same Rust engine as Gemma, with Metal kernels
+written for its format. It decodes at about 165 tokens a second on an M5 Max,
+a little ahead of Ollama on the same machine until the context passes about
+9K tokens. plank also learned Flint's tool-call habits: a `path` given twice
+on an edit is accepted, arguments a tool does not take are named back to the
+model, and job hints name the tools to call. With no `-c`, Gemma and Flint
+open their model's whole window when the KV fits in half of your RAM.
+
 **v7.0.8 beta: sub-agents fan out wider.** Against an online provider,
 plank now runs up to 32 sub-agents at once by default, where it used to stop at
 4. `agents.maxParallel` accepts up to 32; lower it if your provider starts rate
