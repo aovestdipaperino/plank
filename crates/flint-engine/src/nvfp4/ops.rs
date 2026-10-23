@@ -572,7 +572,9 @@ mod tests {
         let Some(dev) = metal() else { return };
         let mut rng = Rng::new(50);
         let m = experts(&mut rng, 256, 128, 16);
-        for (tokens, k_used) in [(1, 6), (5, 6), (9, 2)] {
+        // From 8 tokens up the grouped kernels run; 100 tokens give each
+        // expert more than one 32-slot tile.
+        for (tokens, k_used) in [(1, 6), (5, 6), (9, 2), (100, 6)] {
             let xv = rng.vec(tokens * 256);
             let idv: Vec<u32> = (0..tokens * k_used).map(|_| rng.below(16)).collect();
             let rv: Vec<f32> = (0..tokens * k_used).map(|_| rng.uniform().abs()).collect();

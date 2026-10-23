@@ -39,7 +39,7 @@ impl Attention {
     /// `x` is `[t, hidden]` at positions `offset..`; returns `[t, hidden]`
     /// and extends `cache`. `mask` is this layer type's mask for the forward
     /// (`None` for a single token, which sees every key left after the
-    /// window narrowing).
+    /// window narrowing), built only if the op-chain attention runs.
     // q, k, v, x and t are the attention formula's own names.
     #[allow(clippy::many_single_char_names)]
     pub(crate) fn forward(
@@ -48,7 +48,7 @@ impl Attention {
         offset: usize,
         cache: &mut LayerKv,
         rope: &Rope,
-        mask: Option<&Tensor>,
+        mask: Option<&LazyMask<'_>>,
     ) -> Result<Tensor> {
         let t = x.dim(0)?;
         let heads = |w: &Arc<NvWeight>, n: usize| -> Result<Tensor> {
@@ -87,6 +87,21 @@ impl Attention {
             bail!("Flint KV cache is empty after an append")
         };
         let (base, stored) = (cache.base(), cache.len());
+        // Head dims are small integers, exact in f64.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        if mask.is_some()
+            && let Some(ctx) = prefill_attend(
+                &q,
+                (&keys, &values),
+                &self.sinks,
+                (offset, base),
+                self.window.unwrap_or(0),
+                scale,
+            )?
+        {
+            return self.project(&ctx, t);
+        }
         // A sliding layer's earliest query sees no key before
         // `offset + 1 - window`; drop those before scoring.
         let start = self.window.map_or(0, |w| (offset + 1).saturating_sub(w));
@@ -101,9 +116,6 @@ impl Attention {
         } else {
             (keys, values)
         };
-        // Head dims are small integers, exact in f64.
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
         let fused = if mask.is_none() {
             decode_attend(&q, &keys, &values, &self.sinks, scale)?
         } else {
@@ -117,16 +129,46 @@ impl Attention {
                 &keys.to_dtype(candle_core::DType::F32)?,
                 &values.to_dtype(candle_core::DType::F32)?,
                 &self.sinks,
-                mask,
+                mask.map(LazyMask::get).transpose()?,
                 scale,
             )?,
         };
+        self.project(&ctx, t)
+    }
+
+    /// The output projection of `ctx` `[1, heads, t, head_dim]`.
+    fn project(&self, ctx: &Tensor, t: usize) -> Result<Tensor> {
         let ctx = ctx
             .squeeze(0)?
             .transpose(0, 1)?
             .contiguous()?
             .reshape((t, self.heads * self.head_dim))?;
         ops::matmul(&self.o, &ctx)
+    }
+}
+
+/// A causal mask built on first use: the fused prefill attention needs
+/// none, so on Metal it is never built.
+pub(crate) struct LazyMask<'a> {
+    cell: std::cell::OnceCell<Tensor>,
+    build: Box<dyn Fn() -> Result<Tensor> + 'a>,
+}
+
+impl<'a> LazyMask<'a> {
+    pub(crate) fn new(build: impl Fn() -> Result<Tensor> + 'a) -> Self {
+        Self {
+            cell: std::cell::OnceCell::new(),
+            build: Box::new(build),
+        }
+    }
+
+    /// The mask, built now if it was not yet.
+    pub(crate) fn get(&self) -> Result<&Tensor> {
+        if let Some(m) = self.cell.get() {
+            return Ok(m);
+        }
+        let m = (self.build)()?;
+        Ok(self.cell.get_or_init(|| m))
     }
 }
 
@@ -280,6 +322,115 @@ fn kv_operand<'a>(
         offset: layout.start_offset() * size,
         head_stride: stride[1],
     })
+}
+
+/// Attention for many queries through the fused prefill kernel
+/// (`attn_prefill` in `fused.metal`), which reads the cache in place and
+/// masks from positions instead of a mask tensor. `query` is
+/// `[1, heads, t, d]` at absolute positions `q_pos0..`, `key`/`value` the
+/// whole live cache view from absolute position `key_base`, `window` 0 for
+/// none. Returns `[1, heads, t, d]`, or `None` when the kernel does not
+/// apply (not on Metal, or a shape or layout it does not take).
+#[cfg(target_os = "macos")]
+pub(crate) fn prefill_attend(
+    query: &Tensor,
+    (key, value): (&Tensor, &Tensor),
+    sinks: &Tensor,
+    (q_pos0, key_base): (usize, usize),
+    window: usize,
+    scale: f64,
+) -> Result<Option<Tensor>> {
+    use candle_core::Storage;
+    use candle_core::op::BackpropOp;
+
+    use crate::nvfp4::metal::{ATTN_HEAD_DIM, PF_Q, PrefillQueries, prefill_attention};
+
+    let (_, heads, t, d) = query.dims4()?;
+    let (_, kv_heads, _, key_d) = key.dims4()?;
+    let fits = query.device().is_metal()
+        && t > 1
+        && d == ATTN_HEAD_DIM
+        && key_d == d
+        && value.dims() == key.dims()
+        && value.dtype() == key.dtype()
+        && matches!(
+            key.dtype(),
+            candle_core::DType::F32 | candle_core::DType::F16
+        )
+        && kv_heads > 0
+        && heads.is_multiple_of(kv_heads);
+    if !fits {
+        return Ok(None);
+    }
+    // Whole 32-row blocks of queries per head; the padding rows come out
+    // zero and are cut off below.
+    let t_pad = t.div_ceil(PF_Q) * PF_Q;
+    let query = if t_pad > t {
+        let pad = Tensor::zeros((1, heads, t_pad - t, d), query.dtype(), query.device())?;
+        Tensor::cat(&[query, &pad], 2)?
+    } else {
+        query.contiguous()?
+    };
+    let sinks = sinks.contiguous()?;
+    let (q_store, q_layout) = query.storage_and_layout();
+    let (k_store, k_layout) = key.storage_and_layout();
+    let (v_store, v_layout) = value.storage_and_layout();
+    let (s_store, s_layout) = sinks.storage_and_layout();
+    let (
+        Storage::Metal(q_metal),
+        Storage::Metal(k_metal),
+        Storage::Metal(v_metal),
+        Storage::Metal(s_metal),
+    ) = (&*q_store, &*k_store, &*v_store, &*s_store)
+    else {
+        return Ok(None);
+    };
+    let (Some(k_op), Some(v_op)) = (
+        kv_operand(k_metal, k_layout, d),
+        kv_operand(v_metal, v_layout, d),
+    ) else {
+        return Ok(None);
+    };
+    let queries = PrefillQueries {
+        storage: q_metal,
+        offset: q_layout.start_offset() * 4,
+        t,
+        t_pad,
+        pos0: q_pos0,
+    };
+    // The kernel takes the scale as f32, as every score is.
+    #[allow(clippy::cast_possible_truncation)]
+    let out = prefill_attention(
+        &queries,
+        &k_op,
+        &v_op,
+        (s_metal, s_layout.start_offset() * 4),
+        (heads, kv_heads),
+        key_base,
+        window,
+        scale as f32,
+    )?;
+    let out = Tensor::from_storage(
+        Storage::Metal(out),
+        (1, heads, t_pad, d),
+        BackpropOp::none(),
+        false,
+    );
+    Ok(Some(out.narrow(2, 0, t)?))
+}
+
+/// Off macOS there is no fused prefill: always [`attend`].
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn prefill_attend(
+    _query: &Tensor,
+    _kv: (&Tensor, &Tensor),
+    _sinks: &Tensor,
+    _positions: (usize, usize),
+    _window: usize,
+    _scale: f64,
+) -> Result<Option<Tensor>> {
+    Ok(None)
 }
 
 /// Off macOS there are no Metal kernels: always [`attend`].
@@ -491,7 +642,7 @@ mod tests {
         let rope = Rope::new(64, 10_000.0, 16, &dev).unwrap();
         let mut cache = LayerKv::default();
         let x = Tensor::from_vec(rand(2 * 64, 4), (2, 64), &dev).unwrap();
-        let mask = causal_mask(2, 0, 0, 2, None, &dev).unwrap();
+        let mask = LazyMask::new(|| causal_mask(2, 0, 0, 2, None, &dev));
         attn.forward(&x, 0, &mut cache, &rope, Some(&mask)).unwrap();
         assert_eq!(cache.len(), 2);
         let one = x.narrow(0, 0, 1).unwrap();
@@ -565,6 +716,91 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(worst < 1e-4 * amp, "case {case}: max diff {worst}");
+        }
+    }
+
+    /// The fused prefill kernel against [`attend`] with an explicit causal
+    /// mask on Metal: a fresh cache, queries after earlier keys, a sliding
+    /// window over a cache whose base is past 0, query counts on both sides
+    /// of the 32-row block, and f32 and f16 caches.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fused_prefill_matches_attend_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let d = 128;
+        let scale = 1.0 / 128f64.sqrt();
+        for (case, &(heads, kv_heads, t, offset, base, window, half)) in [
+            (32, 4, 37, 0, 0, 0, false),
+            (8, 2, 64, 100, 0, 0, true),
+            (16, 4, 33, 300, 40, 50, true),
+            (8, 8, 2, 7, 0, 3, false),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seed = 100 + case as u64 * 10;
+            let stored = offset + t - base;
+            let buf = |seed: u64| {
+                let v = Tensor::from_vec(
+                    rand(kv_heads * stored * d, seed),
+                    (1, kv_heads, stored, d),
+                    &dev,
+                )
+                .unwrap();
+                if half {
+                    v.to_dtype(candle_core::DType::F16).unwrap()
+                } else {
+                    v
+                }
+            };
+            let (k, v) = (buf(seed + 1), buf(seed + 2));
+            let q =
+                Tensor::from_vec(rand(heads * t * d, seed + 3), (1, heads, t, d), &dev).unwrap();
+            let sinks = Tensor::from_vec(rand(heads, seed + 4), heads, &dev).unwrap();
+            let got: Vec<f32> = prefill_attend(&q, (&k, &v), &sinks, (offset, base), window, scale)
+                .unwrap()
+                .expect("the prefill kernel takes this shape")
+                .contiguous()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let start = if window == 0 {
+                base
+            } else {
+                base.max((offset + 1).saturating_sub(window))
+            };
+            let wide = |x: &Tensor| {
+                x.narrow(2, start - base, stored - (start - base))
+                    .unwrap()
+                    .to_dtype(candle_core::DType::F32)
+                    .unwrap()
+            };
+            let mask = causal_mask(
+                t,
+                offset,
+                start,
+                offset + t - start,
+                (window > 0).then_some(window),
+                &dev,
+            )
+            .unwrap();
+            let want: Vec<f32> = attend(&q, &wide(&k), &wide(&v), &sinks, Some(&mask), scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4, "case {case}: max diff {worst}");
         }
     }
 

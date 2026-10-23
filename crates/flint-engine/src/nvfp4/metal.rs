@@ -29,6 +29,8 @@ const SOURCE: &str = include_str!("nvfp4.metal");
 const FUSED_SOURCE: &str = include_str!("fused.metal");
 /// The decode graph's own kernels, compiled after the two above.
 const DECODE_SOURCE: &str = include_str!("decode.metal");
+/// The `MoE` grouped by expert, for many tokens.
+const GROUPED_SOURCE: &str = include_str!("moe_grouped.metal");
 
 /// From this many tokens up, a matmul runs the tiled `mm_nvfp4` kernel.
 pub(crate) const MM_MIN_TOKENS: usize = 8;
@@ -56,6 +58,12 @@ pub(crate) const ATTN_BLOCK: usize = SIMD_WIDTH;
 /// enough to fill the GPU, few enough that `attn_dec_combine` merges them
 /// quickly at any depth.
 pub(crate) const ATTN_MAX_CHUNKS: usize = 64;
+/// Queries per `attn_prefill` threadgroup: four simdgroups of 8 rows.
+pub(crate) const PF_Q: usize = 32;
+/// Keys per `attn_prefill` block.
+const PF_K: usize = 32;
+/// Threads per `attn_prefill` threadgroup.
+const PF_THREADS: usize = 4 * SIMD_WIDTH;
 /// Groups of `ATTN_HEAD_DIM` threads in an `attn_dec_combine` threadgroup,
 /// each summing every `COMBINE_GROUPS`-th run.
 pub(crate) const COMBINE_GROUPS: usize = 8;
@@ -83,6 +91,10 @@ pub(crate) const ROUTE_MAX_EXPERTS: usize = ROUTE_THREADS * ROUTE_PER_THREAD;
 /// Values of the residual stream each `dec_combine_norm` thread holds, so
 /// the graph takes a model width up to `NORM_THREADS * COMBINE_PER_THREAD`.
 pub(crate) const COMBINE_PER_THREAD: usize = 4;
+/// Threads in `moe_group`'s one threadgroup.
+const GROUP_THREADS: usize = 1024;
+/// The most experts `moe_group` sorts slots over.
+const GROUP_MAX_EXPERTS: usize = 1024;
 /// Threads in the decode graph's one `dec_rmsnorm` threadgroup.
 pub(crate) const NORM_THREADS: usize = 1024;
 
@@ -110,18 +122,25 @@ fn source() -> String {
          #define ATTN_HEAD_DIM {ATTN_HEAD_DIM}\n\
          #define ATTN_BLOCK {ATTN_BLOCK}\n\
          #define COMBINE_GROUPS {COMBINE_GROUPS}\n\
+         #define PF_Q {PF_Q}\n\
+         #define PF_K {PF_K}\n\
+         #define PF_THREADS {PF_THREADS}\n\
          #define ATTN_SG {ATTN_SG}\n\
          #define ROUTE_MAX_K {ROUTE_MAX_K}\n\
          #define ROUTE_THREADS {ROUTE_THREADS}\n\
          #define ROUTE_PER_THREAD {ROUTE_PER_THREAD}\n\
          #define NORM_THREADS {NORM_THREADS}\n\
          #define COMBINE_PER_THREAD {COMBINE_PER_THREAD}\n\
+         #define GROUP_THREADS {GROUP_THREADS}\n\
+         #define GROUP_MAX_EXPERTS {GROUP_MAX_EXPERTS}\n\
          #line 1 \"nvfp4.metal\"\n\
          {SOURCE}\n\
          #line 1 \"fused.metal\"\n\
          {FUSED_SOURCE}\n\
          #line 1 \"decode.metal\"\n\
-         {DECODE_SOURCE}"
+         {DECODE_SOURCE}\n\
+         #line 1 \"moe_grouped.metal\"\n\
+         {GROUPED_SOURCE}"
     )
 }
 
@@ -143,6 +162,11 @@ pub(crate) struct Pipelines {
     pub dec_qk_norm_rope_f16: ComputePipeline,
     pub dec_mv_f32: ComputePipeline,
     pub dec_combine_norm: ComputePipeline,
+    pub moe_group: ComputePipeline,
+    pub attn_prefill: ComputePipeline,
+    pub attn_prefill_f16: ComputePipeline,
+    pub moe_mm_gate_up: ComputePipeline,
+    pub moe_mm_down: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -203,6 +227,11 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
         dec_qk_norm_rope_f16: get("dec_qk_norm_rope_f16", ATTN_HEAD_DIM)?,
         dec_mv_f32: get("dec_mv_f32", MV_THREADS)?,
         dec_combine_norm: get("dec_combine_norm", NORM_THREADS)?,
+        moe_group: get("moe_group", GROUP_THREADS)?,
+        attn_prefill: get("attn_prefill_f32", PF_THREADS)?,
+        attn_prefill_f16: get("attn_prefill_f16", PF_THREADS)?,
+        moe_mm_gate_up: get("moe_mm_gate_up", MM_THREADS)?,
+        moe_mm_down: get("moe_mm_down", MM_THREADS)?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -454,42 +483,58 @@ pub(crate) fn moe(
     let h = dev.new_buffer(slots * ffn, DType::F32, "nvfp4_moe_h")?;
     let ys = dev.new_buffer(slots * hidden, DType::F32, "nvfp4_moe_ys")?;
     let out = dev.new_buffer(tokens * hidden, DType::F32, "nvfp4_moe_out")?;
-    // Each scoped encoder below ends before the next `command_encoder()`;
-    // otherwise candle hands out a different pool command buffer and the
-    // three passes lose their order.
-    {
-        let enc = dev.command_encoder()?;
-        enc.set_label("nvfp4_moe_gate_up");
-        enc.set_compute_pipeline_state(&pipes.moe_gate_up);
-        enc.set_buffer(0, Some(&gate), gate_off);
-        enc.set_buffer(1, Some(&up), up_off);
-        enc.set_buffer(2, Some(x.buffer()), dims.x_start * 4);
-        enc.set_buffer(3, Some(ids.buffer()), dims.ids_start * 4);
-        enc.set_buffer(4, Some(&gate_scales), 0);
-        enc.set_buffer(5, Some(&up_scales), 0);
-        enc.set_buffer(6, Some(&h), 0);
-        enc.set_bytes(7, &params);
-        enc.dispatch_thread_groups(
-            grid(ffn.div_ceil(MV_ROWS_PER_TG), slots),
-            grid(MV_THREADS, 1),
-        );
-    }
-    // gate/up's encoder has ended (see above).
-    {
-        let enc = dev.command_encoder()?;
-        enc.set_label("nvfp4_moe_down");
-        enc.set_compute_pipeline_state(&pipes.moe_down);
-        enc.set_buffer(0, Some(&down), down_off);
-        enc.set_buffer(1, Some(&h), 0);
-        enc.set_buffer(2, Some(ids.buffer()), dims.ids_start * 4);
-        enc.set_buffer(3, Some(&down_scales), 0);
-        enc.set_buffer(4, Some(route.buffer()), dims.route_start * 4);
-        enc.set_buffer(5, Some(&ys), 0);
-        enc.set_bytes(6, &params);
-        enc.dispatch_thread_groups(
-            grid(hidden.div_ceil(MV_ROWS_PER_TG), slots),
-            grid(MV_THREADS, 1),
-        );
+    if tokens >= MM_MIN_TOKENS && m.count() <= GROUP_MAX_EXPERTS {
+        grouped(
+            &pipes,
+            dev,
+            [
+                (&*gate, gate_off, &*gate_scales),
+                (&*up, up_off, &*up_scales),
+                (&*down, down_off, &*down_scales),
+            ],
+            (x, ids, route),
+            dims,
+            &params,
+            (&h, &ys),
+        )?;
+    } else {
+        // Each scoped encoder below ends before the next `command_encoder()`;
+        // otherwise candle hands out a different pool command buffer and the
+        // three passes lose their order.
+        {
+            let enc = dev.command_encoder()?;
+            enc.set_label("nvfp4_moe_gate_up");
+            enc.set_compute_pipeline_state(&pipes.moe_gate_up);
+            enc.set_buffer(0, Some(&gate), gate_off);
+            enc.set_buffer(1, Some(&up), up_off);
+            enc.set_buffer(2, Some(x.buffer()), dims.x_start * 4);
+            enc.set_buffer(3, Some(ids.buffer()), dims.ids_start * 4);
+            enc.set_buffer(4, Some(&gate_scales), 0);
+            enc.set_buffer(5, Some(&up_scales), 0);
+            enc.set_buffer(6, Some(&h), 0);
+            enc.set_bytes(7, &params);
+            enc.dispatch_thread_groups(
+                grid(ffn.div_ceil(MV_ROWS_PER_TG), slots),
+                grid(MV_THREADS, 1),
+            );
+        }
+        // gate/up's encoder has ended (see above).
+        {
+            let enc = dev.command_encoder()?;
+            enc.set_label("nvfp4_moe_down");
+            enc.set_compute_pipeline_state(&pipes.moe_down);
+            enc.set_buffer(0, Some(&down), down_off);
+            enc.set_buffer(1, Some(&h), 0);
+            enc.set_buffer(2, Some(ids.buffer()), dims.ids_start * 4);
+            enc.set_buffer(3, Some(&down_scales), 0);
+            enc.set_buffer(4, Some(route.buffer()), dims.route_start * 4);
+            enc.set_buffer(5, Some(&ys), 0);
+            enc.set_bytes(6, &params);
+            enc.dispatch_thread_groups(
+                grid(hidden.div_ceil(MV_ROWS_PER_TG), slots),
+                grid(MV_THREADS, 1),
+            );
+        }
     }
     // down's encoder has ended (see above).
     {
@@ -508,6 +553,165 @@ pub(crate) fn moe(
         MetalStorage::new(out, dev.clone(), tokens * hidden, DType::F32),
         Shape::from((tokens, hidden)),
     ))
+}
+
+/// Mirrors `PrefillParams` in the shader.
+#[repr(C)]
+struct PrefillParams {
+    t: u32,
+    t_pad: u32,
+    q_pos0: u32,
+    key_base: u32,
+    window: u32,
+    rep: u32,
+    kv_head_stride: u32,
+    scale: f32,
+}
+
+/// Where prefill attention's queries sit: `[heads][t_pad][ATTN_HEAD_DIM]`
+/// f32 from `offset` bytes, `t` of each head's `t_pad` rows live, the first
+/// at absolute position `pos0`.
+pub(crate) struct PrefillQueries<'a> {
+    pub storage: &'a MetalStorage,
+    pub offset: usize,
+    pub t: usize,
+    pub t_pad: usize,
+    pub pos0: usize,
+}
+
+/// Attention for many queries over a cache (`attn_prefill`): `k`/`v` hold
+/// absolute positions from `key_base` up to the last query's, `window` is
+/// 0 for none. Returns `[heads][t_pad][ATTN_HEAD_DIM]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_attention(
+    q: &PrefillQueries<'_>,
+    k: &KvOperand<'_>,
+    v: &KvOperand<'_>,
+    sinks: (&MetalStorage, usize),
+    (heads, kv_heads): (usize, usize),
+    key_base: usize,
+    window: usize,
+    scale: f32,
+) -> candle_core::Result<MetalStorage> {
+    let kv_dtype = k.storage.dtype();
+    if q.storage.dtype() != DType::F32
+        || v.storage.dtype() != kv_dtype
+        || !matches!(kv_dtype, DType::F32 | DType::F16)
+        || kv_heads == 0
+        || !heads.is_multiple_of(kv_heads)
+        || k.head_stride != v.head_stride
+        || !q.t_pad.is_multiple_of(PF_Q)
+        || q.t > q.t_pad
+    {
+        candle_core::bail!("prefill attention cannot take these operands");
+    }
+    let dev = q.storage.device();
+    let pipes = pipelines(dev)?;
+    let params = PrefillParams {
+        t: u32_of(q.t)?,
+        t_pad: u32_of(q.t_pad)?,
+        q_pos0: u32_of(q.pos0)?,
+        key_base: u32_of(key_base)?,
+        window: u32_of(window)?,
+        rep: u32_of(heads / kv_heads)?,
+        kv_head_stride: u32_of(k.head_stride)?,
+        scale,
+    };
+    let n = heads * q.t_pad * ATTN_HEAD_DIM;
+    let out = dev.new_buffer(n, DType::F32, "attn_prefill_out")?;
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("attn_prefill");
+        enc.set_compute_pipeline_state(if kv_dtype == DType::F16 {
+            &pipes.attn_prefill_f16
+        } else {
+            &pipes.attn_prefill
+        });
+        enc.set_buffer(0, Some(q.storage.buffer()), q.offset);
+        enc.set_buffer(1, Some(k.storage.buffer()), k.offset);
+        enc.set_buffer(2, Some(v.storage.buffer()), v.offset);
+        enc.set_buffer(3, Some(sinks.0.buffer()), sinks.1);
+        enc.set_buffer(4, Some(&out), 0);
+        enc.set_bytes(5, &params);
+        enc.dispatch_thread_groups(grid(q.t_pad / PF_Q, heads), grid(PF_THREADS, 1));
+    }
+    Ok(MetalStorage::new(out, dev.clone(), n, DType::F32))
+}
+
+/// A weight bound for a kernel: its buffer, byte offset and scale buffer.
+type Bound<'a> = (&'a Buffer, usize, &'a Buffer);
+
+/// The `MoE`'s gate/up and down for many tokens, grouped by expert
+/// (`moe_grouped.metal`): `moe_group` sorts the slots by expert and lists
+/// tiles of one expert's slots, then one tiled matmul per (row tile, tile)
+/// reads each expert's weights once per tile instead of once per slot.
+/// Writes `h` and `ys` per slot, as the per-slot kernels do, for `moe_sum`.
+fn grouped(
+    pipes: &Pipelines,
+    dev: &MetalDevice,
+    [gate, up, down]: [Bound<'_>; 3],
+    (x, ids, route): (&MetalStorage, &MetalStorage, &MetalStorage),
+    dims: MoeDims,
+    params: &MoeParams,
+    (h, ys): (&Buffer, &Buffer),
+) -> candle_core::Result<()> {
+    let slots = dims.tokens * dims.k_used;
+    let (hidden, ffn) = (params.d as usize, params.f as usize);
+    // At most one partial tile per expert beyond the full ones.
+    let max_tiles = slots.div_ceil(MM_TILE) + slots.min(params.experts as usize);
+    let perm = dev.new_buffer(slots, DType::U32, "nvfp4_moe_perm")?;
+    // A `uint3` takes 16 bytes in a Metal buffer.
+    let tiles = dev.new_buffer(max_tiles * 4, DType::U32, "nvfp4_moe_tiles")?;
+    let n_tiles = dev.new_buffer(1, DType::U32, "nvfp4_moe_n_tiles")?;
+    // Each scoped encoder ends before the next `command_encoder()`, so the
+    // passes keep their order (see `moe`).
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_group");
+        enc.set_compute_pipeline_state(&pipes.moe_group);
+        enc.set_buffer(0, Some(ids.buffer()), dims.ids_start * 4);
+        enc.set_buffer(1, Some(&perm), 0);
+        enc.set_buffer(2, Some(&tiles), 0);
+        enc.set_buffer(3, Some(&n_tiles), 0);
+        enc.set_buffer(4, Some(ys), 0);
+        enc.set_bytes(5, params);
+        enc.dispatch_thread_groups(grid(1, 1), grid(GROUP_THREADS, 1));
+    }
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_mm_gate_up");
+        enc.set_compute_pipeline_state(&pipes.moe_mm_gate_up);
+        enc.set_buffer(0, Some(gate.0), gate.1);
+        enc.set_buffer(1, Some(up.0), up.1);
+        enc.set_buffer(2, Some(x.buffer()), dims.x_start * 4);
+        enc.set_buffer(3, Some(&perm), 0);
+        enc.set_buffer(4, Some(&tiles), 0);
+        enc.set_buffer(5, Some(&n_tiles), 0);
+        enc.set_buffer(6, Some(gate.2), 0);
+        enc.set_buffer(7, Some(up.2), 0);
+        enc.set_buffer(8, Some(h), 0);
+        enc.set_bytes(9, params);
+        enc.dispatch_thread_groups(grid(ffn.div_ceil(MM_TILE), max_tiles), grid(MM_THREADS, 1));
+    }
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("nvfp4_moe_mm_down");
+        enc.set_compute_pipeline_state(&pipes.moe_mm_down);
+        enc.set_buffer(0, Some(down.0), down.1);
+        enc.set_buffer(1, Some(h), 0);
+        enc.set_buffer(2, Some(&perm), 0);
+        enc.set_buffer(3, Some(&tiles), 0);
+        enc.set_buffer(4, Some(&n_tiles), 0);
+        enc.set_buffer(5, Some(down.2), 0);
+        enc.set_buffer(6, Some(route.buffer()), dims.route_start * 4);
+        enc.set_buffer(7, Some(ys), 0);
+        enc.set_bytes(8, params);
+        enc.dispatch_thread_groups(
+            grid(hidden.div_ceil(MM_TILE), max_tiles),
+            grid(MM_THREADS, 1),
+        );
+    }
+    Ok(())
 }
 
 /// Mirrors `AttnParams` in the shader.
@@ -704,12 +908,17 @@ mod tests {
             ("ATTN_HEAD_DIM", ATTN_HEAD_DIM),
             ("ATTN_BLOCK", ATTN_BLOCK),
             ("COMBINE_GROUPS", COMBINE_GROUPS),
+            ("PF_Q", PF_Q),
+            ("PF_K", PF_K),
+            ("PF_THREADS", PF_THREADS),
             ("ATTN_SG", ATTN_SG),
             ("ROUTE_MAX_K", ROUTE_MAX_K),
             ("ROUTE_THREADS", ROUTE_THREADS),
             ("ROUTE_PER_THREAD", ROUTE_PER_THREAD),
             ("NORM_THREADS", NORM_THREADS),
             ("COMBINE_PER_THREAD", COMBINE_PER_THREAD),
+            ("GROUP_THREADS", GROUP_THREADS),
+            ("GROUP_MAX_EXPERTS", GROUP_MAX_EXPERTS),
         ] {
             let line = format!("#define {name} {value}\n");
             assert!(src.starts_with(PRELUDE_MARK), "the prelude comes first");
@@ -717,7 +926,8 @@ mod tests {
             assert!(
                 !SOURCE.contains(&format!("#define {name} "))
                     && !FUSED_SOURCE.contains(&format!("#define {name} "))
-                    && !DECODE_SOURCE.contains(&format!("#define {name} ")),
+                    && !DECODE_SOURCE.contains(&format!("#define {name} "))
+                    && !GROUPED_SOURCE.contains(&format!("#define {name} ")),
                 "a kernel file still defines {name} itself"
             );
         }

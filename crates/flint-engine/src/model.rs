@@ -16,7 +16,7 @@ use gemma_engine::kv::KvCache;
 use gemma_engine::session::SessionModel;
 use sha2::{Digest, Sha256};
 
-use crate::attention::{Attention, causal_mask};
+use crate::attention::{Attention, LazyMask, causal_mask};
 use crate::config::FlintConfig;
 use crate::ffn::{Dense, Moe};
 use crate::file::GgufFile;
@@ -490,19 +490,18 @@ impl Model {
         #[cfg(not(target_os = "macos"))]
         let _ = graph;
         let eps = self.config.rms_eps;
+        // Built only if a layer's attention takes the op chain: the fused
+        // prefill kernel masks from positions.
+        let w = self.config.sliding_window;
+        let start = (offset + 1).saturating_sub(w);
         let (global, sliding) = if t > 1 {
-            let w = self.config.sliding_window;
-            let start = (offset + 1).saturating_sub(w);
             (
-                Some(causal_mask(t, offset, 0, end, None, &self.device)?),
-                Some(causal_mask(
-                    t,
-                    offset,
-                    start,
-                    end - start,
-                    Some(w),
-                    &self.device,
-                )?),
+                Some(LazyMask::new(|| {
+                    causal_mask(t, offset, 0, end, None, &self.device)
+                })),
+                Some(LazyMask::new(move || {
+                    causal_mask(t, offset, start, end - start, Some(w), &self.device)
+                })),
             )
         } else {
             (None, None)

@@ -280,3 +280,161 @@ kernel void moe_route(
         }
     }
 }
+
+// Attention for many queries (prefill), FlashAttention-style on simdgroup
+// matrices. One threadgroup per (PF_Q queries, query head), four simdgroups
+// of 8 query rows each. Q and the output stay in registers as 8x8 tiles; the
+// keys the block can see are walked in PF_K-key blocks staged as f32 in
+// threadgroup memory (first K, then V in the same buffer). Masking is from
+// positions: a key is visible when it is at or before the query and, with a
+// window, fewer than `window` positions behind it. The sink starts each
+// row's online softmax as one more logit (m = sink, l = 1) that adds no
+// value. q and out are [heads][t_pad][ATTN_HEAD_DIM]; rows past t are
+// masked out entirely and come out zero.
+struct PrefillParams {
+    uint t;              // queries
+    uint t_pad;          // rows per head in q and out
+    uint q_pos0;         // absolute position of query 0
+    uint key_base;       // absolute position of cache index 0
+    uint window;         // 0: none
+    uint rep;            // query heads per KV head
+    uint kv_head_stride; // values between KV heads in k and v
+    float scale;
+};
+
+template <typename T>
+inline void attn_prefill_impl(
+    device const float *q,
+    device const T *k,
+    device const T *v,
+    device const float *sinks,
+    device float *out,
+    constant PrefillParams &p,
+    uint2 tg,
+    uint tid,
+    uint sg,
+    uint lane,
+    threadgroup float *kv,
+    threadgroup float *scr)
+{
+    const uint D = ATTN_HEAD_DIM;
+    const uint h = tg.y;
+    const uint kvh = h / p.rep;
+    const uint row0 = tg.x * PF_Q + sg * 8;
+    simdgroup_float8x8 qt[ATTN_HEAD_DIM / 8];
+    simdgroup_float8x8 o[ATTN_HEAD_DIM / 8];
+    device const float *qh = q + ((ulong)h * p.t_pad + row0) * D;
+    for (uint i = 0; i < D / 8; ++i) {
+        simdgroup_load(qt[i], qh + i * 8, D);
+        o[i] = simdgroup_float8x8(0.0f);
+    }
+    const float sink = sinks[h];
+    float m[8];
+    float l[8];
+    for (uint r = 0; r < 8; ++r) {
+        m[r] = sink;
+        l[r] = 1.0f;
+    }
+    // The keys any query of this threadgroup can see.
+    const uint qmin = p.q_pos0 + tg.x * PF_Q;
+    const uint hi = min(p.q_pos0 + p.t, qmin + PF_Q);
+    uint lo = p.key_base;
+    if (p.window != 0 && qmin + 1 > p.window) {
+        lo = max(lo, qmin + 1 - p.window);
+    }
+    device const T *kh = k + (ulong)kvh * p.kv_head_stride;
+    device const T *vh = v + (ulong)kvh * p.kv_head_stride;
+    threadgroup float *sc = scr + sg * 8 * PF_K;
+    threadgroup float *dg = scr + 4 * 8 * PF_K + sg * 64;
+    for (uint kb = lo; kb < hi; kb += PF_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < PF_K * D; i += PF_THREADS) {
+            const uint kp = kb + i / D;
+            kv[i] = kp < hi ? float(kh[(ulong)(kp - p.key_base) * D + i % D]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // S = Q K^T for 8 rows and PF_K keys.
+        for (uint j = 0; j < PF_K / 8; ++j) {
+            simdgroup_float8x8 s = simdgroup_float8x8(0.0f);
+            for (uint i = 0; i < D / 8; ++i) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, kv + (j * 8) * D + i * 8, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qt[i], kt, s);
+            }
+            simdgroup_store(s, sc + j * 8, PF_K);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // The online softmax, one key per lane.
+        const uint kp = kb + lane;
+        float corr[8];
+        for (uint r = 0; r < 8; ++r) {
+            const uint qi = row0 + r;
+            const uint qp = p.q_pos0 + qi;
+            const bool seen = qi < p.t && kp < hi && kp <= qp && (p.window == 0 || qp - kp < p.window);
+            const float sv = seen ? sc[r * PF_K + lane] * p.scale : -INFINITY;
+            const float mn = max(m[r], simd_max(sv));
+            corr[r] = exp(m[r] - mn);
+            const float pv = exp(sv - mn);
+            l[r] = l[r] * corr[r] + simd_sum(pv);
+            m[r] = mn;
+            sc[r * PF_K + lane] = pv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < PF_K * D; i += PF_THREADS) {
+            const uint kp2 = kb + i / D;
+            kv[i] = kp2 < hi ? float(vh[(ulong)(kp2 - p.key_base) * D + i % D]) : 0.0f;
+        }
+        // The rows' rescale as a diagonal matrix.
+        for (uint e = lane; e < 64; e += SIMD_WIDTH) {
+            dg[e] = e % 9 == 0 ? corr[e / 9] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dm;
+        simdgroup_load(dm, dg, 8);
+        simdgroup_float8x8 pm[PF_K / 8];
+        for (uint j = 0; j < PF_K / 8; ++j) {
+            simdgroup_load(pm[j], sc + j * 8, PF_K);
+        }
+        for (uint i = 0; i < D / 8; ++i) {
+            simdgroup_multiply(o[i], dm, o[i]);
+            for (uint j = 0; j < PF_K / 8; ++j) {
+                simdgroup_float8x8 vt;
+                simdgroup_load(vt, kv + (j * 8) * D + i * 8, D);
+                simdgroup_multiply_accumulate(o[i], pm[j], vt, o[i]);
+            }
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lane; e < 64; e += SIMD_WIDTH) {
+        dg[e] = e % 9 == 0 ? 1.0f / l[e / 9] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dm;
+    simdgroup_load(dm, dg, 8);
+    device float *oh = out + ((ulong)h * p.t_pad + row0) * D;
+    for (uint i = 0; i < D / 8; ++i) {
+        simdgroup_multiply(o[i], dm, o[i]);
+        simdgroup_store(o[i], oh + i * 8, D);
+    }
+}
+
+#define ATTN_PREFILL_KERNEL(NAME, T)                                           \
+    kernel void NAME(                                                          \
+        device const float *q [[buffer(0)]],                                   \
+        device const T *k [[buffer(1)]],                                       \
+        device const T *v [[buffer(2)]],                                       \
+        device const float *sinks [[buffer(3)]],                               \
+        device float *out [[buffer(4)]],                                       \
+        constant PrefillParams &p [[buffer(5)]],                               \
+        uint2 tg [[threadgroup_position_in_grid]],                             \
+        uint tid [[thread_index_in_threadgroup]],                              \
+        uint sg [[simdgroup_index_in_threadgroup]],                            \
+        uint lane [[thread_index_in_simdgroup]])                               \
+    {                                                                          \
+        threadgroup float kv[PF_K * ATTN_HEAD_DIM];                            \
+        threadgroup float scr[4 * 8 * PF_K + 4 * 64];                          \
+        attn_prefill_impl<T>(q, k, v, sinks, out, p, tg, tid, sg, lane, kv, scr); \
+    }
+
+ATTN_PREFILL_KERNEL(attn_prefill_f32, float)
+ATTN_PREFILL_KERNEL(attn_prefill_f16, half)
