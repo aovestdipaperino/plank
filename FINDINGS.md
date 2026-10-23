@@ -3861,3 +3861,41 @@ The cold prefill of plank's 5,073-token prompt ran at 366.4 tok/s, against
 about 491 to 536 tok/s for a 512-token prefill from empty. We have not
 measured how much of each gap is context depth and how much is per-pass
 overhead in the agent.
+
+## Why Flint decoded at 20 tok/s in a session, and what measures it honestly
+
+The gap the smoke run left open had three causes, each measured on an M5
+Max on AC power (2026-10-23).
+
+Single-token attention was about ten candle ops per layer and copied every
+cached key into a transposed matrix each token, so decode fell with depth:
+64, 38, 26 and 16 tok/s at depths 64, 2K, 10K and 20K, while Ollama's
+llama.cpp held 127 to 163 tok/s over the same range. The 14 global layers
+carried almost all of it. The fused `attn_dec_*` kernels in `fused.metal`
+read the cache in place and took 20K to about 44 tok/s.
+
+The sampler spent 3.9 ms of CPU a token while the GPU waited. With `min_p`
+at 0 its floor is 0, so every `-inf` logit left by Flint's top-k filter
+passed `p >= floor` and the whole 150,144-entry vocabulary was exp'd and
+sorted. Skipping masked logits gives 0.47 ms and the same draws.
+
+The NVFP4 matvec read one byte at a time and one row after another. Taking
+a simdgroup's rows together (`rows_dot`) roughly halved `attn_q` on cold
+weights.
+
+Three traps make the numbers lie. `bench_kernels` repeats one weight, which
+then sits in the GPU's cache: `attn_q` reads 258 GB/s there and 129 GB/s
+when every layer's weight streams in turn, as in a real decode. A bench that
+decodes the same token at the same position, as `bench_depth` does, is a
+relative measure across depths and builds, not a session rate. And another
+build on the machine (several `rustc` at 100%) moved the same configuration
+between 27 and 44 tok/s across runs, so compare builds only on an idle
+machine and within one run.
+
+What remains is structural. An extra tiny op costs about 1.3 us of GPU time
+in place, and candle opens an encoder per op, about 2,000 a token (~2.5 ms).
+The weight kernels take about 7 ms, and the small projections (`k`, `v`, the
+shared expert) are latency-bound, so the next steps are fusing q/k/v into
+one dispatch with the q/k norms and RoPE, and the shared expert's gate and
+up into one. A Metal System Trace (`xcrun xctrace record --template 'Metal
+System Trace'`) showed the GPU busy about 82% of a decode.
