@@ -18,6 +18,7 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, bare_close_at, bare_close_partial, bare_open_is,
     tag_prefix_len, tag_prefix_partial,
 };
+use crate::flint::{FlintParser, START as FLINT_START};
 use crate::gemma::{GemmaParser, START as GEMMA_START};
 use crate::qwen::QwenParser;
 use crate::render::ThinkCodeSpan;
@@ -116,6 +117,7 @@ enum Dialect {
     Dsml(ToolSyntax),
     Qwen,
     Gemma,
+    Flint,
 }
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
@@ -470,11 +472,17 @@ fn dsml_start_match(
     false
 }
 
-/// [`dsml_start_match`] widened to every dialect, DSML, Qwen and Gemma alike.
+/// [`dsml_start_match`] widened to every dialect, DSML, Qwen, Gemma and
+/// Flint alike.
 ///
 /// The Gemma arm is tried only when `gemma` is set, i.e. the renderer was
 /// built for Gemma: DSML and Qwen streams adopt each other's openers, but a
 /// literal `<|tool_call>` in a `DeepSeek` or Qwen stream is text, not a call.
+///
+/// Flint spells its opener `<tool_call>`, exactly as Qwen does, so the two
+/// arms are exclusive on `flint`: a renderer built for Flint reads that
+/// opener as Flint and never as Qwen, and any other renderer never reads it
+/// as Flint.
 ///
 /// DSML is tried first and Qwen only if no DSML form is even a prefix. The two
 /// openers share no spelling, so the order is not load-bearing for
@@ -488,6 +496,7 @@ fn dsml_start_match(
 fn start_match_any(
     tail: &[u8],
     gemma: bool,
+    flint: bool,
     complete: &mut bool,
     implicit_invoke: &mut bool,
     matched: &mut Dialect,
@@ -497,7 +506,14 @@ fn start_match_any(
         *matched = Dialect::Dsml(syntax);
         return true;
     }
-    if tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail {
+    if flint {
+        if tail.len() <= FLINT_START.len() && FLINT_START[..tail.len()] == *tail {
+            *implicit_invoke = false;
+            *complete = tail == FLINT_START;
+            *matched = Dialect::Flint;
+            return true;
+        }
+    } else if tail.len() <= QWEN_START.len() && QWEN_START[..tail.len()] == *tail {
         *implicit_invoke = false;
         *complete = tail == QWEN_START;
         *matched = Dialect::Qwen;
@@ -750,6 +766,9 @@ struct ToolViz {
     /// strips them from the parsed value). This suppresses the leading one so
     /// the banner does not open every parameter with a blank rail line.
     qwen_pending_lf: bool,
+    /// Flint arguments already replayed into the banner for the current
+    /// call (see `scan_flint_byte`).
+    args_shown: usize,
     read_style: bool,
     read_prefix_rendered: bool,
     read_line_rendered: bool,
@@ -846,6 +865,7 @@ enum Parser {
     Dsml(DsmlParser),
     Qwen(QwenParser),
     Gemma(GemmaParser),
+    Flint(FlintParser),
 }
 
 impl Parser {
@@ -863,6 +883,7 @@ impl Parser {
             Self::Dsml(p) => p.state(),
             Self::Qwen(p) => p.state(),
             Self::Gemma(p) => p.state(),
+            Self::Flint(p) => p.state(),
         }
     }
 
@@ -873,6 +894,7 @@ impl Parser {
             // the same contract through a default rather than an unwrap.
             Self::Qwen(p) => p.error().unwrap_or("malformed Qwen tool call"),
             Self::Gemma(p) => p.error().unwrap_or("malformed Gemma tool call"),
+            Self::Flint(p) => p.error().unwrap_or("malformed Flint tool call"),
         }
     }
 
@@ -881,6 +903,7 @@ impl Parser {
             Self::Dsml(p) => p.raw(),
             Self::Qwen(p) => p.raw(),
             Self::Gemma(p) => p.raw(),
+            Self::Flint(p) => p.raw(),
         }
     }
 
@@ -889,6 +912,7 @@ impl Parser {
             Self::Dsml(p) => p.calls(),
             Self::Qwen(p) => p.calls(),
             Self::Gemma(p) => p.calls(),
+            Self::Flint(p) => p.calls(),
         }
     }
 
@@ -897,6 +921,7 @@ impl Parser {
             Self::Dsml(p) => p.pending_call(),
             Self::Qwen(p) => p.pending_call(),
             Self::Gemma(p) => p.pending_call(),
+            Self::Flint(p) => p.pending_call(),
         }
     }
 
@@ -905,6 +930,7 @@ impl Parser {
             Self::Dsml(p) => p.param_close_prefix(),
             Self::Qwen(p) => p.param_close_prefix(),
             Self::Gemma(p) => p.param_close_prefix(),
+            Self::Flint(p) => p.param_close_prefix(),
         }
     }
 
@@ -913,6 +939,7 @@ impl Parser {
             Self::Dsml(p) => p.feed(bytes),
             Self::Qwen(p) => p.feed(bytes),
             Self::Gemma(p) => p.feed(bytes),
+            Self::Flint(p) => p.feed(bytes),
         }
     }
 
@@ -921,25 +948,32 @@ impl Parser {
             Self::Dsml(p) => p.reset(),
             Self::Qwen(p) => p.reset(),
             Self::Gemma(p) => p.reset(),
+            Self::Flint(p) => p.reset(),
         }
     }
 
-    /// End of generation. Only the Qwen and Gemma dialects need telling:
-    /// neither has a terminator that ends a *run* of stanzas (see
-    /// `QwenParser::finish`, `GemmaParser::finish`).
+    /// End of generation. Only the Qwen, Gemma and Flint dialects need
+    /// telling: none has a terminator that ends a *run* of stanzas (see
+    /// `QwenParser::finish`, `GemmaParser::finish`, `FlintParser::finish`).
     fn finish(&mut self) {
-        if let Self::Qwen(p) = self {
-            p.finish();
-        } else if let Self::Gemma(p) = self {
-            p.finish();
+        match self {
+            Self::Dsml(_) => {}
+            Self::Qwen(p) => p.finish(),
+            Self::Gemma(p) => p.finish(),
+            Self::Flint(p) => p.finish(),
         }
     }
 
-    /// Whether a Qwen or Gemma run has just closed a stanza and is waiting to
-    /// learn if another follows (see `QwenParser::awaits_another_stanza`).
+    /// Whether a Qwen, Gemma or Flint run has just closed a stanza and is
+    /// waiting to learn if another follows (see
+    /// `QwenParser::awaits_another_stanza`).
     fn awaits_another_stanza(&self) -> bool {
-        matches!(self, Self::Qwen(p) if p.awaits_another_stanza())
-            || matches!(self, Self::Gemma(p) if p.awaits_another_stanza())
+        match self {
+            Self::Dsml(_) => false,
+            Self::Qwen(p) => p.awaits_another_stanza(),
+            Self::Gemma(p) => p.awaits_another_stanza(),
+            Self::Flint(p) => p.awaits_another_stanza(),
+        }
     }
 
     /// True when this parser reads the Qwen dialect.
@@ -952,9 +986,14 @@ impl Parser {
         matches!(self, Self::Gemma(_))
     }
 
+    /// True when this parser reads the Flint dialect.
+    fn is_flint(&self) -> bool {
+        matches!(self, Self::Flint(_))
+    }
+
     /// True when this parser reads a dialect with no DSML tag table.
     fn is_non_dsml(&self) -> bool {
-        self.is_qwen() || self.is_gemma()
+        !matches!(self, Self::Dsml(_))
     }
 
     /// The canonical opener of the non-DSML dialect this parser reads, if any.
@@ -963,17 +1002,18 @@ impl Parser {
             Self::Dsml(_) => None,
             Self::Qwen(_) => Some(QWEN_START),
             Self::Gemma(_) => Some(GEMMA_START),
+            Self::Flint(_) => Some(FLINT_START),
         }
     }
 
     /// The DSML dialect this parser is reading in, if it is a DSML parser.
     ///
-    /// `None` for Qwen and Gemma, which are not DSML-shaped and have no tag
-    /// table.
+    /// `None` for Qwen, Gemma and Flint, which are not DSML-shaped and have
+    /// no tag table.
     fn dsml_syntax(&self) -> Option<ToolSyntax> {
         match self {
             Self::Dsml(p) => Some(p.syntax()),
-            Self::Qwen(_) | Self::Gemma(_) => None,
+            Self::Qwen(_) | Self::Gemma(_) | Self::Flint(_) => None,
         }
     }
 }
@@ -990,6 +1030,11 @@ pub struct StreamRenderer<S> {
     /// does not follow DSML adoption: a DSML or Qwen stream that spells the
     /// Gemma opener is quoting it, and must stream it as text.
     gemma_opener: bool,
+    /// Whether `<tool_call>` opens a Flint stanza rather than a Qwen one:
+    /// true only when built for Flint. The two dialects spell the opener
+    /// identically, so this decides which one a stream adopts, and it never
+    /// changes after construction.
+    flint_opener: bool,
     parser: Parser,
     viz: ToolViz,
     scan: DsmlScan,
@@ -1123,6 +1168,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             sink,
             syntax,
             gemma_opener: syntax == ToolSyntax::Gemma,
+            flint_opener: syntax == ToolSyntax::Flint,
             parser: Parser::dsml(syntax),
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
@@ -2108,6 +2154,10 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.scan_gemma_byte(c);
             return;
         }
+        if self.parser.is_flint() {
+            self.scan_flint_byte(c);
+            return;
+        }
         match &mut self.scan {
             DsmlScan::Between => {
                 if c == b'<' {
@@ -2164,6 +2214,50 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
         }
         self.viz_invoke_end();
+    }
+
+    /// The Flint dialect's display scan.
+    ///
+    /// Flint's tags are fixed (`<arg_key>`, `<arg_value>`) and its values are
+    /// raw, so like Gemma's scan this one is driven off the parser rather
+    /// than off tags. Every tag ends in `>`, and only a `>` can settle
+    /// something new: the `<arg_key>` that makes the tool name final, or the
+    /// `</arg_value>` that completes an argument. On each one the banner
+    /// catches up with what `pending_call` reports — the tool line, then each
+    /// argument not yet shown, replayed through the same `viz_param_*` path
+    /// the other dialects stream through. Arguments therefore appear as each
+    /// one completes rather than byte by byte.
+    ///
+    /// A stanza whose rendering started late (opened inside `<think>`, shown
+    /// once `</think>` arrived) catches up the same way at its next `>`.
+    fn scan_flint_byte(&mut self, c: u8) {
+        let done = self.parser.state() == DsmlState::Done;
+        if c != b'>' && !done {
+            return;
+        }
+        let call = if done {
+            self.parser.calls().last().cloned()
+        } else {
+            self.parser.pending_call()
+        };
+        let Some(call) = call else {
+            return;
+        };
+        if !self.viz.tool_announced {
+            self.viz_tool(&call.name);
+            self.viz.args_shown = 0;
+        }
+        for arg in call.args.iter().skip(self.viz.args_shown) {
+            self.viz_param_begin(&arg.name);
+            for &b in arg.value.as_bytes() {
+                self.viz_param_raw_byte(b);
+            }
+            self.viz_param_end();
+        }
+        self.viz.args_shown = call.args.len();
+        if done {
+            self.viz_invoke_end();
+        }
     }
 
     /// The dialect's inner tag names for the display scan.
@@ -2387,6 +2481,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         start_match_any(
             &self.dsml_start_tail,
             self.gemma_opener,
+            self.flint_opener,
             complete,
             implicit_invoke,
             matched,
@@ -2415,6 +2510,11 @@ impl<S: RenderSink> StreamRenderer<S> {
             Dialect::Gemma => {
                 if !self.parser.is_gemma() {
                     self.parser = Parser::Gemma(GemmaParser::new());
+                }
+            }
+            Dialect::Flint => {
+                if !self.parser.is_flint() {
+                    self.parser = Parser::Flint(FlintParser::new());
                 }
             }
         }
@@ -5051,6 +5151,118 @@ mod qwen_dialect_tests {
         assert_eq!(done.error, None, "{:?}", sr.sink().visible);
         let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["read", "bash"]);
+    }
+
+    const FLINT_CALL: &str = "<tool_call>read<arg_key>path</arg_key><arg_value>Cargo.toml</arg_value><arg_key>max_lines</arg_key><arg_value>20</arg_value></tool_call>";
+
+    /// A renderer built for Flint reads `<tool_call>` as a Flint stanza: one
+    /// call with typed arguments, and a banner naming the tool rather than
+    /// the dialect's raw markup.
+    #[test]
+    fn a_flint_stanza_is_parsed_into_a_call_with_a_banner() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Flint);
+        sr.push("Let me look.\n");
+        sr.push(FLINT_CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls.len(), 1, "{:?}", sr.sink().visible);
+        let call = &done.calls[0];
+        assert_eq!(call.name, "read");
+        assert_eq!(call.arg_value("path"), Some("Cargo.toml"));
+        assert!(!call.args[1].is_string, "20 is JSON");
+        assert!(sr.parser.is_flint());
+        let shown = &sr.sink().visible;
+        assert!(shown.contains("Reading Cargo.toml"), "{shown:?}");
+        assert!(!shown.contains("<arg_key>"), "{shown:?}");
+        assert!(!shown.contains("<tool_call>"), "{shown:?}");
+    }
+
+    /// The banner names a non-read tool and shows each argument.
+    #[test]
+    fn a_flint_banner_shows_the_tool_and_its_arguments() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Flint);
+        // Byte at a time, the way a model streams it.
+        let call =
+            "<tool_call>bash<arg_key>command</arg_key><arg_value>ls -la</arg_value></tool_call>";
+        for i in 0..call.len() {
+            sr.push(&call[i..=i]);
+        }
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls.len(), 1);
+        let shown = &sr.sink().visible;
+        assert!(shown.contains("bash"), "{shown:?}");
+        assert!(shown.contains("ls -la"), "{shown:?}");
+        assert!(!shown.contains("<arg_value>"), "{shown:?}");
+    }
+
+    /// Two Flint stanzas in one pass both reach dispatch.
+    #[test]
+    fn two_flint_stanzas_both_become_calls() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Flint);
+        sr.push(concat!(
+            "<tool_call>read<arg_key>path</arg_key><arg_value>a.rs</arg_value></tool_call>\n",
+            "<tool_call>bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+        ));
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        let names: Vec<_> = done.calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["read", "bash"]);
+    }
+
+    /// Flint and Qwen spell the same opener. A renderer built for any other
+    /// dialect never adopts Flint: the same bytes reach the Qwen parser,
+    /// which rejects the shape, so no Flint call comes out.
+    #[test]
+    fn a_non_flint_renderer_never_adopts_flint() {
+        for syntax in [
+            ToolSyntax::Qwen,
+            ToolSyntax::Dsml,
+            ToolSyntax::Dsml41,
+            ToolSyntax::Gemma,
+        ] {
+            let mut sr = StreamRenderer::with_syntax(Cap::default(), syntax);
+            sr.push(FLINT_CALL);
+            sr.finish();
+            let done = sr.finished();
+            assert!(done.calls.is_empty(), "{syntax:?}: {:?}", done.calls);
+            assert!(done.error.is_some(), "{syntax:?}: Qwen rejects the shape");
+            assert!(!sr.parser.is_flint(), "{syntax:?}");
+        }
+    }
+
+    /// A thinking block before the call still streams as thinking, and the
+    /// call after it still parses.
+    #[test]
+    fn a_flint_call_after_thinking_keeps_the_thought() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Flint);
+        sr.push("<think>check the manifest</think>");
+        sr.push(FLINT_CALL);
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls.len(), 1);
+        assert!(
+            sr.sink().think.contains("check the manifest"),
+            "{:?}",
+            sr.sink().think
+        );
+        assert!(!sr.sink().visible.contains("check the manifest"));
+    }
+
+    /// A literal `</think>` inside a Flint value is payload, not the control
+    /// token, as it is for the other dialects.
+    #[test]
+    fn a_think_close_inside_a_flint_value_is_payload() {
+        let mut sr = StreamRenderer::with_syntax(Cap::default(), ToolSyntax::Flint);
+        sr.push("<tool_call>write<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>x </think> y</arg_value></tool_call>");
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls[0].arg_value("content"), Some("x </think> y"));
     }
 
     /// The end-to-end shape this whole port exists for: a Qwen stanza reaches

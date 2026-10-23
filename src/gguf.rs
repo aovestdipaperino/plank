@@ -58,7 +58,12 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
         match syntax {
             trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
             trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
-            trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
+            // `Flint` is a placeholder until Task 5 adds `ModelFamily::Flint`:
+            // a Flint name read as `Ds4` before the dialect existed, so this
+            // keeps that.
+            trace_stream::syntax::ToolSyntax::Dsml | trace_stream::syntax::ToolSyntax::Flint => {
+                Self::Ds4
+            }
             trace_stream::syntax::ToolSyntax::Gemma => Self::Gemma,
         }
     }

@@ -678,6 +678,9 @@ fn build_tools_prompt_parts_with_wasm(
             gpu_suspend,
         );
     }
+    // Placeholder: `ToolSyntax::Flint` falls through to the DSML path below
+    // until Task 3 routes it to its own builder.
+    //
     // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
     // before any prompt is built, so the dialect can never be selected. The
     // arm is gated rather than left to fall through to DSML so that, if that
@@ -1515,7 +1518,8 @@ fn append_gpu_suspend_note(out: &mut String, syntax: ToolSyntax) {
     out.push_str(match syntax {
         ToolSyntax::Qwen => GPU_SUSPEND_EXAMPLE_QWEN,
         ToolSyntax::Gemma => GPU_SUSPEND_EXAMPLE_GEMMA,
-        ToolSyntax::Dsml | ToolSyntax::Dsml41 => GPU_SUSPEND_EXAMPLE_DSML,
+        // `Flint` is a placeholder: Task 3 gives it its own `<arg_key>` example.
+        ToolSyntax::Dsml | ToolSyntax::Dsml41 | ToolSyntax::Flint => GPU_SUSPEND_EXAMPLE_DSML,
     });
 }
 
@@ -2356,7 +2360,8 @@ pub fn build_short_system_prompt_reminder(
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
     out.push_str(match syntax {
         ToolSyntax::Qwen => qwen_syntax_reminder(),
-        ToolSyntax::Dsml => dsml_syntax_reminder(),
+        // `Flint` is a placeholder: Task 3 gives it `flint_syntax_reminder()`.
+        ToolSyntax::Dsml | ToolSyntax::Flint => dsml_syntax_reminder(),
         ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
         ToolSyntax::Gemma => gemma_syntax_reminder(),
     });

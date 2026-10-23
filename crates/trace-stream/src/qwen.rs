@@ -420,7 +420,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Port of `agent_qwen_value_is_json`. Leading spaces and tabs are trimmed but
 /// not newlines; trailing newlines are. The C finishes with `strtod` over a
 /// 64-byte buffer, so anything longer is never a number.
-fn value_is_json(v: &[u8]) -> bool {
+pub(crate) fn value_is_json(v: &[u8]) -> bool {
     let start = v.iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
     let v = &v[start..];
     let mut n = v.len();

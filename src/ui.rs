@@ -680,6 +680,10 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
                 "Tool error: invalid Gemma tool call: {err}\n{}",
                 sysprompt::gemma_syntax_reminder()
             ),
+            // Placeholder: Task 3 names the dialect and adds
+            // `flint_syntax_reminder()`. `InThink` already takes the default
+            // `IN_THINK_PROHIBITION` arm above.
+            sysprompt::ToolSyntax::Flint => format!("Tool error: invalid tool call: {err}\n"),
         },
     }
 }
@@ -11326,6 +11330,7 @@ the original is frozen and listed in /tree"
                     crate::sysprompt::ToolSyntax::Qwen => "qwen",
                     crate::sysprompt::ToolSyntax::Dsml41 => "dsml41",
                     crate::sysprompt::ToolSyntax::Gemma => "gemma",
+                    crate::sysprompt::ToolSyntax::Flint => "flint",
                 },
                 artifact_version,
                 companion: &companion,
@@ -35424,6 +35429,21 @@ mod tests {
         assert!(p.contains("<|tool_call>call:"), "{p}");
         let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Gemma);
         assert!(t.contains("<channel|>") && !t.contains("</think>"), "{t}");
+    }
+
+    /// Flint closes its thinking block with `</think>`, so a call made inside
+    /// one gets the default prohibition, not Gemma's `<channel|>` text.
+    #[test]
+    fn tool_error_for_flint_keeps_the_default_in_think_text() {
+        let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Flint);
+        assert!(t.contains(sysprompt::IN_THINK_PROHIBITION), "{t}");
+        assert!(t.contains("</think>") && !t.contains("<channel|>"), "{t}");
+        let p = tool_error_payload(PassError::Dsml, "junk", crate::sysprompt::ToolSyntax::Flint);
+        assert!(
+            p.starts_with("Tool error: invalid") && p.contains("junk"),
+            "{p}"
+        );
+        assert!(!p.contains("DSML"), "{p}");
     }
 
     #[test]

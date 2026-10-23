@@ -17,6 +17,8 @@ pub enum ToolSyntax {
     Dsml41,
     /// Gemma 4's `<|tool_call>call:NAME{…}<tool_call|>`.
     Gemma,
+    /// Flint's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
+    Flint,
 }
 
 /// The tag spellings of one DSML dialect.
@@ -50,7 +52,9 @@ impl ToolSyntax {
     /// file — a renamed or relocated model still resolves correctly.
     #[must_use]
     pub fn for_model_name(name: &str) -> Self {
-        if name.starts_with("Gemma 4") {
+        if name.starts_with("Flint") {
+            Self::Flint
+        } else if name.starts_with("Gemma 4") {
             Self::Gemma
         } else if name.starts_with("Qwen3.8") {
             Self::Qwen
@@ -91,7 +95,7 @@ impl ToolSyntax {
                 invoke_name: " invoke",
                 param_name: " parameter",
             }),
-            Self::Qwen | Self::Gemma => None,
+            Self::Qwen | Self::Gemma | Self::Flint => None,
         }
     }
 }
@@ -112,6 +116,12 @@ mod tests {
             ToolSyntax::for_model_name("Qwen3.8 Flash Next mini"),
             ToolSyntax::Qwen
         );
+        assert_eq!(
+            ToolSyntax::for_model_name("Flint NVFP4 Preview"),
+            ToolSyntax::Flint
+        );
+        assert!(ToolSyntax::Flint.dsml_tags().is_none());
+        assert!(!ToolSyntax::Flint.is_xml_tool_call());
         for other in [
             "DeepSeek V4 Flash",
             "DeepSeek V4 Flash Vision Experimental",
