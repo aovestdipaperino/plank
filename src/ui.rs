@@ -18007,8 +18007,13 @@ impl Agent<'_> {
             //
             // The aside gets a renderer of its own, so its thinking is split
             // from its answer the way any other generation's is. Tool calls are
-            // denied for an aside, so it needs none of the dispatch machinery.
-            let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
+            // denied for an aside, so it needs none of the dispatch machinery,
+            // but it must still know the model's dialect: a Flint call read as
+            // DSML opens like a Qwen one and shows as a malformed Qwen call.
+            let mut aside_renderer = StreamRenderer::with_syntax(
+                crate::worker::BtwSink(tx.clone()),
+                self.tool_syntax(),
+            );
             aside_renderer.set_freeze_on_error(true);
             aside_renderer.set_show_thinking(crate::settings::show_thinking_effective());
             if !matches!(self.think, crate::engine::ThinkMode::Off) {
