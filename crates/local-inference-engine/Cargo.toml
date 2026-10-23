@@ -13,7 +13,7 @@ repository.workspace = true
 links = "ds4core"
 
 [features]
-default = ["gemma"]
+default = ["gemma", "flint"]
 # Gemma 4 through `crates/gemma-engine` (candle; Metal on macOS, CPU
 # elsewhere). Needs no C, so it works on every platform the crate builds on.
 gemma = ["dep:gemma-engine", "gemma-engine/candle"]

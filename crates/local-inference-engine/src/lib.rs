@@ -9,13 +9,14 @@
 //! - **Gemma**: Gemma 4 through `crates/gemma-engine` (candle; Metal on macOS,
 //!   the CPU elsewhere), behind the default `gemma` feature.
 //! - **Flint**: Flint through `crates/flint-engine` (candle, NVFP4 kernels),
-//!   behind the `flint` feature.
+//!   behind the default `flint` feature.
 //!
 //! [`Model::open`] reads the GGUF's `general.architecture` and picks the
-//! backend: `gemma4` goes to Gemma, `flint` to Flint, everything else to ds4, which is also the
-//! C's own fallthrough for an architecture it does not name. [`Model`] and
-//! [`Session`] then work the same for both: render a one-turn chat, prefill
-//! it reusing the cached prefix, evaluate, sample, read log-probabilities.
+//! backend: `gemma4` goes to Gemma, `flint` to Flint, everything else to
+//! ds4, which is also the C's own fallthrough for an architecture it does not
+//! name. [`Model`] and [`Session`] then work the same for all three: render
+//! a one-turn chat, prefill it reusing the cached prefix, evaluate, sample,
+//! read log-probabilities.
 //!
 //! Below that:
 //!
@@ -113,7 +114,8 @@ impl std::error::Error for Error {}
 /// What [`Model::open`] loads and how.
 ///
 /// The companion, steering, power and kernel knobs apply to the ds4 backend
-/// only; Gemma and Flint read the model path, the context size and [`Options::cpu`].
+/// only; Gemma and Flint read the model path, the context size and
+/// [`Options::cpu`].
 /// Every ds4 knob not listed here is left at the C's zero value, which is its
 /// default: single machine, no distributed split, no tensor parallelism.
 #[derive(Debug, Clone)]
@@ -289,8 +291,9 @@ pub enum Family {
 
 impl Family {
     /// The backend for the GGUF at `path`: [`Family::Gemma`] for a `gemma4`
-    /// architecture, [`Family::Flint`] for a `flint` one, [`Family::Ds4`] for anything else, unreadable files
-    /// included (the C's own fallthrough; it then reports the real problem).
+    /// architecture, [`Family::Flint`] for a `flint` one, [`Family::Ds4`]
+    /// for anything else, unreadable files included (the C's own
+    /// fallthrough; it then reports the real problem).
     #[must_use]
     pub fn of(path: &Path) -> Self {
         match gguf::architecture(path).as_deref() {

@@ -17,9 +17,9 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// whole of "runs at all" for those families.
 pub const MIN_RAM_BYTES: u64 = 96 * GIB;
 
-/// RAM a native-engine family (Gemma, Flint) needs beyond its weights when its catalog entry does
-/// not say: generous on purpose (4 GiB holds 8K tokens of KV at up to
-/// ~500 KB a token). An entry's `kvBytesPerToken` replaces it.
+/// RAM a native-engine family (Gemma, Flint) needs beyond its weights when
+/// its catalog entry does not say: generous on purpose (4 GiB holds 8K tokens
+/// of KV at up to ~500 KB a token). An entry's `kvBytesPerToken` replaces it.
 pub const NATIVE_KV_RESERVE_BYTES: u64 = 4 * GIB;
 
 /// Share of physical RAM a native-engine family's (Gemma, Flint) default
@@ -27,10 +27,11 @@ pub const NATIVE_KV_RESERVE_BYTES: u64 = 4 * GIB;
 /// (`nativeengine::default_ctx`).
 pub const NATIVE_KV_RAM_DIVISOR: usize = 3;
 
-/// The smallest context a native-engine family (Gemma, Flint) opens by default, however little RAM
-/// there is: below this an agent session cannot hold its own system prompt
-/// and a few tool results. Also what the fit rule reserves KV for, since a
-/// machine that can hold the weights and this much KV can run the engine.
+/// The smallest context a native-engine family (Gemma, Flint) opens by
+/// default, however little RAM there is: below this an agent session cannot
+/// hold its own system prompt and a few tool results. Also what the fit rule
+/// reserves KV for, since a machine that can hold the weights and this much
+/// KV can run the engine.
 pub const NATIVE_MIN_CTX: usize = 8_192;
 
 /// Free space a download must leave behind, so the disk is not filled to the
@@ -135,14 +136,17 @@ impl EngineRow {
     }
 }
 
-/// The KV a native-engine family (Gemma, Flint) needs at the smallest window it opens by default:
-/// the entry's `kvBytesPerToken` times [`NATIVE_MIN_CTX`], else
-/// [`NATIVE_KV_RESERVE_BYTES`]. A larger machine gets a larger window, so this
-/// is the floor that decides whether the engine runs at all.
+/// The KV a native-engine family (Gemma, Flint) needs at the smallest window
+/// it opens by default: the entry's `kvBytesPerToken` times
+/// [`NATIVE_MIN_CTX`], else [`NATIVE_KV_RESERVE_BYTES`]. A larger machine gets
+/// a larger window, so this is the floor that decides whether the engine runs
+/// at all.
 ///
-/// Declared per engine because it varies five-fold between the two models
-/// (E4B shares KV across 18 layers; 12B keeps 8 heads on 40 sliding layers)
-/// and cannot be read from a file that has not been downloaded yet.
+/// Declared per engine because it varies six-fold across the catalog's native
+/// engines (about 115 KB a token on Gemma E4B, which shares KV across 18
+/// layers; 688 KB on Gemma 12B, which keeps 8 heads on 40 sliding layers;
+/// 200 KB on Flint) and cannot be read from a file that has not been
+/// downloaded yet.
 fn native_kv_reserve(entry: &EngineEntry) -> u64 {
     serde_json::from_str::<serde_json::Value>(&entry.raw)
         .ok()
