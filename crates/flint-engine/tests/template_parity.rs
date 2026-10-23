@@ -133,3 +133,45 @@ fn plank_sections_compose_to_the_same_text() {
         .collect();
     assert_eq!(text, render_messages(&messages, &[], true));
 }
+
+#[test]
+fn the_tools_case_composes_from_sections() {
+    // The tools preamble as plank sends it: a trusted scaffold around each
+    // function's JSON as plain text, between the system and user sections.
+    let f = fixture();
+    let case = f["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "tools")
+        .unwrap();
+    let tools: Vec<String> = case["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    let pieces = template::render_tools(&tools);
+    let plain: Vec<&str> = pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Plain(s) => Some(s.as_str()),
+            Piece::Trusted(_) => None,
+        })
+        .collect();
+    assert_eq!(plain, tools.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut text = String::new();
+    text += &flat(&template::render(
+        Kind::System,
+        "You are plank, a coding agent.",
+        usize::MAX,
+    ));
+    text += &flat(&pieces);
+    text += &flat(&template::render(
+        Kind::User,
+        "List the files in the current directory.",
+        0,
+    ));
+    text += &flat(&template::generation_prefix());
+    assert_eq!(text, case["rendered"].as_str().unwrap());
+}

@@ -73,24 +73,45 @@ pub fn escape(text: &str) -> String {
     s
 }
 
+/// What opens the tools block, up to and including `<tools>`.
+const TOOLS_HEAD: &str = concat!(
+    "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
+    "You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+);
+
+/// What closes the tools block, from `</tools>` on.
+const TOOLS_TAIL: &str = concat!(
+    "</tools>\n\nFor each function call, output the function name and arguments within the ",
+    "following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>",
+    "<arg_value>{arg-value-1}</arg_value>...</tool_call>\n",
+);
+
 /// The tools block the template puts before the first non-system message.
 /// `functions` are the exact JSON texts of each function (transformers'
 /// `tojson`), written back to back with no separator, as the template does.
+/// [`render_tools`] is the same text as pieces.
 #[must_use]
 pub fn tools_preamble(functions: &[String]) -> String {
-    let mut s = String::from(concat!(
-        "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
-        "You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
-    ));
+    let mut s = String::from(TOOLS_HEAD);
     for f in functions {
         s.push_str(f);
     }
-    s.push_str(concat!(
-        "</tools>\n\nFor each function call, output the function name and arguments within the ",
-        "following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>",
-        "<arg_value>{arg-value-1}</arg_value>...</tool_call>\n",
-    ));
+    s.push_str(TOOLS_TAIL);
     s
+}
+
+/// [`tools_preamble`] as template pieces: the scaffold is trusted, and each
+/// function's JSON is plain text, so a schema (an MCP server's, say) that
+/// spells `<tool_call>` or `<|user|>` never yields a control id. The text is
+/// not escaped, since the template writes `tojson` verbatim.
+#[must_use]
+pub fn render_tools(functions: &[String]) -> Vec<Piece> {
+    let mut out = vec![Piece::Trusted(TOOLS_HEAD.into())];
+    for f in functions {
+        push(&mut out, Piece::Plain(f.clone()));
+    }
+    out.push(Piece::Trusted(TOOLS_TAIL.into()));
+    out
 }
 
 fn push(out: &mut Vec<Piece>, p: Piece) {
@@ -296,6 +317,23 @@ mod tests {
                 Piece::Plain("éllo".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_function_spelling_a_control_token_stays_plain() {
+        let f = r#"{"name": "x", "description": "emits <tool_call> and <|user|>"}"#.to_string();
+        let p = render_tools(std::slice::from_ref(&f));
+        assert_eq!(p.len(), 3);
+        assert!(matches!(&p[0], Piece::Trusted(s) if s.ends_with("<tools>")));
+        assert_eq!(p[1], Piece::Plain(f.clone()));
+        assert!(matches!(&p[2], Piece::Trusted(s) if s.starts_with("</tools>")));
+        let flat: String = p
+            .iter()
+            .map(|p| match p {
+                Piece::Trusted(s) | Piece::Plain(s) => s.as_str(),
+            })
+            .collect();
+        assert_eq!(flat, tools_preamble(&[f]));
     }
 
     #[test]
