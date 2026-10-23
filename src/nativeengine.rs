@@ -64,12 +64,6 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
     /// When the header does not read as this family's.
     fn probe(path: &Path) -> Result<(usize, usize), EngineError>;
 
-    /// Largest default context, before RAM sizing (`None` = the file's).
-    #[must_use]
-    fn default_ctx_cap() -> Option<usize> {
-        None
-    }
-
     /// Bytes of KV one token takes.
     fn kv_bytes_per_token(model: &Self::Model) -> usize;
 
@@ -111,33 +105,30 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
     }
 }
 
-/// The context opened when the caller asks for none (`ctx <= 0`): the KV a
-/// third of `ram` can hold ([`crate::enginefit::NATIVE_KV_RAM_DIVISOR`]), in
-/// whole 1024-token steps, never below [`crate::enginefit::NATIVE_MIN_CTX`]
-/// and never past the model's own `context_length` (nor `cap`, when given).
+/// The context opened when the caller asks for none (`ctx <= 0`): the model's
+/// own `context_length` when its KV passes the half-of-memory refusal in
+/// [`NativeEngine::open`]; otherwise the KV a third of `ram` can hold
+/// ([`crate::enginefit::NATIVE_KV_RAM_DIVISOR`]), in whole 1024-token steps,
+/// never below [`crate::enginefit::NATIVE_MIN_CTX`].
 ///
 /// The cache is f32 and keeps every position, so the window is what decides
-/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B. A fixed default
-/// was wrong at both ends: 32K cost the 12B 22.5 GB on any machine, while a
-/// 128 GB one could hold E4B's whole 131K. A third leaves the weights and the
-/// rest of the system room, and stays under the half-of-memory refusal in
-/// [`NativeEngine::open`]. `ram` of 0 or `usize::MAX` (not measurable) keeps
-/// the old 32K.
-pub(crate) fn default_ctx(
-    ram: usize,
-    context_length: usize,
-    kv_bytes_per_token: usize,
-    cap: Option<usize>,
-) -> usize {
-    let limit = cap.map_or(context_length, |c| context_length.min(c));
-    let fallback = DEFAULT_CTX.min(limit);
+/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B, 200 KB on Flint.
+/// On a 128 GB machine E4B's 131K and Flint's 262K open whole, while the
+/// 12B's 131K (90 GB) would be refused, so it gets the third instead, which
+/// leaves the weights and the rest of the system room. `ram` of 0 or
+/// `usize::MAX` (not measurable) keeps the old 32K.
+pub(crate) fn default_ctx(ram: usize, context_length: usize, kv_bytes_per_token: usize) -> usize {
+    let fallback = DEFAULT_CTX.min(context_length);
     if ram == 0 || ram == usize::MAX || kv_bytes_per_token == 0 {
         return fallback;
+    }
+    if context_length.saturating_mul(kv_bytes_per_token) <= ram / 2 {
+        return context_length;
     }
     let fits = ram / crate::enginefit::NATIVE_KV_RAM_DIVISOR / kv_bytes_per_token;
     (fits / 1024 * 1024)
         .max(crate::enginefit::NATIVE_MIN_CTX)
-        .min(limit)
+        .min(context_length)
 }
 
 /// The engine: one model, one live session, and the token transcript that
@@ -363,12 +354,7 @@ impl<F: NativeFamily> NativeEngine<F> {
             c
         } else {
             let (context_length, kv_bytes_per_token) = F::probe(path)?;
-            default_ctx(
-                physical_memory(),
-                context_length,
-                kv_bytes_per_token,
-                F::default_ctx_cap(),
-            )
+            default_ctx(physical_memory(), context_length, kv_bytes_per_token)
         };
         // Rotary tables are built for the capped context only, which also
         // makes `context_length()` the clamped context.
@@ -784,17 +770,11 @@ mod tests {
 
     const GIB: usize = 1 << 30;
 
-    /// A family cap bounds the RAM-sized default like the file's own window.
+    /// With RAM to spare the default is the file's own window; with less,
+    /// the KV a third of RAM holds.
     #[test]
-    fn a_cap_bounds_the_default_context() {
-        assert_eq!(
-            default_ctx(128 * GIB, 262_144, 200_704, Some(65_536)),
-            65_536
-        );
-        assert_eq!(default_ctx(0, 262_144, 200_704, Some(16_384)), 16_384);
-        assert_eq!(
-            default_ctx(16 * GIB, 262_144, 200_704, Some(65_536)),
-            27_648
-        );
+    fn the_default_context_reaches_the_files_window() {
+        assert_eq!(default_ctx(128 * GIB, 262_144, 200_704), 262_144);
+        assert_eq!(default_ctx(16 * GIB, 262_144, 200_704), 27_648);
     }
 }

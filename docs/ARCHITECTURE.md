@@ -374,8 +374,7 @@ loop — with piped stdin there is no live input to multiplex.
   default on). It renders with `flint_engine::template`, turns the tools
   block that the system text carries between the `sysprompt::FLINT_TOOLS_OPEN`
   and `FLINT_TOOLS_CLOSE` fence lines into the template's tools turn, applies
-  the GGUF's `top_k` before the shared sampler, caps the default context at
-  65,536 tokens, sizes each prefill chunk so one f32 attention score copy
+  the GGUF's `top_k` before the shared sampler, sizes each prefill chunk so one f32 attention score copy
   stays within 2 GiB (`chunk_for`), and refuses a file larger than the Metal
   device's `maxBufferLength`. The format, the decisions behind it and the v1
   limits are in `docs/FLINT.md`.

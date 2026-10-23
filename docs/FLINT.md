@@ -29,13 +29,14 @@ file given by path is classified by its own `general.architecture`
 (`flint`). The shape name the engine reports comes from `general.name`
 (`Flint NVFP4 Preview` on the real file) and selects `ToolSyntax::Flint`.
 
-With no `-c`, Flint sizes its context the way Gemma does
-(`nativeengine::default_ctx`, a third of RAM worth of f32 KV in 1024-token
-steps, never below 8192), and then caps it at 65,536 tokens. On the 128 GB
-Mac the cap is what binds, and plank says so at startup:
+With no `-c`, Flint opens the file's own `context_length` of 262,144 when
+its f32 KV fits in half of RAM, the same rule as Gemma
+(`nativeengine::default_ctx`); on a smaller machine it falls back to a third
+of RAM worth of KV in 1024-token steps, never below 8192. On the 128 GB Mac
+the whole window opens:
 
 ```
-plank: context 65536 tokens (12.2 GB of KV, this model's default cap; -c to change)
+plank: context 262144 tokens (49.0 GB of KV, sized to this machine's RAM up to the model's window; -c to change)
 ```
 
 ## The chat format
@@ -188,14 +189,15 @@ session blob 391 MB, well under the f32 KV those depths hold in memory,
 because the generic session's snapshot writes only the window of each
 sliding layer.
 
-**The context cap** (plan decision 3). Flint's attention memory grows with
-`t × keys`: the global layers' mask and the attention scores are each a
+**The default context.** Flint's attention memory grows with `t × keys`:
+the global layers' mask and the attention scores are each a
 `heads × t × keys` f32 tensor, which at 262,144 keys and a 512-token chunk
 would be about 17 GB per copy (arithmetic, not measured; see `FINDINGS.md`).
-So the default context is the RAM-sized window capped at 65,536 tokens
-(`FLINT_DEFAULT_CTX_CAP`). An explicit `-c` is still honoured up to the
-file's 262,144, and refused when its KV would exceed half of RAM, as Gemma's
-is.
+The adaptive prefill chunk below keeps one copy within 2 GiB at any depth, so
+the default context is no longer capped below the file's: it is the whole
+262,144 when its KV fits in half of RAM. An explicit `-c` is
+honoured up to the same 262,144, and refused when its KV would exceed half of
+RAM. Contexts past about 21K tokens have not been tested.
 
 **The adaptive prefill chunk.** Each prefill chunk is sized so one f32
 attention score copy stays at or below 2 GiB: with `keys` positions already

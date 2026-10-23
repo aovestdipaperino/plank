@@ -28,9 +28,9 @@ has been downloaded and its header can be read. A file given by path is
 classified by its own `general.architecture` (`gemma4`).
 
 With no `-c` (or `engine.ctx`), Gemma sizes its own context from the RAM
-(`nativeengine::default_ctx`): the window whose f32 KV fits a third of
-physical memory, in 1024-token steps, never below 8192 and never past the
-GGUF's `context_length`. The KV is what the window costs, about 115 KB a
+(`nativeengine::default_ctx`): the GGUF's own `context_length` when its
+f32 KV fits in half of physical memory, otherwise the window whose KV fits a
+third of it, in 1024-token steps, never below 8192. The KV is what the window costs, about 115 KB a
 token on E4B and 688 KB on 12B, so on a 128 GB Mac E4B opens its full 131072
 and 12B 66560, while a 16 GB machine gives 12B the 8192 floor. It does not
 inherit plank's 1,048,576 DeepSeek default, which says nothing about this

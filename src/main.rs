@@ -1744,8 +1744,8 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     eprintln!("plank: loading model {}...", model.display());
     // With no explicit `-c`, the configured window is the DeepSeek default
     // (1,048,576 tokens) and says nothing about this model: `0` lets the
-    // engine size it from the RAM (`nativeengine::default_ctx`), under the
-    // family's own cap when it has one.
+    // engine size it from the RAM (`nativeengine::default_ctx`), up to the
+    // file's own window.
     let ctx = if cfg.ctx_size_explicit {
         cfg.generation.ctx_size
     } else {
@@ -1756,17 +1756,8 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     if ctx == 0 {
         #[allow(clippy::cast_precision_loss)]
         let kv_gb = engine.kv_bytes_at_ctx() as f64 / f64::from(1u32 << 30);
-        // Gemma has no cap, so its line always reads "sized to this
-        // machine's RAM"; Flint's reads "capped" when the cap is what bound.
-        let capped = F::default_ctx_cap()
-            .is_some_and(|cap| usize::try_from(engine.ctx_size()).is_ok_and(|n| n == cap));
-        let sizing = if capped {
-            "this model's default cap"
-        } else {
-            "sized to this machine's RAM"
-        };
         eprintln!(
-            "plank: context {} tokens ({kv_gb:.1} GB of KV, {sizing}; -c to change)",
+            "plank: context {} tokens ({kv_gb:.1} GB of KV, sized to this machine's RAM up to the model's window; -c to change)",
             engine.ctx_size()
         );
     }

@@ -28,11 +28,6 @@ use gemma_engine::Device;
 use crate::engine::{EngineError, Utf8Stream};
 use crate::sysprompt::{FLINT_TOOLS_CLOSE, FLINT_TOOLS_OPEN};
 
-/// The largest context Flint opens by default, before RAM sizing: its
-/// attention memory grows with `t × keys`, so the file's 262,144 is only
-/// reached through an explicit `--ctx`.
-pub const FLINT_DEFAULT_CTX_CAP: usize = 65_536;
-
 /// Bytes one prefill chunk's f32 attention scores may take.
 const SCORE_BUDGET: usize = 2 << 30;
 
@@ -214,10 +209,6 @@ impl crate::nativeengine::NativeFamily for FlintFamily {
         let file = GgufFile::open(path).map_err(flint_error)?;
         let c = FlintConfig::from_header(&file.header).map_err(flint_error)?;
         Ok((c.context_length, c.kv_bytes_per_token()))
-    }
-
-    fn default_ctx_cap() -> Option<usize> {
-        Some(FLINT_DEFAULT_CTX_CAP)
     }
 
     fn kv_bytes_per_token(model: &Model) -> usize {
@@ -716,18 +707,14 @@ mod tests {
         }
     }
 
+    /// No family cap: on a machine with the RAM for it, the default is the
+    /// file's 262,144.
     #[test]
-    fn the_default_context_is_capped() {
+    fn the_default_context_is_the_files() {
         assert_eq!(
-            crate::nativeengine::default_ctx(
-                512 << 30,
-                262_144,
-                200_704,
-                Some(FLINT_DEFAULT_CTX_CAP)
-            ),
-            65_536
+            crate::nativeengine::default_ctx(128 << 30, 262_144, 200_704),
+            262_144
         );
-        assert_eq!(FlintFamily::default_ctx_cap(), Some(65_536));
     }
 
     #[test]

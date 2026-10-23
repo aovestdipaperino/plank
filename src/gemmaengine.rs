@@ -195,14 +195,9 @@ mod tests {
     use crate::nativeengine::to_u32;
 
     /// The shared [`crate::nativeengine::default_ctx`] as Gemma calls it:
-    /// the file's limits and no family cap.
+    /// the file's limits.
     fn default_ctx(ram: usize, limits: gemma_engine::model::Limits) -> usize {
-        crate::nativeengine::default_ctx(
-            ram,
-            limits.context_length,
-            limits.kv_bytes_per_token,
-            None,
-        )
+        crate::nativeengine::default_ctx(ram, limits.context_length, limits.kv_bytes_per_token)
     }
 
     const GIB: usize = 1 << 30;
