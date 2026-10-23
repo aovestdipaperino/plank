@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9
 
 - Flint tool calls (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`)
   parse and render, through `flint::FlintParser` and `ToolSyntax::Flint`. A
