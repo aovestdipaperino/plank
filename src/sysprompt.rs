@@ -144,6 +144,17 @@ pub fn gemma_syntax_reminder() -> &'static str {
     )
 }
 
+/// The short Flint tool-call syntax reminder.
+#[must_use]
+pub fn flint_syntax_reminder() -> &'static str {
+    concat!(
+        "Tool-call syntax reminder:\n",
+        "<tool_call>$TOOL_NAME<arg_key>$KEY</arg_key><arg_value>$VALUE</arg_value></tool_call>\n",
+        "One <arg_key>/<arg_value> pair per argument; values are written raw, ",
+        "JSON for numbers, booleans, arrays and objects.\n",
+    )
+}
+
 /// [`IN_THINK_PROHIBITION`] for Gemma, whose thinking block closes with `<channel|>`.
 pub const GEMMA_IN_THINK_PROHIBITION: &str =
     "Tool calls are only run outside the thinking block: close it with <channel|> first.";
@@ -196,13 +207,13 @@ Use read raw=true only when you need plain file text without line numbers.\n\n";
 /// `tools.editUpto` decides when set. Unset, it follows the C, which made
 /// `[upto]` opt-in (`--edit-upto`, upstream `b030961`) because the V4 Flash
 /// checkpoint struggles with anchored edits: off for the DSML and Qwen
-/// dialects. Gemma's prompt is plank's own and keeps the anchor.
+/// dialects. Gemma's and Flint's prompts are plank's own and keep the anchor.
 #[must_use]
 pub fn edit_upto(syntax: ToolSyntax) -> bool {
     crate::settings::active()
         .tools
         .edit_upto
-        .unwrap_or(syntax == ToolSyntax::Gemma)
+        .unwrap_or(matches!(syntax, ToolSyntax::Gemma | ToolSyntax::Flint))
 }
 
 /// The editing section for the chosen variant.
@@ -678,8 +689,17 @@ fn build_tools_prompt_parts_with_wasm(
             gpu_suspend,
         );
     }
-    // Placeholder: `ToolSyntax::Flint` falls through to the DSML path below
-    // until Task 3 routes it to its own builder.
+    // Flint takes its tools as transformers-`tojson` lines, fenced for
+    // `FlintFamily` to lift into the template's own tools turn.
+    if syntax == ToolSyntax::Flint {
+        return build_flint_tools_prompt_parts(
+            profile_prompt_source(),
+            mcp_servers,
+            wasm_tools,
+            parity,
+            gpu_suspend,
+        );
+    }
     //
     // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
     // before any prompt is built, so the dialect can never be selected. The
@@ -1039,6 +1059,13 @@ const GEMMA_WORKING_STYLE_RESPELLINGS: [(&str, &str); 4] = [
 /// model-agnostic and kept verbatim, cut from the C constants rather than
 /// retyped so it cannot drift from the DSML prompt.
 fn gemma_prose() -> String {
+    native_prose(ToolSyntax::Gemma, GEMMA_EDIT_EXAMPLE)
+}
+
+/// The prose shared by the dialects whose prompt is plank's own (Gemma and
+/// Flint): [`gemma_prose`]'s text, with `edit_example` as the anchored-edit
+/// example and `syntax` deciding whether `[upto]` is taught.
+fn native_prose(syntax: ToolSyntax, edit_example: &str) -> String {
     let intro = TOOLS_PROMPT_INTRO;
     let shape = intro
         .find("## Tools\n")
@@ -1051,7 +1078,7 @@ fn gemma_prose() -> String {
     out.push_str(&intro[read..]);
     insert_document_read_note(&mut out);
 
-    if edit_upto(ToolSyntax::Gemma) {
+    if edit_upto(syntax) {
         let edit = TOOLS_PROMPT_EDIT_LINE;
         let example = edit
             .find("Example anchored edit:\n")
@@ -1061,7 +1088,7 @@ fn gemma_prose() -> String {
             .map(|at| example + at + "</｜DSML｜tool_calls>\n".len())
             .expect("the example closes its stanza");
         out.push_str(&edit[..example]);
-        out.push_str(GEMMA_EDIT_EXAMPLE);
+        out.push_str(edit_example);
         out.push_str(&edit[example_end..]);
     } else {
         // No DSML in it, so nothing to respell.
@@ -1154,6 +1181,222 @@ pub fn gemma_profile_prompt_for_tests(profile_text: &str, allow: &[&str]) -> Str
         prefix: None,
     };
     build_gemma_tools_prompt_parts(Some((profile_text, &spec)), &[], &[], true, true).0
+}
+
+/// Opens the plank-internal fence around Flint's tool lines.
+///
+/// `FlintFamily` cuts the system text at this fence and its close, and hands
+/// the lines between to the template's own tools turn; the model never sees
+/// either marker.
+pub const FLINT_TOOLS_OPEN: &str = "\n<!-- plank:flint-tools -->\n";
+
+/// Closes the fence [`FLINT_TOOLS_OPEN`] opens.
+pub const FLINT_TOOLS_CLOSE: &str = "\n<!-- /plank:flint-tools -->";
+
+/// [`IN_THINK_PROHIBITION`] as Flint's call guidance, taught under parity.
+const FLINT_IN_THINK_LINE: &str =
+    "Tool calls are only run outside the thinking block: close it with </think> first.";
+
+/// The anchored-edit example of [`TOOLS_PROMPT_EDIT_LINE`], as a Flint call.
+/// `path` stays first, as the editing rules above it ask.
+const FLINT_EDIT_EXAMPLE: &str = concat!(
+    "Example anchored edit:\n",
+    "<tool_call>edit",
+    "<arg_key>path</arg_key><arg_value>/tmp/example.c</arg_value>",
+    "<arg_key>old</arg_key><arg_value>static int parse(void) {\n",
+    "    int ok = 0;\n",
+    "[upto]\n",
+    "    return ok;\n",
+    "}</arg_value>",
+    "<arg_key>new</arg_key><arg_value>static int parse(void) {\n",
+    "    return parse_impl();\n",
+    "}</arg_value></tool_call>\n",
+);
+
+/// plank's prose for a Flint model: [`gemma_prose`]'s model-agnostic text,
+/// with the anchored-edit example in Flint's call syntax.
+fn flint_prose() -> String {
+    native_prose(ToolSyntax::Flint, FLINT_EDIT_EXAMPLE)
+}
+
+/// Builds the Flint tools prompt and its trusted length, the counterpart of
+/// [`build_gemma_tools_prompt_parts`].
+///
+/// plank's prose comes first. The tools follow between [`FLINT_TOOLS_OPEN`]
+/// and [`FLINT_TOOLS_CLOSE`], one [`flint_function_json`] line each:
+/// `FlintFamily` lifts them into the template's `# Tools` turn, whose
+/// scaffold the template supplies, so this text never carries a template
+/// marker. The trusted span ends after the builtin lines; MCP and WASM lines
+/// follow inside the fence, and the MCP server instructions after it.
+fn build_flint_tools_prompt_parts(
+    profile: Option<(&str, &crate::profile::ProfileSpec)>,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+    parity: bool,
+    gpu_suspend: bool,
+) -> (String, usize) {
+    let all_builtins = || {
+        parse_builtin_tool_schemas()
+            .into_iter()
+            .chain(native_extra_specs(true))
+    };
+    let (mut out, builtins): (String, Vec<crate::engine::ToolSpec>) =
+        if let Some((text, spec)) = profile {
+            let mut text = text.to_string();
+            if gpu_suspend && spec.builtin_enabled("bash") {
+                append_gpu_suspend_note(&mut text, ToolSyntax::Flint);
+            }
+            (
+                compose_flint_profile_prompt(&text, parity),
+                all_builtins()
+                    .filter(|s| spec.builtin_enabled(&s.name))
+                    .collect(),
+            )
+        } else {
+            let mut out = flint_prose();
+            if gpu_suspend {
+                append_gpu_suspend_note(&mut out, ToolSyntax::Flint);
+            }
+            if parity {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+                out.push_str(FLINT_IN_THINK_LINE);
+            }
+            (out, all_builtins().collect())
+        };
+    out.push_str(FLINT_TOOLS_OPEN);
+    for spec in &builtins {
+        out.push_str(&flint_function_json(spec));
+        out.push('\n');
+    }
+    let trusted_len = out.len();
+
+    // The same foreign set the Gemma builder declares: the provider
+    // registry's `mcp_…` tools, then the WASM component tools.
+    let foreign = provider_tool_registry(mcp_servers)
+        .into_iter()
+        .filter(|s| s.name.starts_with("mcp_"))
+        .chain(wasm_tools.iter().map(|t| {
+            crate::engine::ToolSpec {
+                name: t.exposed.clone(),
+                description: t.description.clone(),
+                parameters: serde_json::from_str(&t.schema)
+                    .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} })),
+            }
+        }));
+    for spec in foreign {
+        out.push_str(&flint_function_json(&spec));
+        out.push('\n');
+    }
+    out.push_str(FLINT_TOOLS_CLOSE);
+    let mut instructions = String::new();
+    crate::tools::mcp::append_server_instructions(&mut instructions, mcp_servers);
+    if !instructions.is_empty() {
+        out.push('\n');
+        out.push_str(&instructions);
+    }
+    (out, trusted_len)
+}
+
+/// Composes a profile's prompt for a Flint model, as
+/// [`compose_gemma_profile_prompt`] does but without declarations: those go
+/// in the fence after it. [`TOOL_PROTOCOL_TOKEN`] expands to Flint's call
+/// guidance under parity and to nothing otherwise; the call syntax itself
+/// comes from the template's tools turn.
+fn compose_flint_profile_prompt(profile_text: &str, parity: bool) -> String {
+    let guidance = if parity { FLINT_IN_THINK_LINE } else { "" };
+    if profile_text.contains(TOOL_PROTOCOL_TOKEN) {
+        profile_text.replace(TOOL_PROTOCOL_TOKEN, guidance)
+    } else {
+        profile_text.trim_end().to_string()
+    }
+}
+
+/// The `PLANK_REGEN_FIXTURES` hook for `tests/flint_parity.rs`: the Flint
+/// tools prompt with no MCP, WASM or profile.
+#[doc(hidden)]
+#[must_use]
+pub fn flint_tools_prompt_for_tests(gpu_suspend: bool) -> String {
+    build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Flint, gpu_suspend).0
+}
+
+/// One function as transformers' `tojson` filter writes it in Flint's chat
+/// template: `json.dumps(x, ensure_ascii=False)` with the default `", "` and
+/// `": "` separators, keys in the order `name`, `description`, `parameters`,
+/// and the schema's own key order after that.
+///
+/// The schema order holds because `serde_json`'s `preserve_order` is on in
+/// plank's build (feature unification); a test pins it.
+#[must_use]
+pub fn flint_function_json(spec: &crate::engine::ToolSpec) -> String {
+    let mut out = String::with_capacity(256);
+    out.push_str("{\"name\": ");
+    write_py_json_str(&mut out, &spec.name);
+    out.push_str(", \"description\": ");
+    write_py_json_str(&mut out, &spec.description);
+    out.push_str(", \"parameters\": ");
+    write_py_json(&mut out, &spec.parameters);
+    out.push('}');
+    out
+}
+
+/// Writes `v` as Python's `json.dumps(v, ensure_ascii=False)` would.
+fn write_py_json(out: &mut String, v: &serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => write_py_json_str(out, s),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_py_json(out, item);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_py_json_str(out, k);
+                out.push_str(": ");
+                write_py_json(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Writes `s` as a Python JSON string under `ensure_ascii=False`: the short
+/// escapes for `"`, `\`, `\n`, `\r`, `\t`, `\b` and `\f`, every other control
+/// below 0x20 as `\u00xx`, and everything else raw.
+fn write_py_json_str(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Renders `specs` as Gemma 4 tool declarations, byte for byte as the model's
@@ -1504,6 +1747,11 @@ const GPU_SUSPEND_EXAMPLE_QWEN: &str = "<parameter=suspend_model>\ntrue\n</param
 const GPU_SUSPEND_EXAMPLE_GEMMA: &str =
     "<|tool_call>call:bash{command:<|\"|>$COMMAND<|\"|>,suspend_model:true}<tool_call|>\n";
 
+/// The `suspend_model` parameter as a Flint call spells it: one
+/// `<arg_key>`/`<arg_value>` pair, the dialect's own parameter form.
+const GPU_SUSPEND_EXAMPLE_FLINT: &str =
+    "<arg_key>suspend_model</arg_key><arg_value>true</arg_value>\n";
+
 /// Appends [`GPU_SUSPEND_NOTE`] and the call form for `syntax` under its own
 /// heading. Deterministic for a given launch: whether plank holds a
 /// releasable model is fixed when the prompt is composed, so the Tier 1
@@ -1518,8 +1766,8 @@ fn append_gpu_suspend_note(out: &mut String, syntax: ToolSyntax) {
     out.push_str(match syntax {
         ToolSyntax::Qwen => GPU_SUSPEND_EXAMPLE_QWEN,
         ToolSyntax::Gemma => GPU_SUSPEND_EXAMPLE_GEMMA,
-        // `Flint` is a placeholder: Task 3 gives it its own `<arg_key>` example.
-        ToolSyntax::Dsml | ToolSyntax::Dsml41 | ToolSyntax::Flint => GPU_SUSPEND_EXAMPLE_DSML,
+        ToolSyntax::Flint => GPU_SUSPEND_EXAMPLE_FLINT,
+        ToolSyntax::Dsml | ToolSyntax::Dsml41 => GPU_SUSPEND_EXAMPLE_DSML,
     });
 }
 
@@ -2360,8 +2608,8 @@ pub fn build_short_system_prompt_reminder(
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
     out.push_str(match syntax {
         ToolSyntax::Qwen => qwen_syntax_reminder(),
-        // `Flint` is a placeholder: Task 3 gives it `flint_syntax_reminder()`.
-        ToolSyntax::Dsml | ToolSyntax::Flint => dsml_syntax_reminder(),
+        ToolSyntax::Flint => flint_syntax_reminder(),
+        ToolSyntax::Dsml => dsml_syntax_reminder(),
         ToolSyntax::Dsml41 => dsml41_syntax_reminder(),
         ToolSyntax::Gemma => gemma_syntax_reminder(),
     });
@@ -4207,5 +4455,132 @@ mod tests {
             true,
         );
         assert!(!without.contains("suspend_model"));
+    }
+
+    #[test]
+    fn flint_function_json_matches_transformers_tojson() {
+        let spec = crate::engine::ToolSpec {
+            name: "read".into(),
+            description: "Read a file — fast".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        };
+        // python3: json.dumps({"name": ..., "description": ..., "parameters": ...}, ensure_ascii=False)
+        assert_eq!(
+            flint_function_json(&spec),
+            r#"{"name": "read", "description": "Read a file — fast", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}"#
+        );
+    }
+
+    #[test]
+    fn flint_json_escapes_like_python() {
+        let spec = crate::engine::ToolSpec {
+            name: "x".into(),
+            description: "a \"q\" \\ b\n\tc\u{1}".into(),
+            parameters: serde_json::json!({}),
+        };
+        assert_eq!(
+            flint_function_json(&spec),
+            r#"{"name": "x", "description": "a \"q\" \\ b\n\tc\u0001", "parameters": {}}"#
+        );
+    }
+
+    /// The rest of Python's control escapes, and the characters it writes raw
+    /// under `ensure_ascii=False` (`é`, U+2028, DEL). Expected string from
+    /// `python3 -I -c 'import json;print(json.dumps({...},ensure_ascii=False))'`.
+    #[test]
+    fn flint_json_escapes_the_remaining_controls_like_python() {
+        let spec = crate::engine::ToolSpec {
+            name: "x".into(),
+            description: "\u{8}\u{c}\r\u{1f} é\u{2028}\u{7f}".into(),
+            parameters: serde_json::json!({"n": [1, 2.5, true, null], "b": false}),
+        };
+        assert_eq!(
+            flint_function_json(&spec),
+            "{\"name\": \"x\", \"description\": \"\\b\\f\\r\\u001f é\u{2028}\u{7f}\", \"parameters\": {\"n\": [1, 2.5, true, null], \"b\": false}}"
+        );
+    }
+
+    /// `flint_function_json` writes keys in the schema's own order, which
+    /// holds only while `serde_json`'s `preserve_order` is on (it arrives
+    /// through feature unification). A build without it would sort keys and
+    /// put `properties` before `type`.
+    #[test]
+    fn flint_json_keeps_schema_key_order() {
+        let spec = crate::engine::ToolSpec {
+            name: "x".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let line = flint_function_json(&spec);
+        assert!(
+            line.find("\"type\"").unwrap() < line.find("\"properties\"").unwrap(),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_flint_prompt_fences_one_json_line_per_tool() {
+        let (text, trusted) =
+            build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Flint, false);
+        let open = text.find(FLINT_TOOLS_OPEN).expect("fence open");
+        let close = text.find(FLINT_TOOLS_CLOSE).expect("fence close");
+        assert!(open < close && trusted <= text.len());
+        let block = &text[open + FLINT_TOOLS_OPEN.len()..close];
+        assert!(block.lines().count() >= 5);
+        for line in block.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(
+                v["name"].is_string() && v["parameters"].is_object(),
+                "{line}"
+            );
+        }
+        assert!(
+            !text.contains("<|system|>"),
+            "markers come from the template, not the prompt"
+        );
+    }
+
+    /// Flint's prompt speaks its own dialect: no DSML or Gemma call syntax
+    /// leaks in through the shared prose, and the anchored-edit example and
+    /// the GPU note use `<arg_key>`/`<arg_value>`.
+    #[test]
+    fn the_flint_prompt_teaches_only_its_own_call_syntax() {
+        let text = flint_tools_prompt_for_tests(true);
+        assert!(!text.contains("DSML"), "DSML leaked into the Flint prompt");
+        assert!(!text.contains("<|tool_call>"), "Gemma syntax leaked");
+        assert!(text.contains(
+            "<tool_call>edit<arg_key>path</arg_key><arg_value>/tmp/example.c</arg_value>"
+        ));
+        assert!(text.contains("<arg_key>suspend_model</arg_key><arg_value>true</arg_value>"));
+        assert!(text.contains(
+            "Tool calls are only run outside the thinking block: close it with </think> first."
+        ));
+    }
+
+    #[test]
+    fn the_flint_prompt_trusts_only_the_builtins() {
+        let (text, trusted) =
+            build_tools_prompt_parts_with_wasm(&[], &[], true, ToolSyntax::Flint, false);
+        let close = text.find(FLINT_TOOLS_CLOSE).unwrap();
+        // With no MCP or WASM tools the foreign part is empty: the trusted
+        // span ends right before the closing fence.
+        assert_eq!(trusted, close);
+        assert!(text[..trusted].ends_with("}\n"));
+    }
+
+    #[test]
+    fn edit_upto_defaults_on_for_flint() {
+        assert!(edit_upto(ToolSyntax::Flint));
+    }
+
+    #[test]
+    fn the_short_reminder_speaks_flint() {
+        let r = build_short_system_prompt_reminder(&[], ToolSyntax::Flint);
+        assert!(r.contains(flint_syntax_reminder()), "{r}");
+        assert!(!r.contains("DSML"), "{r}");
     }
 }

@@ -680,10 +680,12 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
                 "Tool error: invalid Gemma tool call: {err}\n{}",
                 sysprompt::gemma_syntax_reminder()
             ),
-            // Placeholder: Task 3 names the dialect and adds
-            // `flint_syntax_reminder()`. `InThink` already takes the default
-            // `IN_THINK_PROHIBITION` arm above.
-            sysprompt::ToolSyntax::Flint => format!("Tool error: invalid tool call: {err}\n"),
+            // Flint's `InThink` takes the default `IN_THINK_PROHIBITION` arm
+            // above: its thinking block closes with `</think>`.
+            sysprompt::ToolSyntax::Flint => format!(
+                "Tool error: invalid Flint tool call: {err}\n{}",
+                sysprompt::flint_syntax_reminder()
+            ),
         },
     }
 }
@@ -35440,7 +35442,11 @@ mod tests {
         assert!(t.contains("</think>") && !t.contains("<channel|>"), "{t}");
         let p = tool_error_payload(PassError::Dsml, "junk", crate::sysprompt::ToolSyntax::Flint);
         assert!(
-            p.starts_with("Tool error: invalid") && p.contains("junk"),
+            p.starts_with("Tool error: invalid Flint tool call: junk\n"),
+            "{p}"
+        );
+        assert!(
+            p.ends_with(crate::sysprompt::flint_syntax_reminder()),
             "{p}"
         );
         assert!(!p.contains("DSML"), "{p}");
