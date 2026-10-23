@@ -178,9 +178,9 @@ cargo build --release</code></pre>
 Metal-backend objects, links Foundation and Metal, and enables real
 inference.</li>
 <li><strong>Without it</strong> — plank still builds and runs Gemma 4
-for real, on plank's own Rust engine, which compiles no C. DeepSeek and
-Qwen are unavailable; a build with neither falls back to the echo stub,
-which is fine for working on the UI and tools.
+and Flint for real, on plank's own Rust engine, which compiles no C.
+DeepSeek and Qwen are unavailable; a build with neither falls back to
+the echo stub, which is fine for working on the UI and tools.
 <code>PLANK_NO_DS4=1 cargo build --release</code> gives you this build
 even with the submodule checked out.</li>
 </ul>
@@ -226,6 +226,12 @@ default.</td>
 <td>Gemma 4 12B instruct (QAT Q4_0), on the same engine.</td>
 <td>~7 GB</td>
 </tr>
+<tr>
+<td><code>flint</code></td>
+<td>Flint, Recursive's 40B mixture-of-experts (NVFP4), on plank's own
+Rust engine.</td>
+<td>~23 GB</td>
+</tr>
 </tbody>
 </table>
 <p>Pick one with <code>--model &lt;name&gt;</code>, for example
@@ -256,17 +262,29 @@ the CPU elsewhere, on a Rust engine that needs neither the
 thinking, sessions, sub-agents, memory and KV reuse all work as they do
 on DeepSeek; vision, speculative decoding and the System-1 memory gate
 do not exist for it yet.</p>
-<p>With no <code>-c</code>, Gemma sizes its context from the RAM: the
-largest window whose KV fits a third of memory, never below 8,192 tokens
-and never past what the model was trained for. On a 128 GB Mac that is
-the full 131,072 tokens for E4B and about 66,000 for 12B; a 16 GB
-machine gives 12B the 8,192 floor. plank prints the size it chose and
-what it costs at startup.</p>
+<p>With no <code>-c</code>, Gemma opens the model's whole trained window
+when its KV fits in half of memory; otherwise it takes the largest
+window whose KV fits a third of memory, never below 8,192 tokens. On a
+128 GB Mac that is the full 131,072 tokens for E4B and about 66,000 for
+12B; a 16 GB machine gives 12B the 8,192 floor. plank prints the size it
+chose and what it costs at startup.</p>
 <p>Its sessions are a family of their own (<code>.gemma.kv</code>), so
 switching between Gemma and DeepSeek keeps both histories. Any Gemma 4
 GGUF also works by path,
 <code>plank -m ~/models/gemma-4-E4B-it-Q4_K_M.gguf</code>, recognised
 from the file's own architecture field.</p>
+<h3 id="flint">Flint</h3>
+<p>Flint is Recursive's 40B mixture-of-experts model, quantised to
+NVFP4. It runs on the same Rust engine as Gemma, with NVFP4 kernels of
+its own, so it needs neither the submodule nor any C; on a Mac it
+decodes on Metal at speeds close to Ollama's on the same machine.
+<code>plank --model flint</code> fetches the 23 GB file. With no
+<code>-c</code> it opens its whole 262,144-token window when the KV
+(about 100 KB a token) fits in half of memory, as Gemma does. Its
+sessions are their own family (<code>.flint.kv</code>), and it has no
+vision or speculative decoding. A Flint GGUF also works by path,
+recognised from its architecture field. The details are in
+<code>docs/FLINT.md</code>.</p>
 <p>DeepSeek V4.1 Flash is a family of its own, with its own tool-call
 dialect and its own <code>.ds41.kv</code> transcripts.
 <code>--model ds41</code> fetches and runs it; pointing
@@ -390,8 +408,8 @@ if you launch on an unsupported platform.</p>
 <tr>
 <td><code>~/.plank/&lt;engine&gt;.gguf</code></td>
 <td>an engine's main model, for example <code>ds4vision.gguf</code> (the
-default), <code>ds41.gguf</code>, <code>qwen.gguf</code> or
-<code>gemma4-e4b.gguf</code></td>
+default), <code>ds41.gguf</code>, <code>qwen.gguf</code>,
+<code>gemma4-e4b.gguf</code> or <code>flint.gguf</code></td>
 </tr>
 <tr>
 <td><code>~/.plank/&lt;engine&gt;.mtp.gguf</code></td>
@@ -419,9 +437,9 @@ recording which version is on disk</td>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>
 <td>saved sessions (<code>&lt;name&gt;.&lt;family&gt;.kv</code>, such as
-<code>.ds4.kv</code> or <code>.gemma.kv</code>) plus the KV snapshots
-(<code>*.kv_raw</code>) and their metadata (<code>*.json</code>). Browse
-it with <code>/kvcache</code>.</td>
+<code>.ds4.kv</code>, <code>.gemma.kv</code> or <code>.flint.kv</code>)
+plus the KV snapshots (<code>*.kv_raw</code>) and their metadata
+(<code>*.json</code>). Browse it with <code>/kvcache</code>.</td>
 </tr>
 <tr>
 <td><code>~/.plank/settings.json</code></td>
