@@ -35,6 +35,23 @@ pub use gemma_engine::sample::Sampler;
 #[cfg(feature = "candle")]
 pub use gemma_engine::session::{Session, SessionModel};
 
+/// The largest buffer this machine's Metal device makes
+/// (`MTLDevice::maxBufferLength`), or `None` without one (not macOS, or no
+/// device opens). A GGUF larger than this cannot be bound as one no-copy
+/// buffer, and the copy fallback would double the resident weights.
+#[cfg(feature = "candle")]
+#[must_use]
+pub fn metal_max_buffer_len() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        nvfp4::metal::max_buffer_len()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -77,6 +94,20 @@ pub(crate) fn err(msg: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a Mac with a Metal device the limit is the device's own (gigabytes
+    /// on any Apple GPU); without Metal there is none.
+    #[cfg(feature = "candle")]
+    #[test]
+    fn the_metal_buffer_limit_is_the_devices() {
+        let got = metal_max_buffer_len();
+        #[cfg(target_os = "macos")]
+        if candle_core::Device::new_metal(0).is_ok() {
+            assert!(got.is_some_and(|n| n >= 1 << 30), "{got:?}");
+            return;
+        }
+        assert_eq!(got, None);
+    }
 
     #[test]
     fn a_gemma_engine_error_keeps_its_message() {

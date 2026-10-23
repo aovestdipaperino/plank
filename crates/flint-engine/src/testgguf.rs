@@ -141,6 +141,96 @@ pub fn tiny_flint(c: &FlintConfig, vocab: usize, sink: f32, seed: u64) -> Vec<u8
     tiny_flint_builder(c, vocab, sink, seed).bytes()
 }
 
+/// The real file's chat markers with their GGUF token types: the turn
+/// markers are control (3), the tags the model writes are user-defined (4).
+/// [`tiny_vocab`] gives the marker at index `i` the id `256 + i`.
+pub const FLINT_MARKERS: [(&str, i32); 18] = [
+    ("<|end_of_text|>", 3),
+    ("<|system|>", 3),
+    ("<|developer|>", 3),
+    ("<|user|>", 3),
+    ("<|assistant|>", 3),
+    ("<|observation|>", 3),
+    ("<think>", 4),
+    ("</think>", 4),
+    ("<tool_call>", 4),
+    ("</tool_call>", 4),
+    ("<arg_key>", 4),
+    ("</arg_key>", 4),
+    ("<arg_value>", 4),
+    ("</arg_value>", 4),
+    ("<tool_response>", 4),
+    ("</tool_response>", 4),
+    ("<tools>", 4),
+    ("</tools>", 4),
+];
+
+/// The markers a reply ends at, as the real file's `eog_token_ids` lists
+/// them.
+const EOG_MARKERS: [&str; 4] = [
+    "<|end_of_text|>",
+    "<|user|>",
+    "<|observation|>",
+    "<|developer|>",
+];
+
+/// Adds a byte-level `tokenizer.ggml.*` vocab to `b`: the 256 GPT-2 byte
+/// tokens (ids `0..256`, in byte order), then `extra` (spelling, token
+/// type) at `256 + i`, and no merges. The eos is `<|end_of_text|>` and the
+/// eog ids are whichever of [`EOG_MARKERS`] `extra` holds; without
+/// `<|end_of_text|>` the eos is id 0.
+#[cfg(feature = "candle")]
+#[must_use]
+pub fn tiny_vocab(b: Builder, extra: &[(&str, i32)]) -> Builder {
+    let mut tokens: Vec<Value> = crate::tokenizer::bytes_to_unicode()
+        .iter()
+        .map(|c| Value::Str(c.to_string()))
+        .collect();
+    let mut types = vec![Value::I32(1); 256];
+    for (s, ty) in extra {
+        tokens.push(Value::Str((*s).to_string()));
+        types.push(Value::I32(*ty));
+    }
+    let id = |s: &str| {
+        extra
+            .iter()
+            .position(|(t, _)| *t == s)
+            .and_then(|i| u32::try_from(256 + i).ok())
+    };
+    let eos = id("<|end_of_text|>").unwrap_or(0);
+    let mut eog: Vec<Value> = EOG_MARKERS
+        .iter()
+        .filter_map(|s| id(s))
+        .map(Value::U32)
+        .collect();
+    if eog.is_empty() {
+        eog.push(Value::U32(eos));
+    }
+    b.kv("tokenizer.ggml.model", &Value::Str("gpt2".into()))
+        .kv("tokenizer.ggml.pre", &Value::Str("flint".into()))
+        .kv("tokenizer.ggml.tokens", &Value::Array(tokens))
+        .kv("tokenizer.ggml.token_type", &Value::Array(types))
+        .kv("tokenizer.ggml.merges", &Value::Array(Vec::new()))
+        .kv("tokenizer.ggml.eos_token_id", &Value::U32(eos))
+        .kv("tokenizer.ggml.eog_token_ids", &Value::Array(eog))
+}
+
+/// [`tiny_flint`] with [`tiny_vocab`]'s tokenizer: a `256 + extra.len()`
+/// token model that [`crate::tokenizer::FlintTokenizer::from_header`] reads.
+///
+/// # Panics
+/// As [`tiny_flint`].
+#[cfg(feature = "candle")]
+#[must_use]
+pub fn tiny_flint_with_vocab(
+    c: &FlintConfig,
+    extra: &[(&str, i32)],
+    sink: f32,
+    seed: u64,
+) -> Vec<u8> {
+    tiny_vocab(tiny_flint_builder(c, 256 + extra.len(), sink, seed), extra).bytes()
+}
+
 /// [`tiny_flint`] before it is serialised, so a test can add a tensor the
 /// real file does not have.
 ///
@@ -297,6 +387,46 @@ mod tests {
     use super::*;
     use crate::config::test_config;
     use crate::gguf::Header;
+
+    /// The tiny vocab builds a tokenizer: the 256 bytes round-trip, each
+    /// marker is a control id at `256 + its index`, and the turn markers
+    /// that end a reply are the EOG ids.
+    #[cfg(feature = "candle")]
+    #[test]
+    fn the_tiny_vocab_builds_a_flint_tokenizer() {
+        use crate::tokenizer::FlintTokenizer;
+        let c = test_config();
+        let bytes = tiny_flint_with_vocab(&c, &FLINT_MARKERS, 0.5, 7);
+        let h = Header::parse(&bytes).unwrap();
+        assert_eq!(FlintConfig::from_header(&h).unwrap(), c);
+        assert_eq!(
+            h.tensor("token_embd.weight").unwrap().dims,
+            vec![128, 256 + FLINT_MARKERS.len() as u64]
+        );
+        let t = FlintTokenizer::from_header(&h).unwrap();
+        assert_eq!(t.vocab_size(), 256 + FLINT_MARKERS.len());
+        for (i, (spelling, _)) in FLINT_MARKERS.iter().enumerate() {
+            let id = 256 + u32::try_from(i).unwrap();
+            assert_eq!(t.control_id(spelling), Some(id), "{spelling}");
+            assert!(t.is_control(id));
+        }
+        let id = |s: &str| t.control_id(s).unwrap();
+        assert_eq!(t.eos(), id("<|end_of_text|>"));
+        for s in [
+            "<|end_of_text|>",
+            "<|user|>",
+            "<|observation|>",
+            "<|developer|>",
+        ] {
+            assert!(t.is_eog(id(s)), "{s}");
+        }
+        assert!(!t.is_eog(id("<|assistant|>")) && !t.is_eog(id("<think>")));
+        let text = "héllo <tool_call> 🙂";
+        let ids = t.encode_plain(text);
+        assert!(ids.iter().all(|&i| i < 256), "{ids:?}");
+        let back: Vec<u8> = ids.iter().flat_map(|&i| t.piece_bytes(i)).collect();
+        assert_eq!(back, text.as_bytes());
+    }
 
     #[test]
     fn tiny_flint_parses_back_to_its_config_and_layout() {

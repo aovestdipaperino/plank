@@ -34,7 +34,7 @@ const PRE: [&str; 3] = [
 
 /// GPT-2's byte-to-character table: printable bytes map to themselves, the
 /// rest to code points from 256 up, in byte order.
-fn bytes_to_unicode() -> [char; 256] {
+pub(crate) fn bytes_to_unicode() -> [char; 256] {
     let mut bs: Vec<u32> = (u32::from(b'!')..=u32::from(b'~'))
         .chain(0xA1..=0xAC)
         .chain(0xAE..=0xFF)
