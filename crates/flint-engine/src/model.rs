@@ -27,17 +27,17 @@ use crate::rope::Rope;
 use crate::{Result, err};
 
 #[derive(Debug)]
-enum Ffn {
+pub(crate) enum Ffn {
     Dense(Dense),
     Moe(Moe),
 }
 
 #[derive(Debug)]
-struct Layer {
-    attn_norm: Tensor,
-    attn: Attention,
-    ffn_norm: Tensor,
-    ffn: Ffn,
+pub(crate) struct Layer {
+    pub(crate) attn_norm: Tensor,
+    pub(crate) attn: Attention,
+    pub(crate) ffn_norm: Tensor,
+    pub(crate) ffn: Ffn,
 }
 
 /// A loaded Flint model.
@@ -64,6 +64,10 @@ pub struct Model {
     /// buffers and run out of order on the GPU (FINDINGS, "Two threads on
     /// one Metal device"). Serialising that work keeps it in order.
     gpu: Mutex<()>,
+    /// The single-token decode graph, built on the first Metal step: `None`
+    /// inside when this model's shapes need the candle path.
+    #[cfg(target_os = "macos")]
+    decode: std::sync::OnceLock<Option<crate::decode::DecodeGraph>>,
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
@@ -283,6 +287,8 @@ impl Model {
             context_length,
             signature,
             gpu: Mutex::new(()),
+            #[cfg(target_os = "macos")]
+            decode: std::sync::OnceLock::new(),
         }))
     }
 
@@ -345,6 +351,62 @@ impl Model {
         &self.device
     }
 
+    /// Token `token`'s embedding row, widened from BF16 into `out`
+    /// (`hidden` values).
+    pub(crate) fn embed_row(&self, token: u32, out: &mut [f32]) -> Result<()> {
+        let d = self.config.hidden;
+        let i = token as usize;
+        if i >= self.vocab || out.len() != d {
+            return Err(err(format!(
+                "token {token} is outside the {}-token vocab",
+                self.vocab
+            )));
+        }
+        let bytes = &self.file.mapped_file().bytes()[self.embd.0..self.embd.1];
+        for (o, c) in out
+            .iter_mut()
+            .zip(bytes[i * d * 2..(i + 1) * d * 2].as_chunks::<2>().0)
+        {
+            *o = bf16_to_f32(u16::from_le_bytes(*c));
+        }
+        Ok(())
+    }
+
+    /// The layers, for the decode graph.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// The rotary tables, for the decode graph.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn rope(&self) -> &Rope {
+        &self.rope
+    }
+
+    /// The final norm's weight, for the decode graph.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn output_norm(&self) -> &Tensor {
+        &self.output_norm
+    }
+
+    /// The output head, for the decode graph.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn output(&self) -> &NvWeight {
+        &self.output
+    }
+
+    /// The decode graph, built on first use; `None` off Metal or for shapes
+    /// it does not take.
+    #[cfg(target_os = "macos")]
+    fn decode_graph(&self) -> Result<Option<&crate::decode::DecodeGraph>> {
+        if let Some(g) = self.decode.get() {
+            return Ok(g.as_ref());
+        }
+        let g = crate::decode::DecodeGraph::new(self)?;
+        Ok(self.decode.get_or_init(|| g).as_ref())
+    }
+
     fn embed(&self, tokens: &[u32]) -> Result<Tensor> {
         let d = self.config.hidden;
         let bytes = &self.file.mapped_file().bytes()[self.embd.0..self.embd.1];
@@ -385,6 +447,19 @@ impl Model {
     /// match the model, or a device failure. On an error the cache may hold
     /// part of this forward; the caller truncates it back to `offset`.
     pub fn forward(&self, tokens: &[u32], offset: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_with(tokens, offset, cache, true)
+    }
+
+    /// [`Self::forward`], through the decode graph for a single token on
+    /// Metal when `graph` is set and the graph takes this model, else
+    /// through candle ops.
+    pub(crate) fn forward_with(
+        &self,
+        tokens: &[u32],
+        offset: usize,
+        cache: &mut KvCache,
+        graph: bool,
+    ) -> Result<Vec<f32>> {
         // Released when the forward returns, after `to_vec1` has waited for
         // the GPU.
         let _gpu = self.gpu_guard();
@@ -405,6 +480,15 @@ impl Model {
                 self.context_length
             )));
         };
+        #[cfg(target_os = "macos")]
+        if graph
+            && t == 1
+            && let Some(g) = self.decode_graph()?
+        {
+            return g.step(self, tokens[0], offset, cache);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = graph;
         let eps = self.config.rms_eps;
         let (global, sliding) = if t > 1 {
             let w = self.config.sliding_window;
@@ -802,5 +886,46 @@ mod tests {
         let mut c = Session::new(model(), 64);
         c.prefill(&PROMPT, &|| false).unwrap();
         assert!(close(&s.step(42).unwrap(), &c.step(42).unwrap(), 1e-3));
+    }
+
+    /// The decode graph against the candle path on Metal, step by step past
+    /// a 200-token prefill: attention crosses the 128-key chunk boundary,
+    /// and a 4-token window narrows every sliding layer's keys.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_decode_graph_matches_the_candle_path_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        for window in [4usize, 300] {
+            let mut c = test_config();
+            c.head_dim = 128;
+            c.context_length = 512;
+            c.sliding_window = window;
+            let file = GgufFile::from_bytes(&tiny_flint(&c, VOCAB, 0.5, 7)).unwrap();
+            let m = Model::from_file(file, &dev, 512).unwrap();
+            assert!(
+                m.decode_graph().unwrap().is_some(),
+                "the graph takes this model"
+            );
+            let prompt: Vec<u32> = (0..200u32).map(|i| (i * 37) % 256).collect();
+            let mut ops = KvCache::new(c.layers);
+            let mut graph = KvCache::new(c.layers);
+            m.forward_with(&prompt, 0, &mut ops, false).unwrap();
+            m.forward_with(&prompt, 0, &mut graph, false).unwrap();
+            let mut tok = 5u32;
+            for pos in 200..240 {
+                let want = m.forward_with(&[tok], pos, &mut ops, false).unwrap();
+                let got = m.forward_with(&[tok], pos, &mut graph, true).unwrap();
+                assert!(close(&got, &want, 1e-3), "window {window}, position {pos}");
+                tok = want
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map_or(0, |(i, _)| u32::try_from(i).unwrap());
+            }
+            assert_eq!(graph.len(), 240);
+        }
     }
 }

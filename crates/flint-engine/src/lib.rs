@@ -7,6 +7,8 @@
 #[cfg(feature = "candle")]
 mod attention;
 pub mod config;
+#[cfg(all(feature = "candle", target_os = "macos"))]
+mod decode;
 #[cfg(feature = "candle")]
 mod ffn;
 #[cfg(feature = "candle")]

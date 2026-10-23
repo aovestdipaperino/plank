@@ -38,6 +38,12 @@ impl Rope {
         })
     }
 
+    /// The `[positions, head_dim / 2]` cos and sin tables.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tables(&self) -> (&Tensor, &Tensor) {
+        (&self.cos, &self.sin)
+    }
+
     /// Rotates `x` (`[1, heads, t, head_dim]`) as positions `offset..offset + t`.
     pub(crate) fn apply(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
         let t = x.dim(2)?;

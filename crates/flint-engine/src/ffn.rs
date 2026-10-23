@@ -12,6 +12,9 @@ use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 /// `build_moe_ffn`'s floor on the routing-weight sum (the smallest f16
 /// normal), so a row of vanishing probabilities never divides by zero.
 const MIN_WEIGHT_SUM: f64 = 6.103_515_625e-5;
+/// [`MIN_WEIGHT_SUM`] for the Metal kernels, exact in f32.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) const MIN_WEIGHT_SUM_F32: f32 = MIN_WEIGHT_SUM as f32;
 
 /// `down(silu(gate x) * up x)`; each projection's tensor scale is applied
 /// by the op, so the gate is scaled before the `SiLU`.

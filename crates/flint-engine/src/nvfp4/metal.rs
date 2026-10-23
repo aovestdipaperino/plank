@@ -27,19 +27,21 @@ const SOURCE: &str = include_str!("nvfp4.metal");
 /// The single-token attention and routing kernels, compiled into the same
 /// library.
 const FUSED_SOURCE: &str = include_str!("fused.metal");
+/// The decode graph's own kernels, compiled after the two above.
+const DECODE_SOURCE: &str = include_str!("decode.metal");
 
 /// From this many tokens up, a matmul runs the tiled `mm_nvfp4` kernel.
 pub(crate) const MM_MIN_TOKENS: usize = 8;
 /// The simdgroup width every kernel assumes.
-const SIMD_WIDTH: usize = 32;
+pub(crate) const SIMD_WIDTH: usize = 32;
 /// Weight rows each simdgroup of the matvec kernels computes.
-const MV_ROWS_PER_SG: usize = 4;
+pub(crate) const MV_ROWS_PER_SG: usize = 4;
 /// Simdgroups per matvec threadgroup.
-const MV_SG_PER_TG: usize = 2;
+pub(crate) const MV_SG_PER_TG: usize = 2;
 /// Weight rows per matvec threadgroup.
-const MV_ROWS_PER_TG: usize = MV_ROWS_PER_SG * MV_SG_PER_TG;
+pub(crate) const MV_ROWS_PER_TG: usize = MV_ROWS_PER_SG * MV_SG_PER_TG;
 /// Threads per matvec threadgroup.
-const MV_THREADS: usize = SIMD_WIDTH * MV_SG_PER_TG;
+pub(crate) const MV_THREADS: usize = SIMD_WIDTH * MV_SG_PER_TG;
 /// Weight rows and tokens per `mm_nvfp4` tile (`MM_TN`, `MM_TT`).
 const MM_TILE: usize = 32;
 /// Four simdgroups, in a 2x2 grid of 16x16 output patches.
@@ -49,19 +51,23 @@ const SUM_THREADS: usize = 256;
 /// The head dimension the attention kernels take: four values per lane.
 pub(crate) const ATTN_HEAD_DIM: usize = 4 * SIMD_WIDTH;
 /// Keys per `attn_dec_partial` threadgroup.
-const ATTN_CHUNK: usize = 128;
+pub(crate) const ATTN_CHUNK: usize = 128;
 /// Simdgroups per `attn_dec_partial` threadgroup, which is also the most
 /// query heads one KV head may serve.
 pub(crate) const ATTN_SG: usize = 8;
 /// The most experts `moe_route` picks per token.
 pub(crate) const ROUTE_MAX_K: usize = 8;
 /// Threads per `moe_route` threadgroup, which routes one token.
-const ROUTE_THREADS: usize = 256;
+pub(crate) const ROUTE_THREADS: usize = 256;
 /// Experts each `moe_route` thread holds, so a token may have up to
 /// `ROUTE_THREADS * ROUTE_PER_THREAD` experts.
 const ROUTE_PER_THREAD: usize = 4;
 /// The most experts `moe_route` takes.
 pub(crate) const ROUTE_MAX_EXPERTS: usize = ROUTE_THREADS * ROUTE_PER_THREAD;
+/// Threads per `dec_combine` threadgroup, one value each.
+pub(crate) const COMBINE_THREADS: usize = 256;
+/// Threads in the decode graph's one `dec_rmsnorm` threadgroup.
+pub(crate) const NORM_THREADS: usize = 256;
 
 // The 2x2 simdgroups of 16x16 patches cover exactly one tile.
 const _: () = assert!(MM_TILE == 2 * 16);
@@ -90,10 +96,13 @@ fn source() -> String {
          #define ROUTE_MAX_K {ROUTE_MAX_K}\n\
          #define ROUTE_THREADS {ROUTE_THREADS}\n\
          #define ROUTE_PER_THREAD {ROUTE_PER_THREAD}\n\
+         #define NORM_THREADS {NORM_THREADS}\n\
          #line 1 \"nvfp4.metal\"\n\
          {SOURCE}\n\
          #line 1 \"fused.metal\"\n\
-         {FUSED_SOURCE}"
+         {FUSED_SOURCE}\n\
+         #line 1 \"decode.metal\"\n\
+         {DECODE_SOURCE}"
     )
 }
 
@@ -108,6 +117,11 @@ pub(crate) struct Pipelines {
     pub attn_partial: ComputePipeline,
     pub attn_combine: ComputePipeline,
     pub moe_route: ComputePipeline,
+    pub dec_rmsnorm: ComputePipeline,
+    pub dec_mv3: ComputePipeline,
+    pub dec_qk_norm_rope: ComputePipeline,
+    pub dec_mv_f32: ComputePipeline,
+    pub dec_combine: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -161,6 +175,11 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
         attn_partial: get("attn_dec_partial", ATTN_SG * SIMD_WIDTH)?,
         attn_combine: get("attn_dec_combine", ATTN_HEAD_DIM)?,
         moe_route: get("moe_route", ROUTE_THREADS)?,
+        dec_rmsnorm: get("dec_rmsnorm", NORM_THREADS)?,
+        dec_mv3: get("dec_mv3_nvfp4", MV_THREADS)?,
+        dec_qk_norm_rope: get("dec_qk_norm_rope", ATTN_HEAD_DIM)?,
+        dec_mv_f32: get("dec_mv_f32", MV_THREADS)?,
+        dec_combine: get("dec_combine", COMBINE_THREADS)?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -308,12 +327,12 @@ pub(crate) fn grid(width: usize, height: usize) -> MTLSize {
 
 /// Mirrors `MatParams` in the shader.
 #[repr(C)]
-struct MatParams {
-    k: u32,
-    n: u32,
-    tokens: u32,
-    row_bytes: u32,
-    scale: f32,
+pub(crate) struct MatParams {
+    pub(crate) k: u32,
+    pub(crate) n: u32,
+    pub(crate) tokens: u32,
+    pub(crate) row_bytes: u32,
+    pub(crate) scale: f32,
 }
 
 /// `x [tokens, cols]` times a dense weight on the GPU.
@@ -367,16 +386,16 @@ pub(crate) fn matmul(
 
 /// Mirrors `MoeParams` in the shader.
 #[repr(C)]
-struct MoeParams {
-    d: u32,
-    f: u32,
-    slots: u32,
-    k_used: u32,
-    experts: u32,
-    gu_row_bytes: u32,
-    gu_expert_bytes: u32,
-    down_row_bytes: u32,
-    down_expert_bytes: u32,
+pub(crate) struct MoeParams {
+    pub(crate) d: u32,
+    pub(crate) f: u32,
+    pub(crate) slots: u32,
+    pub(crate) k_used: u32,
+    pub(crate) experts: u32,
+    pub(crate) gu_row_bytes: u32,
+    pub(crate) gu_expert_bytes: u32,
+    pub(crate) down_row_bytes: u32,
+    pub(crate) down_expert_bytes: u32,
 }
 
 /// The gathered `MoE` on the GPU: gate/up per slot, down per slot weighted
@@ -470,13 +489,13 @@ pub(crate) fn moe(
 
 /// Mirrors `AttnParams` in the shader.
 #[repr(C)]
-struct AttnParams {
-    keys: u32,
-    chunks: u32,
-    rep: u32,
-    k_head_stride: u32,
-    v_head_stride: u32,
-    scale: f32,
+pub(crate) struct AttnParams {
+    pub(crate) keys: u32,
+    pub(crate) chunks: u32,
+    pub(crate) rep: u32,
+    pub(crate) k_head_stride: u32,
+    pub(crate) v_head_stride: u32,
+    pub(crate) scale: f32,
 }
 
 /// Where single-token attention reads one KV operand: the buffer, the byte
@@ -563,13 +582,13 @@ pub(crate) fn decode_attention(
 
 /// Mirrors `RouteParams` in the shader.
 #[repr(C)]
-struct RouteParams {
-    experts: u32,
-    k: u32,
-    tokens: u32,
-    norm: u32,
-    scale: f32,
-    min_sum: f32,
+pub(crate) struct RouteParams {
+    pub(crate) experts: u32,
+    pub(crate) k: u32,
+    pub(crate) tokens: u32,
+    pub(crate) norm: u32,
+    pub(crate) scale: f32,
+    pub(crate) min_sum: f32,
 }
 
 /// Sigmoid top-`k` routing of `logits [tokens, experts]` (contiguous from
@@ -638,13 +657,15 @@ mod tests {
             ("ROUTE_MAX_K", ROUTE_MAX_K),
             ("ROUTE_THREADS", ROUTE_THREADS),
             ("ROUTE_PER_THREAD", ROUTE_PER_THREAD),
+            ("NORM_THREADS", NORM_THREADS),
         ] {
             let line = format!("#define {name} {value}\n");
             assert!(src.starts_with(PRELUDE_MARK), "the prelude comes first");
             assert!(src.contains(&line), "missing {line:?}");
             assert!(
                 !SOURCE.contains(&format!("#define {name} "))
-                    && !FUSED_SOURCE.contains(&format!("#define {name} ")),
+                    && !FUSED_SOURCE.contains(&format!("#define {name} "))
+                    && !DECODE_SOURCE.contains(&format!("#define {name} ")),
                 "a kernel file still defines {name} itself"
             );
         }
