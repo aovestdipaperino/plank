@@ -123,7 +123,7 @@ pub struct Session<M: SessionModel = Model> {
 
 impl<M: SessionModel> Session<M> {
     /// An empty session holding at most `ctx` tokens (never more than the
-    /// model's [`Model::context_length`]).
+    /// model's [`SessionModel::context_length`]).
     #[must_use]
     pub fn new(model: Arc<M>, ctx: usize) -> Self {
         let n = model.kv_shape().len();

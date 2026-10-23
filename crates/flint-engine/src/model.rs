@@ -63,6 +63,11 @@ fn bf16_to_f32(bits: u16) -> f32 {
 
 /// SHA-256 over the file's shape: every metadata key with its value's
 /// debug form, and every tensor's name, shape and type. Never the weights.
+///
+/// `tokenizer.*` is skipped. Snapshots store token ids, so a file whose
+/// vocab changed but whose shapes did not would accept a snapshot whose ids
+/// now mean other text. That is acceptable: such a file has another sha,
+/// and plank keys its caches by the file, not by this signature alone.
 fn signature(h: &Header) -> [u8; 32] {
     let mut s = Sha256::new();
     s.update(b"flint-engine model v1\n");

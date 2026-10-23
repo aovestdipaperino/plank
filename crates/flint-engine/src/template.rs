@@ -124,8 +124,13 @@ fn push(out: &mut Vec<Piece>, p: Piece) {
 /// One plank section as template pieces.
 ///
 /// A system section trusts its first `trusted_len` bytes (rounded down to a
-/// char boundary; plank's own prompt), so control spellings there become
-/// control ids; the rest is plain. A tool-result section is plank's
+/// char boundary; plank's own prompt); the rest is plain. Both halves still
+/// pass through [`escape`], so in the trusted prefix only spellings that
+/// escaping leaves alone, the type-4 tokens such as `<tool_call>`, survive
+/// as control ids; a turn marker there is escaped like any other text.
+/// Each half is escaped on its own, so a marker straddling `trusted_len`
+/// is not escaped (it cannot become a control id either, being split
+/// across a trusted and a plain piece). A tool-result section is plank's
 /// `<tool_result>` message, split into one observation per result. An
 /// assistant section is the model's own reply, trusted verbatim.
 #[must_use]

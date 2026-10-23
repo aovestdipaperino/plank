@@ -16,8 +16,12 @@ const GATING_SIGMOID: u32 = 2;
 /// does not apply them itself; the caller decides.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sampling {
+    /// `general.sampling.temp`: a finite temperature, 0 or more.
     pub temperature: Option<f32>,
+    /// `general.sampling.top_p`: nucleus mass, in `0..=1`.
     pub top_p: Option<f32>,
+    /// `general.sampling.top_k`: candidates kept before sampling. The shared
+    /// sampler does not apply it yet.
     pub top_k: Option<u32>,
 }
 
