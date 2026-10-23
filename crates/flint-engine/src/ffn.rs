@@ -107,8 +107,26 @@ mod tests {
     #[test]
     fn route_clamps_a_vanishing_sum() {
         let dev = Device::Cpu;
-        let logits = Tensor::new(&[[-100f32, -100.0, -100.0]], &dev).unwrap();
+        // sigmoid(-20) is about 2.1e-9, so the row's sum sits far below the
+        // floor: divided by the floor the weights stay tiny, where dividing
+        // by their own sum would make them 0.5 each. sigmoid(-100) is 0 in
+        // f32, and the floor keeps 0 / 0 from becoming NaN.
+        let logits =
+            Tensor::new(&[[-20f32, -20.0, -20.0], [-100.0, -100.0, -100.0]], &dev).unwrap();
         let (_, w) = route(&logits, 2, true, 1.0).unwrap();
-        assert!(w.to_vec2::<f32>().unwrap()[0].iter().all(|x| x.is_finite()));
+        let w = w.to_vec2::<f32>().unwrap();
+        #[allow(clippy::cast_possible_truncation)] // the floor is an exact f32
+        let want = sigmoid(-20.0) / MIN_WEIGHT_SUM as f32;
+        assert!(
+            w[0].iter().all(|x| (x - want).abs() <= 1e-3 * want),
+            "{:?} against {want}",
+            w[0]
+        );
+        assert!(w[0].iter().sum::<f32>() < 1e-3, "{:?}", w[0]);
+        assert!(
+            w[1].iter().all(|x| x.is_finite() && *x < 1e-30),
+            "{:?}",
+            w[1]
+        );
     }
 }
