@@ -3899,3 +3899,48 @@ shared expert) are latency-bound, so the next steps are fusing q/k/v into
 one dispatch with the q/k norms and RoPE, and the shared expert's gate and
 up into one. A Metal System Trace (`xcrun xctrace record --template 'Metal
 System Trace'`) showed the GPU busy about 82% of a decode.
+
+## Flint's decode graph: what made it fast, what did not, and how to measure
+
+Moving Flint's single-token decode from candle ops to one encoder per token
+(`decode.rs`) took the depth-64 rate from 75 to 130 tok/s on its own: a
+candle step was about 2,000 kernels in separate encoders with fresh
+allocations, and that overhead was as large as streaming the weights. The
+rest came from kernels, each measured in-process or alternated with
+cooldowns (M5 Max, AC power, 2026-10-23):
+
+- Attention as an online softmax over runs of 32-key blocks, one lane per
+  key, cut attention at depth 64 from 2.7 to 0.9 ms a token. Accumulating V
+  with four independent accumulators over a full block gained another 6 to
+  12% at every depth: the single-accumulator loop was a serial chain of
+  shuffle, load and multiply-add, and skipping it outright saved 2.1 ms of
+  about 4 at 20K.
+- An f16 cache (llama.cpp's default) halves what deep attention reads; with
+  it the f64 oracle must round K and V to f16 too, or f16 rounding alone
+  moves single probabilities by up to 1.6e-2.
+- Two rows per simdgroup (not four) in the NVFP4 matvecs: +8%. The narrow
+  projections (o, the shared expert) launch too few threadgroups otherwise.
+- Ending each layer with the residual add and the next layer's RMS norm in
+  one threadgroup: +6% with 1,024 threads, but -7% with 256, where one
+  threadgroup summing the experts' rows is latency-bound.
+- A parallel merge of the attention runs: about +3% at depth.
+
+These did not help, so they are not in: one simdgroup scoring all eight
+query heads of a KV head (spilled its per-head arrays), staging each K block
+in threadgroup memory (barriers cost more than the duplicate reads), four
+lanes per key for coalesced K reads, unrolled K scoring, 128 or 256 attention
+runs per KV head instead of 64, compile-time full-tile row loops in the
+matvec (the compiler already did it), and a concurrent encoder's overlap of
+the shared expert with routing (equal to the serial encoder, kept because it
+is no slower).
+
+How to measure: the M5 Max throttles under sustained load, by up to a third
+(one build read 160 tok/s, then 102 a few runs later), so builds compared in
+separate back-to-back processes mislead. Toggle candidates inside one
+process and alternate them in short bursts, taking medians, or alternate
+whole runs with a minute's cooldown. A bench that decodes one fixed token
+keeps the same experts cached and flatters the rate; `bench_depth` and
+`bench_vs` decode greedily. Metal System Trace's GPU intervals are per
+command buffer, so once a step is one encoder only ablation (skipping
+groups of dispatches) splits its time; the shader profiler table needs a
+counter-enabled template.

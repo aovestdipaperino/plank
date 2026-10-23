@@ -30,13 +30,13 @@ file given by path is classified by its own `general.architecture`
 (`Flint NVFP4 Preview` on the real file) and selects `ToolSyntax::Flint`.
 
 With no `-c`, Flint opens the file's own `context_length` of 262,144 when
-its f32 KV fits in half of RAM, the same rule as Gemma
+its KV fits in half of RAM, the same rule as Gemma
 (`nativeengine::default_ctx`); on a smaller machine it falls back to a third
 of RAM worth of KV in 1024-token steps, never below 8192. On the 128 GB Mac
 the whole window opens:
 
 ```
-plank: context 262144 tokens (49.0 GB of KV, sized to this machine's RAM up to the model's window; -c to change)
+plank: context 262144 tokens (24.5 GB of KV, sized to this machine's RAM up to the model's window; -c to change)
 ```
 
 ## The chat format
@@ -178,14 +178,16 @@ truncates exactly at any token, so `kv_reuse_probe` reports
 fork snapshots and ladder rungs. The rationale is the same as in
 `docs/GEMMA.md` and is not repeated here.
 
-The KV cache is f32, reusing gemma-engine's cache, at 200,704 bytes a token
-on the real file (`FlintConfig::kv_bytes_per_token`). The spec asked for f16,
-which would be 100,352. The user accepted f32: it is what the shared session
-already does, and it keeps the forward pass exact against the f64 oracle
-below. Snapshots go through the generic session (magic `PLFK`), and the
-system-prompt checkpoint and per-session blobs work unchanged. In the smoke
-run the system-prompt checkpoint for 5,059 tokens was 372 MB on disk and the
-session blob 391 MB, well under the f32 KV those depths hold in memory,
+The KV cache is f16, as llama.cpp keeps it, at 100,352 bytes a token on the
+real file (`FlintConfig::kv_bytes_per_token`): gemma-engine's cache with a
+dtype (`KvCache::with_dtype`, chosen by `SessionModel::kv_dtype`), so Gemma
+stays f32. Part B had shipped f32, which the user accepted; going to f16
+halves the bytes deep-context attention streams per token, and the f64
+oracle below rounds K and V to f16 where the cache stores them, so it still
+checks the arithmetic at 1e-3. Snapshots go through the generic session
+(magic `PLFK`) and still hold f32 on disk, widened on save and narrowed on
+restore, so earlier checkpoints load. In the smoke run the system-prompt
+checkpoint for 5,059 tokens was 372 MB on disk and the session blob 391 MB,
 because the generic session's snapshot writes only the window of each
 sliding layer.
 
@@ -250,31 +252,51 @@ top five probabilities) and over the full greedy runs of three of them,
 including 16 tokens after a 20,861-token prompt. The oracle
 (`tools/flint_numpy_ref.py`) is an independent float64 forward pass written
 from llama.cpp's graph semantics, with weights decoded by the pinned
-commit's gguf-py. On all ten checked positions plank's f32 Metal engine
-agrees with it on the argmax, and the largest difference on any top-20
-probability is 1.8e-6 against a tolerance of 1e-3. Its prompts are short (at
+commit's gguf-py, rounding K and V to f16 as the cache does (`--kv f32` for
+the exact variant). On all ten checked positions plank's Metal engine agrees
+with it on the argmax, and the largest difference on any top-20 probability
+is 6.6e-5 against a tolerance of 1e-3 (1.8e-6 when both kept an f32 cache). Its prompts are short (at
 most 22 positions), so the sliding window and deep RoPE positions are only
 covered by the coarser llama.cpp agreement. The details are in `FINDINGS.md`
 under "Flint against llama.cpp on the real file".
 
 ## Speed
 
-Measured on an Apple M5 Max with 128 GiB, on AC power.
+Single-token decode on Metal runs through a decode graph
+(`crates/flint-engine/src/decode.rs`), not through candle ops: the whole
+forward of one token is encoded into one concurrent compute encoder on the
+graph's own command queue, about 14 dispatches a layer over scratch buffers
+allocated once, with a buffer barrier only where a stage reads the last one's
+output. Its kernels (`decode.metal`, `fused.metal`, `nvfp4.metal`) run q, k
+and v as one NVFP4 matvec, normalise and rotate q and k while writing k and v
+into the f16 cache, attend over the cache in place (an online softmax over
+runs of 32-key blocks, one lane per key, then a parallel merge with the
+sinks), route the experts in one kernel, and end each layer by adding the FFN
+back into the residual stream and normalising it for the next layer in one
+1,024-thread threadgroup. The embedding is written and the logits read in
+shared memory. Prefill, the CPU and any shape the graph does not take keep
+the candle path, and `Model::forward_with(.., false)` reaches it for tests.
 
-| | rate | source |
-|---|---|---|
-| decode at 32 tokens of context | 60.1 to 62.6 tok/s | `bench_decode`, three runs |
-| decode at 512 tokens of context | 52.5 to 54.2 tok/s | `bench_decode`, three runs |
-| prefill, 512 tokens | about 491 to 536 tok/s | `bench_decode`, three runs |
-| decode in an agent session (~5.1K to 5.6K context) | 37.3 tok/s (486 tokens in 13.0 s) | smoke run, exit stats |
-| decode in an agent session, two short replies | 40.1 tok/s (100 tokens in 2.5 s) | smoke run, exit stats |
-| cold prefill of plank's system prompt | 366.4 tok/s (5,073 tokens in 13.8 s) | smoke run, exit stats |
+Head to head with Ollama's llama.cpp on the same file, alternating with a
+minute's cooldown between runs (an Apple M5 Max with 128 GiB on AC power,
+2026-10-23; `bench_vs` for plank, Ollama's own eval and prompt rates):
 
-For comparison, `llama-bench` at `970b51c` reported 116.42 tok/s prefill and
-9.78 tok/s decode on the same machine. The session figures count the
-thinking tokens along with the answer. After the first launch the
-system-prompt checkpoint restores the 5,059-token prefix from disk, and each
-turn prefills only its new suffix.
+| context | plank decode | Ollama decode | plank prefill | Ollama prefill |
+|---|---|---|---|---|
+| 22 tokens | 164.5 tok/s | 161.6 tok/s | | |
+| 1,816 tokens | 161.2 tok/s | 156.7 tok/s | 257 tok/s | 2,084 tok/s |
+| 9,016 tokens | 133.6 tok/s | 136.0 tok/s | 347 tok/s | 1,729 tok/s |
+| 18,016 tokens | 97.9 tok/s | 130.2 tok/s | 229 tok/s | 2,630 tok/s |
+
+Decode is level with Ollama to about 9K tokens of context and falls behind
+deeper, where attention over the cache dominates. Prefill is several times
+slower: for more than one token the experts still run as one matvec per
+(token, expert) slot, re-reading each expert's weights for every token routed
+to it, where llama.cpp groups the tokens by expert. Before the decode graph,
+the candle path decoded at 64, 38, 26 and 16 tok/s at depths 64, 2K, 10K and
+20K. The machine throttles under sustained load (the same build fell from
+160 to 102 tok/s across back-to-back runs), so compare builds within one
+process or with cooldowns; `FINDINGS.md` has the method.
 
 ## Smoke run (2026-10-23, release, `PLANK_NO_DS4=1`, temporary `HOME`, AC power)
 
