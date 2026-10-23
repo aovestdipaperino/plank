@@ -359,24 +359,23 @@ impl Model {
                 self.layers.len()
             )));
         }
-        if offset + t > self.context_length {
+        let Some(end) = offset.checked_add(t).filter(|&e| e <= self.context_length) else {
             return Err(err(format!(
-                "{} positions exceed the context of {}",
-                offset + t,
+                "{t} tokens at offset {offset} exceed the context of {}",
                 self.context_length
             )));
-        }
+        };
         let eps = self.config.rms_eps;
         let (global, sliding) = if t > 1 {
             let w = self.config.sliding_window;
             let start = (offset + 1).saturating_sub(w);
             (
-                Some(causal_mask(t, offset, 0, offset + t, None, &self.device)?),
+                Some(causal_mask(t, offset, 0, end, None, &self.device)?),
                 Some(causal_mask(
                     t,
                     offset,
                     start,
-                    offset + t - start,
+                    end - start,
                     Some(w),
                     &self.device,
                 )?),
@@ -550,6 +549,34 @@ mod tests {
     fn a_token_outside_the_vocab_is_an_error() {
         let mut s = Session::new(model(), 64);
         assert!(s.prefill(&[300], &|| false).is_err());
+    }
+
+    #[test]
+    fn forward_refuses_an_offset_that_would_overflow() {
+        let m = model();
+        let mut cache = KvCache::new(m.kv_shape().len());
+        let e = m.forward(&[1, 2], usize::MAX, &mut cache).unwrap_err();
+        assert!(e.0.contains("context"), "{e}");
+    }
+
+    #[test]
+    fn forward_refuses_no_tokens() {
+        let m = model();
+        let mut cache = KvCache::new(m.kv_shape().len());
+        assert!(m.forward(&[], 0, &mut cache).is_err());
+    }
+
+    #[test]
+    fn forward_refuses_a_context_overrun() {
+        let m = model();
+        let ctx = m.context_length();
+        let mut cache = KvCache::new(m.kv_shape().len());
+        let e = m.forward(&vec![1; ctx + 1], 0, &mut cache).unwrap_err();
+        assert!(e.0.contains("exceed the context"), "{e}");
+        assert!(
+            cache.layers.iter().all(gemma_engine::kv::LayerKv::is_empty),
+            "nothing ran"
+        );
     }
 
     #[cfg(target_os = "macos")]
