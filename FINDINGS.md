@@ -3835,3 +3835,29 @@ kernels before the lock exists. Gemma now has the same lock: its `Model`
 holds a `Mutex` on Metal for a whole `forward` and overrides
 `device_exclusive` for `snapshot` and `restore`, with the same two-thread
 regression tests.
+
+## Flint's first agent smoke run: what it showed
+
+The end-to-end run (release, `PLANK_NO_DS4=1`, a scratch `HOME`, AC power,
+2026-10-23) parsed every Flint tool call the model wrote and needed no fix.
+Asked to create `hello.txt` and show it with bash, the model used `bash`
+twice (`echo "hi" > hello.txt`, then `cat hello.txt`) rather than the
+`write` tool. The prompt named bash, so this is a choice, not a parse
+failure, but a check that expects a `write` call will not see one.
+
+The KV discipline held: each pass of the one-shot reused everything but its
+new suffix (19, 37 and 39 tokens), and on the second REPL turn all four held
+spans were kept and only 7 tokens were prefilled.
+
+Snapshots are much smaller than the f32 KV they restore. The
+system-prompt checkpoint for 5,059 tokens was 372,196,462 bytes, about
+73.6 KB a token against the 200,704 bytes a token the live cache holds,
+because the generic session writes only the window of each sliding layer.
+
+Decode in an agent session is slower than `bench_decode` suggests: 37.3
+tok/s over 486 tokens at about 5.1K to 5.6K of context, and 40.1 tok/s over
+two short replies, against 52.5 to 54.2 tok/s at 512 tokens in the bench.
+The cold prefill of plank's 5,073-token prompt ran at 366.4 tok/s, against
+about 491 to 536 tok/s for a 512-token prefill from empty. We have not
+measured how much of each gap is context depth and how much is per-pass
+overhead in the agent.

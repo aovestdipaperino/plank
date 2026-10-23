@@ -48,7 +48,9 @@ flowchart TD
     session[session + compact + sysprompt<br/>transcript, persistence]
     engine[engine::Engine trait]
     ds4[ds4engine + ffi<br/>real ds4 model]
+    native[nativeengine<br/>NativeEngine adapter]
     gemma[gemmaengine<br/>Gemma 4, feature gemma]
+    flint[flintengine<br/>Flint, feature flint]
     echo[EchoEngine<br/>stub]
     profile[profile.rs<br/>active --profile spec]
 
@@ -59,10 +61,14 @@ flowchart TD
     agent --> session
     agent --> engine
     engine --> ds4
-    engine --> gemma
+    engine --> native
+    native --> gemma
+    native --> flint
     engine --> echo
     ds4 --> cengine[(refs/ds4 C engine<br/>Metal)]
     gemma --> gcrate[(crates/gemma-engine<br/>candle: Metal or CPU)]
+    flint --> fcrate[(crates/flint-engine<br/>NVFP4 on Metal or CPU)]
+    fcrate --> gcrate
     profile -.-> session
     profile -.-> tools
     profile -.-> agent
@@ -136,6 +142,13 @@ catalog engine that has not been downloaded yet, the entry's
 because there is no header to read. The dialect follows from the reported
 shape name (`Gemma 4 …`), as it does for the other families. See
 `docs/GEMMA.md`.
+
+A fourth family, Flint (`ModelFamily::Flint`, `ToolSyntax::Flint`,
+`.flint.kv` transcripts), runs on the same native engine adapter as Gemma.
+`gguf::family_of` recognises it by `general.architecture == "flint"`, the
+`flint` catalog engine carries a `"family": "flint"` hint for the same reason
+as the Gemma ones, and the shape name the engine reports (`Flint …`, from
+`general.name`) selects the dialect. See `docs/FLINT.md`.
 
 The second family is DeepSeek V4.1 Flash. It is not a revision of V4 but a
 separate model: different weights, tokenizer and vision encoder, and its own
@@ -280,7 +293,7 @@ loop — with piped stdin there is no live input to multiplex.
 
 - `goal.rs` — `/goal` autonomous loop: iteration state, adjudication prompt, and verdict parsing. Pure logic; `ui.rs` drives it from both front ends.
 
-### Engine abstraction (`engine.rs`, `ds4engine.rs`, `gemmaengine.rs`, `crates/local-inference-engine`, `snapshot.rs`)
+### Engine abstraction (`engine.rs`, `ds4engine.rs`, `nativeengine.rs`, `gemmaengine.rs`, `flintengine.rs`, `crates/local-inference-engine`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
   `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,
   `ctx_size`, plus `generate_aside` /
@@ -289,9 +302,10 @@ loop — with piped stdin there is no live input to multiplex.
   stats, and the `EchoEngine` stub. Trait methods default to unsupported so
   non-ds4 engines opt in only to what they support.
 - `crates/local-inference-engine` — local inference as its own crate. Its
-  `Model`/`Session` API serves both families, routing on the GGUF's
+  `Model`/`Session` API serves every family, routing on the GGUF's
   `general.architecture` (`Family::of`): `gemma4` to `crates/gemma-engine`
-  (feature `gemma`), the rest to the C engine. For the C engine it holds the build of
+  (feature `gemma`), `flint` to `crates/flint-engine` (feature `flint`; both
+  are the crate's default features), the rest to the C engine. For the C engine it holds the build of
   `libds4core.a`, `ffi.rs` (raw declarations for the subset of the ds4 C API
   plank uses: engine open/close, chat-template tokenization, session
   sync/sample/eval, speculative decode, KV snapshots; re-exported as
@@ -315,9 +329,19 @@ loop — with piped stdin there is no live input to multiplex.
   `ds4_session_eval_speculative_argmax` instead of one `ds4_session_eval` per
   token — the only entry point that consumes drafts, and the reason configuring
   the engine for speculation is not on its own enough to get any benefit from it.
-- `gemmaengine.rs` — `GemmaEngine`, Gemma 4 behind `Engine` (feature `gemma`,
-  default on). Unlike `Ds4Engine` it needs neither `refs/ds4` nor macOS, and
-  `make_local_engine` routes a Gemma-family model to it under either cfg. It
+- `nativeengine.rs` — `NativeEngine<F: NativeFamily>`, the one `Engine`
+  implementation for models that run in native Rust. It owns the model, the
+  live session and the token transcript, and does everything that does not
+  depend on the chat format: span reconciliation, exact truncation,
+  `kv_reuse_probe`, snapshots (`get_kv`/`set_kv`), the warm walk, sampling,
+  and `default_ctx`, the RAM-sized default window. A `NativeFamily` supplies
+  the rest: opening the model, rendering a section to tokens, the generation
+  prefix, stop ids, stream translation, a logit filter, an optional default
+  context cap, and the prefill chunk size at a given depth.
+  `make_local_engine` routes a Gemma or Flint model here under either cfg.
+- `gemmaengine.rs` — `GemmaFamily` and `GemmaEngine`
+  (`NativeEngine<GemmaFamily>`), Gemma 4 behind `Engine` (feature `gemma`,
+  default on). Unlike `Ds4Engine` it needs neither `refs/ds4` nor macOS. It
   keeps the ds4 engine's transcript discipline: the leading sections that
   match recorded spans keep their tokens verbatim, and only the rest is
   rendered and tokenized. Gemma's KV truncates exactly, so a prompt that
@@ -338,6 +362,25 @@ loop — with piped stdin there is no live input to multiplex.
   sliding layers. `session.rs` holds the live session, with chunked prefill
   and truncate. `sample.rs` is the sampler. `tests/reference.rs` checks the
   forward pass against llama.cpp; it is opt-in through `PLANK_GEMMA_GGUF`.
+- `flintengine.rs` — `FlintFamily` and `FlintEngine`
+  (`NativeEngine<FlintFamily>`), Flint behind `Engine` (feature `flint`,
+  default on). It renders with `flint_engine::template`, turns the tools
+  block that the system text carries between the `sysprompt::FLINT_TOOLS_OPEN`
+  and `FLINT_TOOLS_CLOSE` fence lines into the template's tools turn, applies
+  the GGUF's `top_k` before the shared sampler, caps the default context at
+  65,536 tokens, sizes each prefill chunk so one f32 attention score copy
+  stays within 2 GiB (`chunk_for`), and refuses a file larger than the Metal
+  device's `maxBufferLength`. The format, the decisions behind it and the v1
+  limits are in `docs/FLINT.md`.
+- `crates/flint-engine` — the native-Rust Flint inference crate. `nvfp4/`
+  holds the NVFP4 (ggml type 40) block decoder and its Metal and CPU matmul
+  kernels; `model.rs` is the MoE forward pass, which holds a `Mutex` on Metal
+  for a whole `forward`; `tokenizer.rs` and `template.rs` are the GGUF's
+  tokenizer and transformers-rendered chat format. It reuses gemma-engine's
+  generic `Session` (snapshot magic `PLFK`), KV and sampler.
+  `tests/reference_model.rs` checks the tokenizer and the forward pass
+  against llama.cpp and an f64 NumPy oracle; it is opt-in through
+  `PLANK_FLINT_GGUF`.
 - `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
   (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
@@ -506,6 +549,13 @@ Model text is fed byte-by-byte through a pipeline:
    highlighting, and gray thinking text.
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable
    `ToolCall`s.
+4. The other dialects have their own incremental parsers in `trace-stream`,
+   sharing `ToolCall` and the state enum with `dsml.rs`: `qwen.rs`,
+   `gemma.rs`, and `flint.rs` for Flint's
+   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
+   whose values are raw (no escaping) and typed by the Qwen parser's
+   `value_is_json` rule. The renderer detects the opener and hands the
+   stanza to the parser of the dialect it names.
 
 A headless sub-agent's `StreamRenderer` output does not write to the caller's
 screen directly: it is routed by `ui::SubSinkTarget` through a channel to
