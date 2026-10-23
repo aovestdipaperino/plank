@@ -236,6 +236,8 @@ extism = { version = "1.30", default-features = false, features = [
 
 [dev-dependencies]
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0", features = ["testing"] }
+# Test runs must not append to the developer's real tool-call error log.
+trace-stream = { path = "crates/trace-stream", features = ["no-tool-error-log"] }
 gemma-engine = { path = "crates/gemma-engine", features = ["testgguf"] }
 flint-engine = { path = "crates/flint-engine", features = ["testgguf"] }
 

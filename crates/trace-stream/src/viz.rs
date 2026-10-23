@@ -173,11 +173,13 @@ fn logging_enabled_for(opt_out: Option<&std::ffi::OsStr>) -> bool {
 
 /// Whether tool-call errors are appended to `~/.plank/tool-call-errors.log`.
 ///
-/// Off under `cargo test`, and off in a spawned binary when
+/// Off under this crate's `cargo test`, off in a dependent's test build
+/// (which enables the `no-tool-error-log` feature from its
+/// dev-dependencies), and off in a spawned binary when
 /// `PLANK_NO_TOOL_ERROR_LOG=1` is set — the e2e harness sets it so fixture
 /// stanzas (`echo plank-e2e`) never enter the developer's real log.
 fn tool_error_logging_enabled() -> bool {
-    if cfg!(test) {
+    if cfg!(test) || cfg!(feature = "no-tool-error-log") {
         return false;
     }
     logging_enabled_for(std::env::var_os("PLANK_NO_TOOL_ERROR_LOG").as_deref())
@@ -1035,6 +1037,10 @@ pub struct StreamRenderer<S> {
     /// identically, so this decides which one a stream adopts, and it never
     /// changes after construction.
     flint_opener: bool,
+    /// Whether a Qwen stanza that fails at the byte after `<tool_call>` (no
+    /// `<function=`) is re-read as Flint: for a consumer that cannot know the
+    /// dialect and opts in ([`StreamRenderer::set_flint_sniffing`]).
+    flint_sniffing: bool,
     parser: Parser,
     viz: ToolViz,
     scan: DsmlScan,
@@ -1169,6 +1175,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             syntax,
             gemma_opener: syntax == ToolSyntax::Gemma,
             flint_opener: syntax == ToolSyntax::Flint,
+            flint_sniffing: false,
             parser: Parser::dsml(syntax),
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
@@ -1237,6 +1244,19 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// read as a call. plank always knows the dialect and must leave it alone.
     pub fn set_gemma_opener(&mut self, on: bool) {
         self.gemma_opener = on;
+    }
+
+    /// Sets whether a `<tool_call>` stanza that is not Qwen is read as Flint
+    /// (default false).
+    ///
+    /// Flint and Qwen spell the opener the same; a renderer that does not
+    /// know which model wrote the stream (a debug console) adopts Qwen, and
+    /// with this on, a stanza whose next bytes are not `<function=` restarts
+    /// as Flint over the same bytes instead of failing as a malformed Qwen
+    /// call. plank always knows the dialect and must leave it alone: on, a
+    /// DSML model's stray `<tool_call>` text could parse as a Flint call.
+    pub fn set_flint_sniffing(&mut self, on: bool) {
+        self.flint_sniffing = on;
     }
 
     /// Sets whether tool-call visualization is shown (default true). Production
@@ -2352,6 +2372,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     fn feed_dsml_byte(&mut self, c: u8) {
         let was_param = self.parser.state() == DsmlState::ParamValue;
         self.parser.feed([c]);
+        self.sniff_flint();
         if !self.dsml_ignored {
             self.scan_dsml_byte(c);
             if was_param && self.parser.state() != DsmlState::ParamValue {
@@ -2359,6 +2380,24 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
         }
         self.settle_parser_state();
+    }
+
+    /// With [`Self::flint_sniffing`] on, turns a Qwen parse that has just
+    /// failed after the shared `<tool_call>` opener into a Flint parse of
+    /// the same bytes, when those bytes are a valid Flint prefix.
+    fn sniff_flint(&mut self) {
+        if !self.flint_sniffing
+            || !self.parser.is_qwen()
+            || self.parser.state() != DsmlState::Error
+            || !self.parser.raw().starts_with(FLINT_START)
+        {
+            return;
+        }
+        let mut flint = FlintParser::new();
+        flint.feed(self.parser.raw());
+        if flint.state() != DsmlState::Error {
+            self.parser = Parser::Flint(flint);
+        }
     }
 
     /// Acts on a terminal parser state: banner, verdict, and collected calls.
@@ -5116,6 +5155,46 @@ mod qwen_dialect_tests {
             assert_eq!(done.error, None, "{syntax:?}");
             assert_eq!(sr.sink().visible, text, "{syntax:?}: verbatim");
         }
+    }
+
+    /// An untold renderer (the debug console) reads `<tool_call>` as Qwen; a
+    /// Flint stanza then fails there, unless Flint sniffing is on, which
+    /// re-reads it as Flint. A real Qwen stanza still parses as Qwen.
+    #[test]
+    fn an_untold_renderer_sniffs_flint_after_the_shared_opener() {
+        const FLINT: &str =
+            "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd && ls</arg_value></tool_call>";
+        let mut plain = StreamRenderer::new(Cap::default());
+        plain.push("<think>plan</think>");
+        plain.push(FLINT);
+        plain.finish();
+        assert!(
+            plain
+                .finished()
+                .error
+                .is_some_and(|e| e.contains("<function=")),
+            "without sniffing it reads as a malformed Qwen call"
+        );
+
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_flint_sniffing(true);
+        sr.push("<think>plan</think>");
+        sr.push(FLINT);
+        sr.finish();
+        let done = sr.finished();
+        assert_eq!(done.error, None, "{:?}", sr.sink().visible);
+        assert_eq!(done.calls.len(), 1);
+        assert_eq!(done.calls[0].name, "bash");
+        assert_eq!(done.calls[0].args[0].value, "pwd && ls");
+
+        let mut qwen = StreamRenderer::new(Cap::default());
+        qwen.set_flint_sniffing(true);
+        qwen.push("<think>plan</think>");
+        qwen.push("<tool_call>\n<function=read>\n<parameter=path>\nsrc/a.rs\n</parameter>\n</function>\n</tool_call>");
+        qwen.finish();
+        let done = qwen.finished();
+        assert_eq!(done.error, None, "{:?}", qwen.sink().visible);
+        assert_eq!(done.calls[0].name, "read");
     }
 
     /// A renderer that cannot know its dialect (the debug console) opts in to

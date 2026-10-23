@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Flint tool calls (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`)
+  parse and render, through `flint::FlintParser` and `ToolSyntax::Flint`. A
+  key repeated with the same value is dropped (Flint ends some `edit` calls
+  with their `path` again); one repeated with a different value is an error
+  that names the argument.
+- Flint and Qwen spell the opener the same, so a renderer built without a
+  dialect reads `<tool_call>` as Qwen and reported a Flint call as
+  "expected <function=...> in Qwen tool call". A consumer that cannot know
+  the dialect, such as a debug console, opts in with
+  `StreamRenderer::set_flint_sniffing(true)`: a stanza whose next bytes are
+  not `<function=` then restarts as Flint over the same bytes.
+- The `no-tool-error-log` feature keeps the renderer from appending to
+  `~/.plank/tool-call-errors.log`, for a dependent's test builds (enable it
+  from dev-dependencies; normal builds keep logging).
+
 ## 0.1.8
 
 - Gemma 4 tool calls (`<|tool_call>call:NAME{key:<|"|>text<|"|>}<tool_call|>`)

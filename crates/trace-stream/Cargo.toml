@@ -17,6 +17,12 @@ readme = "README.md"
 # it off `qwen_stub.rs` stands in for the parser so `viz.rs` needs no `#[cfg]`
 # on the dialect dispatch it runs for every generation.
 
+# Never append to `~/.plank/tool-call-errors.log`. A crate's own tests are
+# covered by `cfg(test)`; a dependent turns this on from its
+# dev-dependencies, so its test runs leave the developer's real log alone
+# while its normal builds still log.
+no-tool-error-log = []
+
 [dependencies]
 
 [dev-dependencies]
