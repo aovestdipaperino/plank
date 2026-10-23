@@ -19,6 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev = Device::new_metal(0)?;
     let model = Model::open_with_ctx(&path, &dev, 8192)?;
     let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    // One discarded iteration first, so pipeline compilation and the first
+    // touch of the mapped weights do not land in the measured runs.
+    let mut warm = Session::new(model.clone(), 8192);
+    warm.prefill(&prompt[..32], &|| false)?;
+    for &t in &prompt[32..40] {
+        warm.step(t)?;
+    }
+    dev.synchronize()?;
+    drop(warm);
     for (label, depth) in [("short", 32usize), ("512", 512)] {
         let mut s = Session::new(model.clone(), 8192);
         let start = Instant::now();
