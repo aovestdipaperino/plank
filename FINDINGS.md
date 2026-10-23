@@ -3971,3 +3971,14 @@ growing with depth, with two hazards:
 running an A/B on a freshly built binary is unreliable on macOS: XProtect
 scans the new executable at 100% CPU, and one first run read 291 tok/s
 where the same build reads 1,133.
+
+## Flint repeats `path` at the end of `edit` calls
+
+In a real session (2026-10-23, 44 passes) Flint wrote every `edit` call as
+`path, old, new, path`, with the same path both times, although the system
+prompt shows `path` once and first. The parser rejected each as a duplicate
+key, and the bare "duplicate key path" error plus a generic syntax reminder
+never told the model what was wrong, so it retried the same shape and fell
+back to `write`. A key repeated with the same value is now dropped
+(`trace-stream/src/flint.rs`); one repeated with a different value is still
+an error, naming the argument.
