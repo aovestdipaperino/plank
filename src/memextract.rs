@@ -494,6 +494,8 @@ pub fn build_prompt(
     let mut out = String::from(
         "You are the memory extraction pass. Read the conversation excerpt below and \
          update persistent memory.\n\n\
+         Be quick: do not overthink. Think briefly, if at all, then reply; this is a \
+         short background task, not a problem to work through.\n\n\
          Save only facts that cannot be re-derived by reading the repository: who the \
          user is, corrections they gave about how to work, project goals and constraints \
          not in the code or git history, and pointers to external systems. Never save \
@@ -862,6 +864,14 @@ mod tests {
                 id: "def456".to_string()
             }]
         );
+    }
+
+    /// The pass runs in the background, often on a model that reasons at
+    /// length: the prompt asks it to answer quickly.
+    #[test]
+    fn the_prompt_asks_for_a_quick_answer() {
+        let p = build_prompt(&[], &[], true, None);
+        assert!(p.contains("Be quick: do not overthink."), "{p}");
     }
 
     #[test]
