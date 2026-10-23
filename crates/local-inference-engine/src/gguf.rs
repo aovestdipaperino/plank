@@ -11,6 +11,9 @@ use std::path::Path;
 /// The `general.architecture` value of a Gemma 4 GGUF.
 pub const GEMMA4_ARCH: &str = "gemma4";
 
+/// The `general.architecture` value of a Flint GGUF.
+pub const FLINT_ARCH: &str = "flint";
+
 /// Refuses to allocate for a declared length beyond this. The file may be
 /// truncated or not a GGUF at all, and a bogus 64-bit length would otherwise
 /// become an allocation.

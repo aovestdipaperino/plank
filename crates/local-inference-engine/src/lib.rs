@@ -8,9 +8,11 @@
 //!   the C sources present; [`DS4_AVAILABLE`] says whether this build has it.
 //! - **Gemma**: Gemma 4 through `crates/gemma-engine` (candle; Metal on macOS,
 //!   the CPU elsewhere), behind the default `gemma` feature.
+//! - **Flint**: Flint through `crates/flint-engine` (candle, NVFP4 kernels),
+//!   behind the `flint` feature.
 //!
 //! [`Model::open`] reads the GGUF's `general.architecture` and picks the
-//! backend: `gemma4` goes to Gemma, everything else to ds4, which is also the
+//! backend: `gemma4` goes to Gemma, `flint` to Flint, everything else to ds4, which is also the
 //! C's own fallthrough for an architecture it does not name. [`Model`] and
 //! [`Session`] then work the same for both: render a one-turn chat, prefill
 //! it reusing the cached prefix, evaluate, sample, read log-probabilities.
@@ -21,7 +23,7 @@
 //!   `#[repr(C)]` mirrors. plank's `Ds4Engine` drives these directly.
 //! - [`metal`]: finding the Metal kernel sources the C engine compiles at open.
 //! - [`ds4`]: the ds4 backend's own safe types, for ds4-only capabilities.
-//! - `gemma_engine`: the Gemma crate itself, re-exported.
+//! - `gemma_engine`, `flint_engine`: the candle crates themselves, re-exported.
 //!
 //! A backend that is not built makes [`Model::open`] fail for the models it
 //! would serve, never the build, so a dependent needs no `cfg` of its own.
@@ -62,9 +64,13 @@
 
 pub mod ds4;
 pub mod ffi;
+#[cfg(feature = "flint")]
+mod flint;
 #[cfg(feature = "gemma")]
 mod gemma;
 pub mod gguf;
+#[cfg(any(feature = "gemma", feature = "flint"))]
+mod logits;
 pub mod metal;
 
 use std::fmt;
@@ -72,6 +78,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use ffi::{Ds4Backend as Backend, Ds4TokenScore as TokenScore};
+#[cfg(feature = "flint")]
+pub use flint_engine;
 #[cfg(feature = "gemma")]
 pub use gemma_engine;
 
@@ -80,6 +88,9 @@ pub const DS4_AVAILABLE: bool = cfg!(ds4_engine);
 
 /// Whether this build carries the Gemma backend.
 pub const GEMMA_AVAILABLE: bool = cfg!(feature = "gemma");
+
+/// Whether this build carries the Flint backend.
+pub const FLINT_AVAILABLE: bool = cfg!(feature = "flint");
 
 /// A failure reported by the engine, or the engine being absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +113,7 @@ impl std::error::Error for Error {}
 /// What [`Model::open`] loads and how.
 ///
 /// The companion, steering, power and kernel knobs apply to the ds4 backend
-/// only; Gemma reads the model path, the context size and [`Options::cpu`].
+/// only; Gemma and Flint read the model path, the context size and [`Options::cpu`].
 /// Every ds4 knob not listed here is left at the C's zero value, which is its
 /// default: single machine, no distributed split, no tensor parallelism.
 #[derive(Debug, Clone)]
@@ -272,16 +283,19 @@ pub enum Family {
     Ds4,
     /// Gemma 4 on candle.
     Gemma,
+    /// Flint on candle.
+    Flint,
 }
 
 impl Family {
     /// The backend for the GGUF at `path`: [`Family::Gemma`] for a `gemma4`
-    /// architecture, [`Family::Ds4`] for anything else, unreadable files
+    /// architecture, [`Family::Flint`] for a `flint` one, [`Family::Ds4`] for anything else, unreadable files
     /// included (the C's own fallthrough; it then reports the real problem).
     #[must_use]
     pub fn of(path: &Path) -> Self {
         match gguf::architecture(path).as_deref() {
             Some(gguf::GEMMA4_ARCH) => Self::Gemma,
+            Some(gguf::FLINT_ARCH) => Self::Flint,
             _ => Self::Ds4,
         }
     }
@@ -300,6 +314,11 @@ enum ModelInner {
     #[cfg(feature = "gemma")]
     Gemma {
         model: Arc<gemma_engine::model::Model>,
+        ctx: usize,
+    },
+    #[cfg(feature = "flint")]
+    Flint {
+        model: Arc<flint::Loaded>,
         ctx: usize,
     },
 }
@@ -331,6 +350,20 @@ impl Model {
                     options.model.display()
                 )));
             }
+            #[cfg(feature = "flint")]
+            Family::Flint => {
+                let ctx = usize::try_from(options.ctx_size).unwrap_or(1).max(1);
+                let model = flint::open(&options.model, ctx, options.cpu)?;
+                let ctx = model.model.context_length();
+                ModelInner::Flint { model, ctx }
+            }
+            #[cfg(not(feature = "flint"))]
+            Family::Flint => {
+                return Err(Error::new(format!(
+                    "{} is a Flint model; this build has no Flint backend (enable the `flint` feature)",
+                    options.model.display()
+                )));
+            }
         };
         Ok(Self { inner })
     }
@@ -342,6 +375,8 @@ impl Model {
             ModelInner::Ds4(_) => Family::Ds4,
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { .. } => Family::Gemma,
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { .. } => Family::Flint,
         }
     }
 
@@ -352,6 +387,8 @@ impl Model {
             ModelInner::Ds4(m) => Some(m),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { .. } => None,
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { .. } => None,
         }
     }
 
@@ -361,7 +398,17 @@ impl Model {
     pub fn as_gemma(&self) -> Option<&Arc<gemma_engine::model::Model>> {
         match &self.inner {
             ModelInner::Gemma { model, .. } => Some(model),
-            ModelInner::Ds4(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The Flint model, when Flint serves this one.
+    #[cfg(feature = "flint")]
+    #[must_use]
+    pub fn as_flint(&self) -> Option<&Arc<flint_engine::model::Model>> {
+        match &self.inner {
+            ModelInner::Flint { model, .. } => Some(&model.model),
+            _ => None,
         }
     }
 
@@ -372,6 +419,8 @@ impl Model {
             ModelInner::Ds4(m) => m.ctx_size(),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { ctx, .. } => i32::try_from(*ctx).unwrap_or(i32::MAX),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { ctx, .. } => i32::try_from(*ctx).unwrap_or(i32::MAX),
         }
     }
 
@@ -382,6 +431,8 @@ impl Model {
             ModelInner::Ds4(m) => m.name(),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { model, .. } => model.name.clone(),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model, .. } => flint::name(model),
         }
     }
 
@@ -392,12 +443,15 @@ impl Model {
             ModelInner::Ds4(m) => m.eos(),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { model, .. } => gemma::eos(model),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model, .. } => flint::eos(model),
         }
     }
 
     /// Renders and tokenizes a one-turn chat under the model's own template:
     /// the system turn when `system` is non-empty (or, for Gemma, when
-    /// thinking), `prompt` as the user turn, and the assistant opener.
+    /// thinking), `prompt` as the user turn, and the assistant opener. Flint
+    /// has no thinking switch, so it ignores `think`.
     ///
     /// # Errors
     /// Fails, on ds4, when `system` or `prompt` contains a NUL byte.
@@ -406,6 +460,8 @@ impl Model {
             ModelInner::Ds4(m) => m.encode_chat(system, prompt, think.ds4()),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { model, .. } => Ok(gemma::encode_chat(model, system, prompt, think)),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model, .. } => Ok(flint::encode_chat(model, system, prompt)),
         }
     }
 
@@ -419,6 +475,8 @@ impl Model {
             ModelInner::Ds4(m) => m.tokenize_rendered(text),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { model, .. } => Ok(gemma::tokenize_rendered(model, text)),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model, .. } => Ok(flint::tokenize_rendered(model, text)),
         }
     }
 
@@ -430,6 +488,8 @@ impl Model {
             ModelInner::Ds4(m) => m.token_bytes(token),
             #[cfg(feature = "gemma")]
             ModelInner::Gemma { model, .. } => gemma::token_bytes(model, token),
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model, .. } => flint::token_bytes(model, token),
         }
     }
 }
@@ -446,6 +506,8 @@ enum SessionInner {
     Ds4(ds4::Session),
     #[cfg(feature = "gemma")]
     Gemma(gemma::Session),
+    #[cfg(feature = "flint")]
+    Flint(flint::Session),
 }
 
 impl Session {
@@ -460,6 +522,11 @@ impl Session {
             ModelInner::Gemma { model: gemma, ctx } => {
                 let want = usize::try_from(ctx_size).unwrap_or(1).clamp(1, *ctx);
                 SessionInner::Gemma(gemma::Session::new(gemma, want))
+            }
+            #[cfg(feature = "flint")]
+            ModelInner::Flint { model: flint, ctx } => {
+                let want = usize::try_from(ctx_size).unwrap_or(1).clamp(1, *ctx);
+                SessionInner::Flint(flint::Session::new(flint, want))
             }
         };
         Ok(Self {
@@ -481,6 +548,8 @@ impl Session {
             SessionInner::Ds4(s) => Some(s),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(_) => None,
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(_) => None,
         }
     }
 
@@ -490,7 +559,17 @@ impl Session {
     pub fn as_gemma(&self) -> Option<&gemma_engine::session::Session> {
         match &self.inner {
             SessionInner::Gemma(s) => Some(s.inner()),
-            SessionInner::Ds4(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The Flint session, when Flint serves this one.
+    #[cfg(feature = "flint")]
+    #[must_use]
+    pub fn as_flint(&self) -> Option<&flint_engine::Session<flint_engine::model::Model>> {
+        match &self.inner {
+            SessionInner::Flint(s) => Some(s.inner()),
+            _ => None,
         }
     }
 
@@ -501,6 +580,8 @@ impl Session {
             SessionInner::Ds4(s) => s.ctx(),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => i32::try_from(s.ctx()).unwrap_or(i32::MAX),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => i32::try_from(s.ctx()).unwrap_or(i32::MAX),
         }
     }
 
@@ -511,6 +592,8 @@ impl Session {
             SessionInner::Ds4(s) => s.pos(),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => i32::try_from(s.pos()).unwrap_or(i32::MAX),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => i32::try_from(s.pos()).unwrap_or(i32::MAX),
         }
     }
 
@@ -521,6 +604,8 @@ impl Session {
             SessionInner::Ds4(s) => s.invalidate(),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => s.invalidate(),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => s.invalidate(),
         }
     }
 
@@ -535,7 +620,7 @@ impl Session {
 
     /// Like [`sync`](Self::sync), calling `on_progress(event, current, total)`
     /// as the backend reports prefill progress. `current` is an absolute
-    /// prompt position; Gemma reports once per 512-token chunk.
+    /// prompt position; Gemma and Flint report once per 512-token chunk.
     ///
     /// # Errors
     /// Fails when the prompt does not fit the context or the prefill fails.
@@ -548,6 +633,8 @@ impl Session {
             SessionInner::Ds4(s) => s.sync_with_progress(tokens, on_progress),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => s.sync(tokens, on_progress),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => s.sync(tokens, on_progress),
         }
     }
 
@@ -560,13 +647,15 @@ impl Session {
             SessionInner::Ds4(s) => s.eval(token),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => s.eval(token),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => s.eval(token),
         }
     }
 
     /// Samples the next token from the logits at the current position.
     /// `temperature <= 0` is greedy; `top_k` 0 keeps every token. `rng` is
     /// the sampler state, advanced in place; seed it once per generation.
-    /// Gemma returns `-1` when nothing has been evaluated yet.
+    /// Gemma and Flint return `-1` when nothing has been evaluated yet.
     #[must_use]
     pub fn sample(
         &mut self,
@@ -580,6 +669,8 @@ impl Session {
             SessionInner::Ds4(s) => s.sample(temperature, top_k, top_p, min_p, rng),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => s.sample(temperature, top_k, top_p, min_p, rng),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => s.sample(temperature, top_k, top_p, min_p, rng),
         }
     }
 
@@ -591,6 +682,8 @@ impl Session {
             SessionInner::Ds4(s) => s.top_logprobs(k),
             #[cfg(feature = "gemma")]
             SessionInner::Gemma(s) => s.top_logprobs(k),
+            #[cfg(feature = "flint")]
+            SessionInner::Flint(s) => s.top_logprobs(k),
         }
     }
 }

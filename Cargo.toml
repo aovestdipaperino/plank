@@ -81,7 +81,7 @@ gemma = ["dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/gemm
 # `FlintEngine` behind `Engine`. On by default, like `gemma`. It runs on
 # `nativeengine`, whose session and sampler are gemma-engine's, so it pulls
 # gemma-engine in too (without the `local-inference-engine` Gemma half).
-flint = ["dep:flint-engine", "flint-engine/candle", "dep:gemma-engine", "gemma-engine/candle"]
+flint = ["dep:flint-engine", "flint-engine/candle", "dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/flint"]
 # Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
 # the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
 # sidecar wiring, and the downloader's Qwen artifacts.
