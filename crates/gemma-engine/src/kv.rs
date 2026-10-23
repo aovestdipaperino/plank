@@ -98,6 +98,78 @@ impl LayerKv {
         Ok(Some((k.narrow(2, 0, stored)?, v.narrow(2, 0, stored)?)))
     }
 
+    /// Makes room for `n` positions past the live ones without writing
+    /// them, allocating `[1, kv_heads, cap, head_dim]` buffers on first use
+    /// and doubling them (copying the live prefix once) when they are full.
+    /// Returns whether the buffers were replaced, which invalidates any
+    /// [`LayerKv::buffers`] taken before.
+    ///
+    /// # Errors
+    /// Propagates any candle error from allocation or `slice_set`.
+    pub fn reserve(
+        &mut self,
+        n: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<bool> {
+        let stored = self.stored();
+        let (cap, live) = match (&self.k, &self.v) {
+            (Some(k), Some(v)) => {
+                let (_, _, cap, _) = k.dims4()?;
+                if stored + n <= cap {
+                    return Ok(false);
+                }
+                let mut new_cap = cap;
+                while stored + n > new_cap {
+                    new_cap *= 2;
+                }
+                (new_cap, Some((k, v)))
+            }
+            _ => ((stored + n).max(256).next_power_of_two(), None),
+        };
+        let new_k = Tensor::zeros((1, kv_heads, cap, head_dim), DType::F32, device)?;
+        let new_v = Tensor::zeros((1, kv_heads, cap, head_dim), DType::F32, device)?;
+        if let Some((k, v)) = live
+            && stored > 0
+        {
+            new_k.slice_set(&k.narrow(2, 0, stored)?.contiguous()?, 2, 0)?;
+            new_v.slice_set(&v.narrow(2, 0, stored)?.contiguous()?, 2, 0)?;
+        }
+        self.k = Some(new_k);
+        self.v = Some(new_v);
+        Ok(true)
+    }
+
+    /// The whole backing buffers, `[1, kv_heads, cap, head_dim]` each, whose
+    /// index `i` holds absolute position `base + i`; `None` before the first
+    /// [`LayerKv::append`] or [`LayerKv::reserve`].
+    #[must_use]
+    pub fn buffers(&self) -> Option<(&Tensor, &Tensor)> {
+        self.k.as_ref().zip(self.v.as_ref())
+    }
+
+    /// Marks `n` positions past the live ones as written, by a caller that
+    /// wrote them into [`LayerKv::buffers`] itself after a
+    /// [`LayerKv::reserve`] of at least `n`.
+    ///
+    /// # Errors
+    /// When the buffers cannot hold `n` more positions.
+    pub fn advance(&mut self, n: usize) -> Result<()> {
+        let cap = match &self.k {
+            Some(k) => k.dims4()?.2,
+            None => 0,
+        };
+        if self.stored() + n > cap {
+            return Err(Error(format!(
+                "cannot advance {n} positions past {} in a {cap}-position buffer",
+                self.stored()
+            )));
+        }
+        self.len += n;
+        Ok(())
+    }
+
     /// Append `n` new positions (read off dim 2 of `k`/`v`), growing the
     /// backing buffer (doubling capacity, copying the live prefix once) when
     /// it doesn't fit.
@@ -107,8 +179,7 @@ impl LayerKv {
     /// `slice_set`.
     ///
     /// # Panics
-    /// Never in practice: every `unwrap()` below reads back `self.k`/`self.v`
-    /// in a branch that just finished assigning them to `Some`.
+    /// Never in practice: [`LayerKv::reserve`] has just made both buffers.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let k = k.to_dtype(DType::F32)?.contiguous()?;
         let v = v.to_dtype(DType::F32)?.contiguous()?;
@@ -116,56 +187,8 @@ impl LayerKv {
         if n == 0 {
             return Ok(());
         }
-        let device = k.device().clone();
         let stored = self.stored();
-
-        match &self.k {
-            None => {
-                let cap = (stored + n).max(256).next_power_of_two();
-                self.k = Some(Tensor::zeros(
-                    (1, kv_heads, cap, head_dim),
-                    DType::F32,
-                    &device,
-                )?);
-                self.v = Some(Tensor::zeros(
-                    (1, kv_heads, cap, head_dim),
-                    DType::F32,
-                    &device,
-                )?);
-            }
-            Some(existing) => {
-                let (_, _, cap, _) = existing.dims4()?;
-                if stored + n > cap {
-                    let mut new_cap = cap;
-                    while stored + n > new_cap {
-                        new_cap *= 2;
-                    }
-                    let new_k =
-                        Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
-                    let new_v =
-                        Tensor::zeros((1, kv_heads, new_cap, head_dim), DType::F32, &device)?;
-                    if stored > 0 {
-                        let old_k = self
-                            .k
-                            .as_ref()
-                            .unwrap()
-                            .narrow(2, 0, stored)?
-                            .contiguous()?;
-                        let old_v = self
-                            .v
-                            .as_ref()
-                            .unwrap()
-                            .narrow(2, 0, stored)?
-                            .contiguous()?;
-                        new_k.slice_set(&old_k, 2, 0)?;
-                        new_v.slice_set(&old_v, 2, 0)?;
-                    }
-                    self.k = Some(new_k);
-                    self.v = Some(new_v);
-                }
-            }
-        }
-
+        self.reserve(n, kv_heads, head_dim, k.device())?;
         self.k.as_ref().unwrap().slice_set(&k, 2, stored)?;
         self.v.as_ref().unwrap().slice_set(&v, 2, stored)?;
         self.len += n;
