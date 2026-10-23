@@ -3,91 +3,47 @@
 
 //! Gemma 4 behind [`Engine`], over the native-Rust `gemma-engine` crate.
 //!
-//! The transcript discipline is the ds4 engine's: the rendered transcript is
-//! split into sections, the leading sections that match recorded spans keep
-//! their tokens verbatim, and only the rest is rendered (with Gemma's chat
-//! template) and tokenized. Unlike the ds4 KV, Gemma's is prefix-truncatable,
-//! so a prompt that diverges anywhere keeps the KV up to that token and
-//! prefills only the remainder.
+//! The transcript discipline, the KV and the warm walk are
+//! [`NativeEngine`]'s; this module supplies Gemma's part of it as
+//! [`GemmaFamily`]: its tokenizer, its chat template and its stop ids.
 //!
 //! Gemma writes its reasoning in a `<|channel>thought\n…<channel|>` block,
 //! which [`ThinkTranslator`] streams as `<think>…</think>` so the renderer
 //! sees what it sees from every other local model. Past turns' thoughts stay
 //! in history: recorded tokens are reused verbatim.
+//!
+//! [`Engine`]: crate::engine::Engine
+//! [`NativeEngine`]: crate::nativeengine::NativeEngine
 
 use std::path::Path;
 use std::sync::Arc;
 
 use gemma_engine::Device;
 use gemma_engine::model::Model;
-use gemma_engine::sample::Sampler;
-use gemma_engine::session::Session;
 use gemma_engine::template::{self, Kind};
 use gemma_engine::tokenizer::GemmaTokenizer;
 
-use crate::ds4tokens::{SectionKey, SpanRole, TokenTranscript, parse_sections};
-use crate::engine::{
-    Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, KvReuse, PrefillProgress,
-    Prompt, ThinkMode, Utf8Stream,
-};
-use crate::kvcache::KVCache;
-
-/// Tokens a prefill evaluates between progress reports (the session's own
-/// chunk size, so each report is one forward).
-const PREFILL_CHUNK: usize = 512;
-
-/// The context used when the caller asks for none and the machine's memory
-/// is unknown; otherwise [`default_ctx`] sizes it from the RAM.
-const DEFAULT_CTX: usize = 32_768;
-
-/// The context opened when the caller asks for none (`ctx <= 0`): the KV a
-/// third of `ram` can hold ([`crate::enginefit::GEMMA_KV_RAM_DIVISOR`]), in
-/// whole 1024-token steps, never below [`crate::enginefit::GEMMA_MIN_CTX`]
-/// and never past the model's own `context_length`.
-///
-/// The cache is f32 and keeps every position, so the window is what decides
-/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B. A fixed default
-/// was wrong at both ends: 32K cost the 12B 22.5 GB on any machine, while a
-/// 128 GB one could hold E4B's whole 131K. A third leaves the weights and the
-/// rest of the system room, and stays under the half-of-memory refusal in
-/// [`GemmaEngine::open`]. `ram` of 0 or `usize::MAX` (not measurable) keeps
-/// the old 32K.
-fn default_ctx(ram: usize, limits: gemma_engine::model::Limits) -> usize {
-    let fallback = DEFAULT_CTX.min(limits.context_length);
-    if ram == 0 || ram == usize::MAX || limits.kv_bytes_per_token == 0 {
-        return fallback;
-    }
-    let fits = ram / crate::enginefit::GEMMA_KV_RAM_DIVISOR / limits.kv_bytes_per_token;
-    (fits / 1024 * 1024)
-        .max(crate::enginefit::GEMMA_MIN_CTX)
-        .min(limits.context_length)
-}
+use crate::engine::{EngineError, Utf8Stream};
+use crate::nativeengine::engine_error;
 
 /// Bytes of a thought block's channel name held back before giving up on
 /// finding its `\n`. The model writes `thought\n`; anything longer is not a
 /// channel name and is streamed rather than lost.
 const CHANNEL_NAME_MAX: usize = 64;
 
-/// The engine: one model, one live session, and the token transcript that
-/// describes what the session's KV was built from.
+/// Gemma 4's part of [`NativeEngine`]: its tokenizer, template and thought
+/// channel.
+///
+/// [`NativeEngine`]: crate::nativeengine::NativeEngine
 #[derive(Debug)]
-pub struct GemmaEngine {
+pub struct GemmaFamily {
     model: Arc<Model>,
-    session: Session,
-    transcript: TokenTranscript,
-    /// The template kind of each span, parallel to `transcript.spans()`.
-    kinds: Vec<Kind>,
-    think: ThinkMode,
-    trusted_len: usize,
-    /// `"metal"` or `"cpu"`: where the model runs.
-    device_name: &'static str,
-    /// Set by `warm_reset` until the walk's first append or sync: the window
-    /// in which `kvtier` restores a tier checkpoint. A restore there keeps the
-    /// warm buffer, because the walk goes on to append every tier again —
-    /// restored ones included — and taking the checkpoint's own transcript
-    /// would hold those tiers twice.
-    warm_pending: bool,
+    controls: Controls,
 }
+
+/// Gemma 4 behind [`crate::engine::Engine`]: one model, one live session, and
+/// the token transcript that describes what the session's KV was built from.
+pub type GemmaEngine = crate::nativeengine::NativeEngine<GemmaFamily>;
 
 /// Ids the decode loop and the stream translator look up once.
 #[derive(Debug, Clone, Copy)]
@@ -109,11 +65,70 @@ impl Controls {
     }
 }
 
-/// Whether sampling `id` ends the reply. A stop token is neither recorded nor
-/// evaluated: the next section's rendering supplies it (`<turn|>` opens a
-/// user section, `<|tool_response>` opens a tool result).
-fn is_stop(tok: &GemmaTokenizer, c: Controls, id: u32) -> bool {
-    id == tok.eos() || Some(id) == c.turn_close || Some(id) == c.resp_open
+impl crate::nativeengine::NativeFamily for GemmaFamily {
+    type Model = Model;
+    type Translator = ThinkTranslator;
+    const LABEL: &'static str = "gemma";
+
+    fn open(path: &Path, device: &Device, cap: usize) -> Result<(Arc<Model>, Self), EngineError> {
+        let model = Model::open_with_ctx(path, device, cap).map_err(engine_error)?;
+        let controls = Controls::of(&model.tokenizer);
+        Ok((model.clone(), Self { model, controls }))
+    }
+
+    fn probe(path: &Path) -> Result<(usize, usize), EngineError> {
+        let l = gemma_engine::model::probe(path).map_err(engine_error)?;
+        Ok((l.context_length, l.kv_bytes_per_token))
+    }
+
+    fn kv_bytes_per_token(model: &Model) -> usize {
+        model.kv_bytes_per_token()
+    }
+
+    fn model_name(&self) -> String {
+        self.model.name.clone()
+    }
+
+    fn bos(&self) -> Option<u32> {
+        self.model.tokenizer.bos()
+    }
+
+    fn render(
+        &self,
+        kind: Kind,
+        text: &str,
+        prev: Option<Kind>,
+        think: bool,
+        trusted_len: usize,
+    ) -> Vec<u32> {
+        self.model
+            .tokenizer
+            .encode_pieces(&template::render(kind, text, prev, think, trusted_len))
+    }
+
+    fn generation_prefix(&self, last: Option<Kind>, _think: bool) -> Vec<u32> {
+        self.model
+            .tokenizer
+            .encode_pieces(&template::generation_prefix(last))
+    }
+
+    /// A stop token is neither recorded nor evaluated: the next section's
+    /// rendering supplies it (`<turn|>` opens a user section,
+    /// `<|tool_response>` opens a tool result).
+    fn is_stop(&self, id: u32) -> bool {
+        let tok = &self.model.tokenizer;
+        id == tok.eos()
+            || Some(id) == self.controls.turn_close
+            || Some(id) == self.controls.resp_open
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        self.model.tokenizer.encode_plain(text).len()
+    }
+
+    fn translate(&self, tr: &mut ThinkTranslator, id: u32, utf8: &mut Utf8Stream) -> String {
+        tr.push(&self.model.tokenizer, id, utf8)
+    }
 }
 
 /// Turns Gemma's thought channel into `<think>` tags while streaming.
@@ -171,613 +186,24 @@ impl ThinkTranslator {
     }
 }
 
-/// The span role a template kind is recorded under.
-fn role_of(kind: Kind) -> SpanRole {
-    match kind {
-        Kind::System => SpanRole::System,
-        Kind::User | Kind::ToolResult => SpanRole::User,
-        Kind::Assistant => SpanRole::Assistant,
-    }
-}
-
-/// The section tag `template::classify` reads for a span role.
-fn tag_of(role: SpanRole) -> &'static str {
-    match role {
-        SpanRole::System => "system",
-        SpanRole::User => "user",
-        SpanRole::Assistant => "assistant",
-    }
-}
-
-fn to_i32(ids: &[u32]) -> Vec<i32> {
-    ids.iter()
-        .map(|&t| i32::try_from(t).unwrap_or(i32::MAX))
-        .collect()
-}
-
-fn to_u32(ids: &[i32]) -> Vec<u32> {
-    ids.iter().map(|&t| u32::try_from(t).unwrap_or(0)).collect()
-}
-
-fn count(n: usize) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
-fn common_prefix(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
-}
-
-fn engine_error(e: gemma_engine::Error) -> EngineError {
-    EngineError::new(e.0)
-}
-
-/// How the template renders: what [`reconcile_into`] needs besides the
-/// transcript it edits.
-#[derive(Debug, Clone, Copy)]
-struct Render<'a> {
-    tok: &'a GemmaTokenizer,
-    think: bool,
-    trusted_len: usize,
-}
-
-impl<'a> Render<'a> {
-    fn new(tok: &'a GemmaTokenizer, think: ThinkMode, trusted_len: usize) -> Self {
-        Self {
-            tok,
-            think: !matches!(think, ThinkMode::Off),
-            trusted_len,
-        }
-    }
-
-    /// Renders one section after `kinds`' last span and appends it.
-    fn push(
-        &self,
-        transcript: &mut TokenTranscript,
-        kinds: &mut Vec<Kind>,
-        role: &str,
-        text: &str,
-    ) {
-        let prev = kinds.last().copied();
-        let kind = template::classify(role, text, prev);
-        let pieces = template::render(kind, text, prev, self.think, self.trusted_len);
-        let mut ids = Vec::new();
-        if transcript.spans().is_empty()
-            && let Some(bos) = self.tok.bos()
-        {
-            ids.push(bos);
-        }
-        ids.extend(self.tok.encode_pieces(&pieces));
-        transcript.push_span(role_of(kind), 0, text.to_owned(), &to_i32(&ids));
-        kinds.push(kind);
-    }
-
-    /// Brings `transcript` in line with the rendered transcript `flat`: the
-    /// leading spans whose (role, text) match keep their tokens, the rest are
-    /// rendered from text.
-    fn reconcile(&self, transcript: &mut TokenTranscript, kinds: &mut Vec<Kind>, flat: &str) {
-        let sections = parse_sections(flat);
-        let keys: Vec<SectionKey> = sections
-            .iter()
-            .filter_map(|(role, text)| {
-                SpanRole::from_tag(role).map(|role| SectionKey {
-                    role,
-                    text: text.clone(),
-                })
-            })
-            .collect();
-        let keep = transcript.common_prefix(&keys);
-        crate::engine::kv_debug(|| {
-            format!(
-                "gemma reconcile: {} spans held, {} sections in, kept {keep}",
-                transcript.spans().len(),
-                keys.len()
-            )
-        });
-        transcript.truncate_spans(keep);
-        kinds.truncate(keep);
-        for (role, text) in sections.iter().skip(keep) {
-            self.push(transcript, kinds, role, text);
-        }
-    }
-
-    /// The tokens a generation after `kinds`' last span starts with.
-    fn generation_prefix(&self, kinds: &[Kind]) -> Vec<u32> {
-        self.tok
-            .encode_pieces(&template::generation_prefix(kinds.last().copied()))
-    }
-}
-
-/// Bytes of RAM on this machine, or `usize::MAX` when it cannot be read (so
-/// the KV check never refuses on a failed probe).
-#[cfg(target_os = "macos")]
-fn physical_memory() -> usize {
-    let mut bytes: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: the name is NUL-terminated, `bytes` and `len` are valid out
-    // pointers sized for `hw.memsize`'s u64, and no new value is set.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 {
-        usize::try_from(bytes).unwrap_or(usize::MAX)
-    } else {
-        usize::MAX
-    }
-}
-
-/// Bytes of RAM on this machine, or `usize::MAX` when it cannot be read.
-#[cfg(not(target_os = "macos"))]
-fn physical_memory() -> usize {
-    // SAFETY: sysconf only reads system configuration.
-    let (pages, size) = unsafe {
-        (
-            libc::sysconf(libc::_SC_PHYS_PAGES),
-            libc::sysconf(libc::_SC_PAGESIZE),
-        )
-    };
-    match (usize::try_from(pages), usize::try_from(size)) {
-        (Ok(p), Ok(s)) => p.saturating_mul(s),
-        _ => usize::MAX,
-    }
-}
-
-/// Metal when this machine has it, else the CPU.
-fn pick_device() -> (Device, &'static str) {
-    #[cfg(target_os = "macos")]
-    if let Ok(d) = Device::new_metal(0) {
-        return (d, "metal");
-    }
-    (Device::Cpu, "cpu")
-}
-
-impl GemmaEngine {
-    /// Opens the Gemma 4 GGUF at `path` on Metal (the CPU when there is no
-    /// Metal device) with a `ctx`-token context, clamped to the model's; a
-    /// `ctx` of zero or less means [`default_ctx`]: sized from the RAM.
-    ///
-    /// # Errors
-    /// When the file does not load as a Gemma 4 model, or when the KV for
-    /// `ctx` tokens would take more than half the machine's memory.
-    pub fn open(path: &Path, ctx: i32) -> Result<Self, EngineError> {
-        let (device, name) = pick_device();
-        Self::open_on(path, ctx, &device, name)
-    }
-
-    /// [`GemmaEngine::open`] forced onto the CPU, for tests.
-    ///
-    /// # Errors
-    /// As [`GemmaEngine::open`].
-    #[cfg(test)]
-    pub fn open_on_cpu(path: &Path, ctx: i32) -> Result<Self, EngineError> {
-        Self::open_on(path, ctx, &Device::Cpu, "cpu")
-    }
-
-    fn open_on(
-        path: &Path,
-        ctx: i32,
-        device: &Device,
-        device_name: &'static str,
-    ) -> Result<Self, EngineError> {
-        let cap = match usize::try_from(ctx).ok().filter(|&c| c > 0) {
-            Some(c) => c,
-            None => default_ctx(
-                physical_memory(),
-                gemma_engine::model::probe(path).map_err(engine_error)?,
-            ),
-        };
-        // Rotary tables are built for the capped context only, which also
-        // makes `context_length()` the clamped context.
-        let model = Model::open_with_ctx(path, device, cap).map_err(engine_error)?;
-        let ctx = model.context_length();
-        let need = model.kv_bytes_per_token().saturating_mul(ctx);
-        if need > physical_memory() / 2 {
-            return Err(EngineError::new(format!(
-                "a {ctx}-token context needs {} GB of KV; lower it with --ctx",
-                need.div_ceil(1 << 30)
-            )));
-        }
-        let session = Session::new(model.clone(), ctx);
-        Ok(Self {
-            model,
-            session,
-            transcript: TokenTranscript::new(),
-            kinds: Vec::new(),
-            think: ThinkMode::default(),
-            trusted_len: 0,
-            device_name,
-            warm_pending: false,
-        })
-    }
-
-    /// Bytes the KV cache takes at the full context this engine opened with:
-    /// what the window actually costs in memory, for the startup line.
-    #[must_use]
-    pub fn kv_bytes_at_ctx(&self) -> usize {
-        self.model
-            .kv_bytes_per_token()
-            .saturating_mul(self.session.ctx())
-    }
-
-    /// Where the model runs: `"metal"` or `"cpu"`.
-    #[must_use]
-    pub fn device_name(&self) -> &'static str {
-        self.device_name
-    }
-
-    fn render(&self) -> Render<'_> {
-        Render::new(&self.model.tokenizer, self.think, self.trusted_len)
-    }
-
-    /// Reconciles the token transcript with the rendered transcript `flat`.
-    fn reconcile(&mut self, flat: &str) {
-        Render::new(&self.model.tokenizer, self.think, self.trusted_len).reconcile(
-            &mut self.transcript,
-            &mut self.kinds,
-            flat,
-        );
-    }
-
-    /// Drops every recorded token, for a change that alters the system turn.
-    fn invalidate(&mut self) {
-        self.session.truncate(0);
-        self.transcript = TokenTranscript::new();
-        self.kinds.clear();
-        self.warm_pending = false;
-    }
-
-    /// Prefills `toks` after the session's first `base` tokens (the session
-    /// already holds exactly those), reporting progress per chunk. Returns the
-    /// last logits, or `None` when interrupted.
-    fn prefill(
-        &mut self,
-        base: usize,
-        toks: &[u32],
-        interrupt: &dyn Fn() -> bool,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<Option<Vec<f32>>, EngineError> {
-        let total_abs = base + toks.len();
-        on_event(EngineEvent::Prefill(PrefillProgress::primed(
-            count(base),
-            count(total_abs),
-        )));
-        let start = std::time::Instant::now();
-        let mut total = count(total_abs);
-        let mut last = None;
-        for chunk in toks.chunks(PREFILL_CHUNK) {
-            match self
-                .session
-                .prefill(chunk, interrupt)
-                .map_err(engine_error)?
-            {
-                Some(l) => last = Some(l),
-                None => return Ok(None),
-            }
-            on_event(EngineEvent::Prefill(PrefillProgress::from_absolute(
-                count(base),
-                count(self.session.tokens().len()),
-                &mut total,
-                start.elapsed().as_secs_f64(),
-            )));
-        }
-        Ok(last)
-    }
-
-    /// Fails before touching the session when `need` tokens cannot fit.
-    fn check_fits(&self, need: usize) -> Result<(), EngineError> {
-        if need > self.session.ctx() {
-            return Err(EngineError::new(format!(
-                "context full: {need} tokens > {}",
-                self.session.ctx()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Records a sampled reply: the generation prefix it followed and its ids,
-    /// as a new assistant span — or as more of the last one when that is
-    /// already an assistant reply (a resumed `/btw` pass).
-    fn record_reply(&mut self, text: String, prefix: &[u32], reply: &[u32]) {
-        if reply.is_empty() {
-            return;
-        }
-        let mut ids = to_i32(prefix);
-        ids.extend(to_i32(reply));
-        if self.transcript.last_is_assistant() {
-            self.transcript.extend_last_span(&text, &ids);
-        } else {
-            self.transcript
-                .push_span(SpanRole::Assistant, 0, text, &ids);
-            self.kinds.push(Kind::Assistant);
-        }
-    }
-}
-
-impl Engine for GemmaEngine {
-    fn generate(
-        &mut self,
-        prompt: Prompt<'_>,
-        opts: &GenerationOptions,
-        interrupt: &dyn Fn() -> bool,
-        greedy: &dyn Fn() -> bool,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<GenerationStats, EngineError> {
-        self.warm_pending = false;
-        self.reconcile(prompt.flat());
-        let prefix = self.render().generation_prefix(&self.kinds);
-        let mut full = to_u32(self.transcript.tokens());
-        full.extend_from_slice(&prefix);
-        self.check_fits(full.len())?;
-
-        // The last prompt token is always evaluated: its logits pick the
-        // first reply token.
-        let mut common = common_prefix(self.session.tokens(), &full);
-        if common == full.len() {
-            common = common.saturating_sub(1);
-        }
-        let live = self.session.tokens().len();
-        // Below a restored snapshot's sliding window the session empties.
-        let common = self.session.truncate(common);
-        crate::engine::kv_debug(|| {
-            format!(
-                "gemma generate: prompt={} live={live} reused={common}",
-                full.len()
-            )
-        });
-        let Some(mut logits) = self.prefill(common, &full[common..], interrupt, on_event)? else {
-            return Ok(GenerationStats {
-                interrupted: true,
-                ctx_used: count(self.session.tokens().len()),
-                ..GenerationStats::default()
-            });
-        };
-
-        let model = self.model.clone();
-        let tok = &model.tokenizer;
-        let controls = Controls::of(tok);
-        let mut sampler = Sampler::new(if opts.seed != 0 {
-            opts.seed
-        } else {
-            0x2545_f491_4f6c_dd1d
-        });
-        let mut translator = ThinkTranslator::default();
-        let mut utf8 = Utf8Stream::default();
-        let mut reply: Vec<u32> = Vec::new();
-        let mut reply_text = String::new();
-        let mut interrupted = false;
-        let mut generated: i32 = 0;
-        let start = std::time::Instant::now();
-        let mut steady_mark: Option<(std::time::Instant, i32)> = None;
-        let (max_tokens, bound) = crate::engine::pass_budget(
-            opts.n_predict,
-            count(self.session.ctx()) - count(self.session.tokens().len()),
-            opts.ctx_reserve,
-        );
-        while generated < max_tokens {
-            if steady_mark.is_none()
-                && start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
-            {
-                steady_mark = Some((std::time::Instant::now(), generated));
-            }
-            if interrupt() {
-                interrupted = true;
-                break;
-            }
-            let t = sampler.sample(&logits, opts.temperature, opts.top_p, opts.min_p, greedy());
-            if is_stop(tok, controls, t) {
-                break;
-            }
-            let text = translator.push(tok, t, &mut utf8);
-            if !text.is_empty() {
-                reply_text.push_str(&text);
-                on_event(EngineEvent::Text(text));
-            }
-            reply.push(t);
-            generated += 1;
-            logits = self.session.step(t).map_err(engine_error)?;
-        }
-        let tail = utf8.flush();
-        if !tail.is_empty() {
-            reply_text.push_str(&tail);
-            on_event(EngineEvent::Text(tail));
-        }
-        self.record_reply(reply_text, &prefix, &reply);
-
-        let secs = start.elapsed().as_secs_f64();
-        Ok(GenerationStats {
-            generated,
-            tps: if secs > 0.0 {
-                f64::from(generated) / secs
-            } else {
-                0.0
-            },
-            steady_tps: crate::engine::rate_since(steady_mark, generated),
-            ctx_used: count(self.session.tokens().len()),
-            interrupted,
-            limit: crate::engine::pass_limit(generated, max_tokens, bound, interrupted),
-            usage: None,
-            spec: crate::engine::SpecStats::default(),
-            prefill_tokens: 0,
-            prefill_secs: 0.0,
-        })
-    }
-
-    fn emits_think_tags(&self) -> bool {
-        true
-    }
-
-    /// The candle KV truncates to the common prefix in `generate`, so fork
-    /// snapshots and ladder rungs would only serialise the whole f32 cache
-    /// (about 114 KB per token on E4B) for nothing.
-    fn kv_truncates_exactly(&self) -> bool {
-        true
-    }
-
-    /// Truncates the session to its common prefix with `transcript`, the
-    /// truncation the next `generate` would make, so a snapshot taken before
-    /// that turn does not record a sidechain's tail. A restored session keeps
-    /// only `window + SNAPSHOT_SLACK` positions per sliding layer, so a tail
-    /// longer than the slack would otherwise turn the resumed turn into a
-    /// rebuild from zero. Left alone during a warm walk, which owns the
-    /// transcript until `warm_sync`.
-    fn sync_to_prefix(&mut self, transcript: &str) {
-        if self.warm_pending {
-            return;
-        }
-        self.reconcile(transcript);
-        let want = to_u32(self.transcript.tokens());
-        let common = common_prefix(self.session.tokens(), &want);
-        let kept = self.session.truncate(common);
-        crate::engine::kv_debug(|| {
-            format!(
-                "gemma sync_to_prefix: transcript={} common={common} kept={kept}",
-                want.len()
-            )
-        });
-    }
-
-    /// Reports the reusable prefix as the live end: `live == common`.
-    ///
-    /// Gemma's KV truncates exactly, so a prompt that diverges behind the live
-    /// end keeps every token up to the divergence and prefills only the rest.
-    /// That is never the rebuild-from-zero shape `KvReuse::rebuilds_from_zero`
-    /// describes (the ds4 sync's), which the agent answers by restoring a
-    /// ladder rung or fork snapshot and by skipping prompt suggestions.
-    /// Reporting the real session length would buy both for nothing.
-    ///
-    /// The exception is a session restored from a snapshot, whose sliding
-    /// layers hold only their window plus `SNAPSHOT_SLACK`: diverging so far
-    /// behind its end that [`Session::reusable`] is 0 empties it, so the probe
-    /// reports the real length, the rebuild shape. So does a prompt sharing no
-    /// token at all, which keeps nothing on any session.
-    fn kv_reuse_probe(&mut self, transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
-        let render = self.render();
-        let mut tokens = self.transcript.clone();
-        let mut kinds = self.kinds.clone();
-        render.reconcile(&mut tokens, &mut kinds, transcript);
-        let mut full = to_u32(tokens.tokens());
-        full.extend(render.generation_prefix(&kinds));
-        let common = common_prefix(self.session.tokens(), &full);
-        let live = if common > 0 && self.session.reusable(common) == common {
-            common
-        } else {
-            self.session.tokens().len()
-        };
-        Some(KvReuse {
-            live: count(live),
-            common: count(common),
-        })
-    }
-
-    fn set_think_mode(&mut self, mode: ThinkMode) {
-        if mode != self.think {
-            self.think = mode;
-            self.invalidate();
-        }
-    }
-
-    fn set_trusted_system_prefix(&mut self, len: usize) {
-        if len != self.trusted_len {
-            self.trusted_len = len;
-            self.invalidate();
-        }
-    }
-
-    fn count_tokens(&self, text: &str) -> i32 {
-        count(self.model.tokenizer.encode_plain(text).len())
-    }
-
-    fn get_kv(&mut self) -> Option<KVCache> {
-        Some(KVCache::new(
-            self.session.snapshot().ok()?,
-            self.transcript.clone(),
-        ))
-    }
-
-    /// Restores the session and, outside a warm walk, the transcript the
-    /// checkpoint was captured with. Inside one (right after `warm_reset`) the
-    /// warm buffer stays: the walk re-appends every tier, and `warm_sync`
-    /// matches it against the restored session's own tokens.
-    fn set_kv(&mut self, cache: &KVCache) -> Result<(), EngineError> {
-        self.session.restore(cache.kv()).map_err(engine_error)?;
-        if self.warm_pending {
-            return Ok(());
-        }
-        self.transcript = cache.transcript().clone();
-        self.kinds.clear();
-        for span in self.transcript.spans() {
-            let kind =
-                template::classify(tag_of(span.role), &span.text, self.kinds.last().copied());
-            self.kinds.push(kind);
-        }
-        Ok(())
-    }
-
-    fn can_release_gpu(&self) -> bool {
-        true
-    }
-
-    /// Places the system turn in the transcript. Nothing is prefilled until
-    /// [`Engine::warm_sync`], so a checkpoint restored in between is not paid
-    /// for twice.
-    fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
-        self.transcript = TokenTranscript::new();
-        self.kinds.clear();
-        self.reconcile(&format!("[system]\n{system}\n"));
-        self.warm_pending = true;
-        Ok(())
-    }
-
-    fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
-        self.warm_pending = false;
-        if let Some(text) = text {
-            // Trimmed as `parse_sections` trims, so the span matches the
-            // section the next turn's transcript carries.
-            Render::new(&self.model.tokenizer, self.think, self.trusted_len).push(
-                &mut self.transcript,
-                &mut self.kinds,
-                "user",
-                text.trim_end(),
-            );
-        }
-        Ok(())
-    }
-
-    fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
-        self.warm_pending = false;
-        let want = to_u32(self.transcript.tokens());
-        self.check_fits(want.len())?;
-        let common = common_prefix(self.session.tokens(), &want);
-        let common = self.session.truncate(common);
-        if common == want.len() {
-            return Ok(false);
-        }
-        self.prefill(common, &want[common..], &|| false, on_event)?;
-        Ok(true)
-    }
-
-    fn ctx_size(&self) -> i32 {
-        count(self.session.ctx())
-    }
-
-    fn model_name(&self) -> String {
-        self.model.name.clone()
-    }
-
-    fn is_local(&self) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Engine, EngineEvent, GenerationOptions, Prompt, ThinkMode};
+    use crate::engine::{
+        Engine, EngineEvent, GenerationOptions, GenerationStats, Prompt, ThinkMode,
+    };
+    use crate::nativeengine::to_u32;
+
+    /// The shared [`crate::nativeengine::default_ctx`] as Gemma calls it:
+    /// the file's limits and no family cap.
+    fn default_ctx(ram: usize, limits: gemma_engine::model::Limits) -> usize {
+        crate::nativeengine::default_ctx(
+            ram,
+            limits.context_length,
+            limits.kv_bytes_per_token,
+            None,
+        )
+    }
 
     const GIB: usize = 1 << 30;
     const E4B: gemma_engine::model::Limits = gemma_engine::model::Limits {

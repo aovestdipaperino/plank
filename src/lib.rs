@@ -119,6 +119,10 @@ pub mod mempressure;
 #[cfg(feature = "builtin_editor")]
 pub mod miniedit;
 pub mod names;
+/// A native-Rust model behind [`engine::Engine`], generic over its family
+/// (Gemma today): the transcript reconcile, the KV and the warm walk.
+#[cfg(feature = "gemma")]
+pub mod nativeengine;
 pub mod notify;
 #[cfg(feature = "use_obscura")]
 pub mod obscura_web;
