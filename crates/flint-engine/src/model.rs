@@ -317,10 +317,11 @@ impl Model {
             .collect()
     }
 
-    /// Bytes one position adds to the cache: K and V, f32, every layer.
+    /// Bytes one position adds to the cache: K and V, f32, every layer
+    /// ([`FlintConfig::kv_bytes_per_token`]).
     #[must_use]
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.config.layers * 2 * self.config.kv_heads * self.config.head_dim * 4
+        self.config.kv_bytes_per_token()
     }
 
     /// The device every tensor and the KV cache live on.
