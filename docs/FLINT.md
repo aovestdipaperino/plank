@@ -254,10 +254,19 @@ including 16 tokens after a 20,861-token prompt. The oracle
 from llama.cpp's graph semantics, with weights decoded by the pinned
 commit's gguf-py, rounding K and V to f16 as the cache does (`--kv f32` for
 the exact variant). On all ten checked positions plank's Metal engine agrees
-with it on the argmax, and the largest difference on any top-20 probability
-is 6.6e-5 against a tolerance of 1e-3 (1.8e-6 when both kept an f32 cache). Its prompts are short (at
-most 22 positions), so the sliding window and deep RoPE positions are only
-covered by the coarser llama.cpp agreement. The details are in `FINDINGS.md`
+with it on the argmax.
+
+Since prefill multiplies in f16 (below), the user's decision is that parity
+means the oracle's argmax at every position plus greedy agreement with
+llama.cpp, as llama.cpp's own f16 arithmetic allows: the f16 multiplies
+move single probabilities by up to 7.2e-2 at the checked positions, and the
+test keeps a coarse 0.1 bound on each top-20 probability only as a guard
+against a broken kernel. While every multiply was f32 the largest
+difference was 6.6e-5 against a tolerance of 1e-3 (1.8e-6 with an f32
+cache). The oracle's prompts are short (at most 22 positions), so the
+sliding window and deep RoPE positions are only covered by the llama.cpp
+agreement, which holds over 16 greedy tokens after the 20,861-token
+prompt. The details are in `FINDINGS.md`
 under "Flint against llama.cpp on the real file".
 
 ## Speed
@@ -283,18 +292,31 @@ minute's cooldown between runs (an Apple M5 Max with 128 GiB on AC power,
 
 | context | plank decode | Ollama decode | plank prefill | Ollama prefill |
 |---|---|---|---|---|
-| 22 tokens | 164.5 tok/s | 161.6 tok/s | | |
-| 1,816 tokens | 161.2 tok/s | 156.7 tok/s | 257 tok/s | 2,084 tok/s |
-| 9,016 tokens | 133.6 tok/s | 136.0 tok/s | 347 tok/s | 1,729 tok/s |
-| 18,016 tokens | 97.9 tok/s | 130.2 tok/s | 229 tok/s | 2,630 tok/s |
+| 22 tokens | 165.6 tok/s | 156.9 tok/s | | |
+| 1,816 tokens | 165.1 tok/s | 156.1 tok/s | 1,133 tok/s | 2,102 tok/s |
+| 9,016 tokens | 152.2 tok/s | 148.6 tok/s | 1,090 tok/s | 1,856 tok/s |
+| 18,016 tokens | 130.8 tok/s | 141.0 tok/s | 865 tok/s | 2,744 tok/s |
 
-Decode is level with Ollama to about 9K tokens of context and falls behind
-deeper, where attention over the cache dominates. Prefill is several times
-slower: for more than one token the experts still run as one matvec per
-(token, expert) slot, re-reading each expert's weights for every token routed
-to it, where llama.cpp groups the tokens by expert. Before the decode graph,
+Decode is ahead of Ollama to about 9K tokens of context and slightly behind
+deeper, where attention over the cache dominates. Before the decode graph,
 the candle path decoded at 64, 38, 26 and 16 tok/s at depths 64, 2K, 10K and
-20K. The machine throttles under sustained load (the same build fell from
+20K.
+
+Prefill (more than one token at a time) keeps candle for the glue but runs
+its heavy parts on Flint's own kernels: the experts grouped by expert
+(`moe_grouped.metal`: `moe_group` sorts the slots by expert on the GPU, then
+one tiled matmul per 16-slot tile of an expert reads its weights once per
+tile, where one matvec per slot had re-read them for every token), and
+attention as `attn_prefill` (FlashAttention-style on simdgroup matrices,
+reading the f16 cache in place and masking from positions, so no mask
+tensor is built). Following llama.cpp, and by the user's decision, the
+tiled matmuls, the experts' gate/up and the prefill attention multiply in
+f16 with f32 accumulation; the down projections stay f32
+(`ops::matmul_exact`, `moe_mm_down`) because `SiLU(gate) * up` exceeds
+f16's range on the real file. Prefill went from 257, 347 and 229 tok/s at
+those depths to the figures above; it is still about two to three times
+slower than Ollama's, most of all deep in a context, where attention
+dominates. The machine throttles under sustained load (the same build fell from
 160 to 102 tok/s across back-to-back runs), so compare builds within one
 process or with cooldowns; `FINDINGS.md` has the method.
 

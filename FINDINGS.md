@@ -3944,3 +3944,30 @@ keeps the same experts cached and flatters the rate; `bench_depth` and
 command buffer, so once a step is one encoder only ablation (skipping
 groups of dispatches) splits its time; the shader profiler table needs a
 counter-enabled template.
+
+## Flint's prefill: grouped experts, fused attention, and where f16 breaks
+
+A 512-token prefill chunk spent most of its time in two places (M5 Max,
+2026-10-23): the experts, run as one matvec per (token, expert) slot, which
+re-read expert weights about 3,000 times a layer, and attention as candle
+ops over full score tensors plus two causal masks built on the CPU per
+forward (17 MB each at 8.5K of context). Grouping the slots by expert on the
+GPU and a FlashAttention-style kernel took prefill at 1.8K tokens of context
+from 257 to about 820 tok/s. A chunk routes about a dozen slots to each of
+the 256 experts, so 16-slot tiles beat 32-slot ones by 12%.
+
+f16 multiplies (f32 accumulation), as llama.cpp does, added 16 to 52% more,
+growing with depth, with two hazards:
+
+- Precision. f16 attention alone moved one probability 4.9e-2 from the f64
+  oracle, so f16 does not fit a 1e-3 criterion; the user moved parity to
+  argmax plus greedy agreement, as llama.cpp's own noise allows.
+- Range. The experts' down projection in f16 turned every logit to NaN on
+  the real file: its input, SiLU(gate) * up, exceeds f16's 65,504. Down
+  projections stay f32 (`ops::matmul_exact`, `moe_mm_down`); gate, up and
+  the projections of normalised inputs are safe.
+
+64-query attention threadgroups (instead of 32) measured no different, and
+running an A/B on a freshly built binary is unreliable on macOS: XProtect
+scans the new executable at 100% CPU, and one first run read 291 tok/s
+where the same build reads 1,133.
