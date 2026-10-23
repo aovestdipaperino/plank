@@ -55,3 +55,7 @@ workspace = true
 [[example]]
 name = "bench_kernels"
 required-features = ["candle"]
+
+[[example]]
+name = "bench_decode"
+required-features = ["candle"]
