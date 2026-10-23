@@ -29,7 +29,8 @@ impl Dense {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let g = ops::matmul(&self.gate, x)?.silu()?;
         let u = ops::matmul(&self.up, x)?;
-        ops::matmul(&self.down, &(g * u)?.contiguous()?)
+        // SiLU(gate) * up can exceed f16's range: keep this one in f32.
+        ops::matmul_exact(&self.down, &(g * u)?.contiguous()?)
     }
 }
 

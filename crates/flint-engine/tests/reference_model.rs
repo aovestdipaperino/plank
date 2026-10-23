@@ -18,13 +18,14 @@ use serde_json::Value;
 
 /// Probability tolerance on each of llama.cpp's top-5 first tokens (spec).
 const PROB_TOLERANCE: f64 = 0.005;
-/// Each of the f64 `NumPy` oracle's top-20 probabilities must be within this
-/// of ours, at every position. The user's decision: llama.cpp rounds
-/// activations to `Q8_0` (its NVFP4 matmuls run on the CPU) and keeps an f16
-/// KV, so it moves single probabilities by tenths and cannot be a precise
-/// per-position oracle (FINDINGS, "Flint against llama.cpp on the real
-/// file"); `tools/flint_numpy_ref.py` can.
-const NUMPY_TOLERANCE: f64 = 1e-3;
+/// A coarse bound on each of the f64 `NumPy` oracle's top-20 probabilities,
+/// a regression guard rather than the parity criterion. The user's decision
+/// (2026-10-23): prefill multiplies in f16 as llama.cpp does, which moves
+/// single probabilities by a few hundredths, so parity is the oracle's
+/// argmax at every position plus greedy agreement with llama.cpp, and this
+/// bound (still tighter than llama.cpp's own spread of up to 0.38) only
+/// catches a broken kernel. It was 1e-3 while every multiply was f32.
+const NUMPY_TOLERANCE: f64 = 0.1;
 
 fn fixture(name: &str) -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -183,7 +184,8 @@ fn first_tokens_and_the_long_greedy_run_match_llama_cpp() {
 }
 
 /// Prefill, then step through the oracle's forced tokens, checking the
-/// argmax and every top-20 probability at each of the positions.
+/// argmax at each of the positions, and every top-20 probability against
+/// the coarse [`NUMPY_TOLERANCE`].
 #[test]
 #[ignore = "needs the Flint GGUF: PLANK_FLINT_GGUF=path"]
 fn probabilities_match_the_f64_numpy_oracle() {

@@ -8,7 +8,9 @@
 // one tiled matmul per (MOE_GU_TN or MOE_DN_TN weight rows, tile), reading
 // each expert's weights once per tile instead of once per slot. A prefill
 // chunk routes about a dozen slots to each expert, so tiles are 16 slots,
-// not the dense matmul's 32. Compiled after
+// not the dense matmul's 32. Gate/up multiplies in f16 (weights decode
+// exactly into f16, the normalised input rounds to it), accumulating in
+// f32; down stays f32, since SiLU(gate) * up can exceed f16's range. Compiled after
 // nvfp4.metal, whose helpers and launch constants it uses (plus
 // GROUP_THREADS from metal.rs's prelude).
 
@@ -84,6 +86,61 @@ inline void load_weight_run(
     uint b,
     uint r,
     uint s,
+    threadgroup half *ws)
+{
+    threadgroup half *wd = ws + r * 64 + s * 16;
+    const uint row = n0 + r;
+    if (row < rows) {
+        device const uchar *blk = w + (ulong)row * row_bytes + b * 36;
+        const float d = ue4m3_to_f32(blk[s]);
+        device const uchar *qs = blk + 4 + s * 8;
+        for (uint j = 0; j < 8; ++j) {
+            const uchar q = qs[j];
+            wd[j] = half(KVALUES[q & 0xF] * d);
+            wd[j + 8] = half(KVALUES[q >> 4] * d);
+        }
+    } else {
+        for (uint j = 0; j < 16; ++j) {
+            wd[j] = 0.0h;
+        }
+    }
+}
+
+// Gathers this thread's 16-value run s of block b of slot r's input row
+// (row index `src`, of width k) into xs, zero for a dead slot.
+inline void load_input_run(
+    device const float *x,
+    uint src,
+    bool live,
+    uint k,
+    uint b,
+    uint r,
+    uint s,
+    threadgroup half *xs)
+{
+    threadgroup half *xd = xs + r * 64 + s * 16;
+    if (live) {
+        device const float *row = x + (ulong)src * k + b * 64 + s * 16;
+        for (uint j = 0; j < 16; ++j) {
+            xd[j] = half(row[j]);
+        }
+    } else {
+        for (uint j = 0; j < 16; ++j) {
+            xd[j] = 0.0h;
+        }
+    }
+}
+
+// load_weight_run and load_input_run into f32 staging, for the down
+// projection, whose input (SiLU(gate) * up) can exceed f16's range.
+inline void load_weight_run_f32(
+    device const uchar *w,
+    uint row_bytes,
+    uint n0,
+    uint rows,
+    uint b,
+    uint r,
+    uint s,
     threadgroup float *ws)
 {
     threadgroup float *wd = ws + r * 64 + s * 16;
@@ -104,9 +161,7 @@ inline void load_weight_run(
     }
 }
 
-// Gathers this thread's 16-value run s of block b of slot r's input row
-// (row index `src`, of width k) into xs, zero for a dead slot.
-inline void load_input_run(
+inline void load_input_run_f32(
     device const float *x,
     uint src,
     bool live,
@@ -150,9 +205,11 @@ kernel void moe_mm_gate_up(
     if (tg.y >= n_tiles[0]) {
         return;
     }
-    threadgroup float wsg[MOE_GU_TN * 64];
-    threadgroup float wsu[MOE_GU_TN * 64];
-    threadgroup float xs[MOE_TT * 64];
+    threadgroup half wsg[MOE_GU_TN * 64];
+    threadgroup half wsu[MOE_GU_TN * 64];
+    threadgroup half xs[MOE_TT * 64];
+    threadgroup float csg[MOE_TT * MOE_GU_TN];
+    threadgroup float csu[MOE_TT * MOE_GU_TN];
     const uint3 tile = tiles[tg.y];
     const uint e = tile.x;
     const uint n0 = tg.x * MOE_GU_TN;
@@ -177,12 +234,12 @@ kernel void moe_mm_gate_up(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 64; kk += 8) {
-            simdgroup_float8x8 a_g;
-            simdgroup_float8x8 a_u;
+            simdgroup_half8x8 a_g;
+            simdgroup_half8x8 a_u;
             simdgroup_load(a_g, wsg + sn * 64 + kk, 64);
             simdgroup_load(a_u, wsu + sn * 64 + kk, 64);
             for (uint j = 0; j < MOE_TT / 8; ++j) {
-                simdgroup_float8x8 bm;
+                simdgroup_half8x8 bm;
                 simdgroup_load(bm, xs + (j * 8) * 64 + kk, 64, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(ag[j], a_g, bm, ag[j]);
                 simdgroup_multiply_accumulate(au[j], a_u, bm, au[j]);
@@ -190,18 +247,18 @@ kernel void moe_mm_gate_up(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // The weight buffers are free now: stage C[t][n] for gate and up there.
+    // Stage C[t][n] for gate and up.
     for (uint j = 0; j < MOE_TT / 8; ++j) {
-        simdgroup_store(ag[j], wsg + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
-        simdgroup_store(au[j], wsu + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
+        simdgroup_store(ag[j], csg + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
+        simdgroup_store(au[j], csu + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint c = tid; c < MOE_TT * MOE_GU_TN; c += MM_THREADS) {
         const uint tt = c / MOE_GU_TN;
         const uint n = n0 + c % MOE_GU_TN;
         if (tt < tile.z && n < p.f) {
-            const float g = wsg[c] * gs[e];
-            const float u = wsu[c] * us[e];
+            const float g = csg[c] * gs[e];
+            const float u = csu[c] * us[e];
             h[(ulong)perm[tile.y + tt] * p.f + n] = g / (1.0f + exp(-g)) * u;
         }
     }
@@ -209,7 +266,7 @@ kernel void moe_mm_gate_up(
 
 // ys[slot][row] = route[slot] * ds[e] * down_e[row] . h[slot] for MOE_DN_TN
 // rows of one tile's expert and up to MOE_TT of its slots. Each simdgroup
-// computes a 16-row strip across the MOE_TT slots.
+// computes a 16-row strip across the MOE_TT slots, in f32.
 kernel void moe_mm_down(
     device const uchar *wd [[buffer(0)]],
     device const float *h [[buffer(1)]],
@@ -229,6 +286,7 @@ kernel void moe_mm_down(
     }
     threadgroup float ws[MOE_DN_TN * 64];
     threadgroup float xs[MOE_TT * 64];
+    threadgroup float cs[MOE_TT * MOE_DN_TN];
     const uint3 tile = tiles[tg.y];
     const uint e = tile.x;
     const uint n0 = tg.x * MOE_DN_TN;
@@ -247,10 +305,10 @@ kernel void moe_mm_down(
     const uint slot = live ? perm[tile.y + r] : 0;
     for (uint b = 0; b < p.f / 64; ++b) {
         for (uint rr = r; rr < MOE_DN_TN; rr += MM_THREADS / 4) {
-            load_weight_run(wd + base, p.down_row_bytes, n0, p.d, b, rr, s, ws);
+            load_weight_run_f32(wd + base, p.down_row_bytes, n0, p.d, b, rr, s, ws);
         }
         if (loads_x) {
-            load_input_run(h, slot, live, p.f, b, r, s, xs);
+            load_input_run_f32(h, slot, live, p.f, b, r, s, xs);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 64; kk += 8) {
@@ -270,7 +328,7 @@ kernel void moe_mm_down(
     }
     for (uint i = 0; i < 2; ++i) {
         for (uint j = 0; j < MOE_TT / 8; ++j) {
-            simdgroup_store(acc[i][j], ws + (j * 8) * MOE_DN_TN + (sn + i * 8), MOE_DN_TN, ulong2(0, 0), true);
+            simdgroup_store(acc[i][j], cs + (j * 8) * MOE_DN_TN + (sn + i * 8), MOE_DN_TN, ulong2(0, 0), true);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -279,7 +337,7 @@ kernel void moe_mm_down(
         const uint n = n0 + c % MOE_DN_TN;
         if (tt < tile.z && n < p.d) {
             const uint sl = perm[tile.y + tt];
-            ys[(ulong)sl * p.d + n] = ws[c] * ds[e] * route[sl];
+            ys[(ulong)sl * p.d + n] = cs[c] * ds[e] * route[sl];
         }
     }
 }

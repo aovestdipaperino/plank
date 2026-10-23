@@ -16,6 +16,20 @@ use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 /// `x` not `[tokens, cols]` f32 contiguous, a weight with several experts,
 /// or a device failure.
 pub fn matmul(w: &Arc<NvWeight>, x: &Tensor) -> candle_core::Result<Tensor> {
+    matmul_with(w, x, false)
+}
+
+/// [`matmul`] kept in f32 on Metal for any token count, for an input that
+/// can exceed f16's range (a down projection's `SiLU(gate) * up`); the
+/// plain one multiplies many tokens in f16.
+///
+/// # Errors
+/// As [`matmul`].
+pub fn matmul_exact(w: &Arc<NvWeight>, x: &Tensor) -> candle_core::Result<Tensor> {
+    matmul_with(w, x, true)
+}
+
+fn matmul_with(w: &Arc<NvWeight>, x: &Tensor, exact: bool) -> candle_core::Result<Tensor> {
     let dims = mat_dims(w, x.layout())?;
     if dims.tokens == 0 {
         // Nothing to compute: an empty result, without binding or dispatching.
@@ -24,7 +38,10 @@ pub fn matmul(w: &Arc<NvWeight>, x: &Tensor) -> candle_core::Result<Tensor> {
         }
         return Tensor::zeros((0, w.rows()), DType::F32, x.device());
     }
-    x.apply_op1_no_bwd(&MatmulOp { w: Arc::clone(w) })
+    x.apply_op1_no_bwd(&MatmulOp {
+        w: Arc::clone(w),
+        exact,
+    })
 }
 
 /// The gathered `MoE` over `x [tokens, hidden]` with `ids [tokens, k]` (u32)
@@ -130,6 +147,8 @@ pub(crate) fn moe_dims(
 #[derive(Debug)]
 struct MatmulOp {
     w: Arc<NvWeight>,
+    /// Multiply in f32 on Metal even from `MM_MIN_TOKENS` up.
+    exact: bool,
 }
 
 impl CustomOp1 for MatmulOp {
@@ -161,7 +180,7 @@ impl CustomOp1 for MatmulOp {
         l: &Layout,
     ) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
         let dims = mat_dims(&self.w, l)?;
-        crate::nvfp4::metal::matmul(&self.w, s, dims)
+        crate::nvfp4::metal::matmul(&self.w, s, dims, self.exact)
     }
 }
 

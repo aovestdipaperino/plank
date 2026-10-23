@@ -365,9 +365,12 @@ pub(crate) fn prefill_attend(
     // Whole 32-row blocks of queries per head; the padding rows come out
     // zero and are cut off below.
     let t_pad = t.div_ceil(PF_Q) * PF_Q;
+    // With an f16 cache the kernel multiplies in f16 (accumulating in f32),
+    // so the queries go to f16 too.
+    let query = query.to_dtype(key.dtype())?;
     let query = if t_pad > t {
         let pad = Tensor::zeros((1, heads, t_pad - t, d), query.dtype(), query.device())?;
-        Tensor::cat(&[query, &pad], 2)?
+        Tensor::cat(&[&query, &pad], 2)?
     } else {
         query.contiguous()?
     };
@@ -393,7 +396,7 @@ pub(crate) fn prefill_attend(
     };
     let queries = PrefillQueries {
         storage: q_metal,
-        offset: q_layout.start_offset() * 4,
+        offset: q_layout.start_offset() * query.dtype().size_in_bytes(),
         t,
         t_pad,
         pos0: q_pos0,
@@ -800,7 +803,9 @@ mod tests {
                 .zip(&got)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
-            assert!(worst < 1e-4, "case {case}: max diff {worst}");
+            // An f16 cache multiplies in f16.
+            let tol = if half { 3e-3 } else { 1e-4 };
+            assert!(worst < tol, "case {case}: max diff {worst}");
         }
     }
 

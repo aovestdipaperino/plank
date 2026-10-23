@@ -418,6 +418,144 @@ inline void attn_prefill_impl(
     }
 }
 
+// The prefill kernel for an f16 cache: Q, K, V and P multiply in f16, as
+// llama.cpp does, with scores and outputs accumulated in f32; q is f16.
+// Otherwise as attn_prefill_impl.
+inline void attn_prefill_half(
+    device const half *q,
+    device const half *k,
+    device const half *v,
+    device const float *sinks,
+    device float *out,
+    constant PrefillParams &p,
+    uint2 tg,
+    uint tid,
+    uint sg,
+    uint lane,
+    threadgroup half *kv,
+    threadgroup float *scr,
+    threadgroup half *ph)
+{
+    const uint D = ATTN_HEAD_DIM;
+    const uint h = tg.y;
+    const uint kvh = h / p.rep;
+    const uint row0 = tg.x * PF_Q + sg * 8;
+    simdgroup_half8x8 qt[ATTN_HEAD_DIM / 8];
+    simdgroup_float8x8 o[ATTN_HEAD_DIM / 8];
+    device const half *qh = q + ((ulong)h * p.t_pad + row0) * D;
+    for (uint i = 0; i < D / 8; ++i) {
+        simdgroup_load(qt[i], qh + i * 8, D);
+        o[i] = simdgroup_float8x8(0.0f);
+    }
+    const float sink = sinks[h];
+    float m[8];
+    float l[8];
+    for (uint r = 0; r < 8; ++r) {
+        m[r] = sink;
+        l[r] = 1.0f;
+    }
+    const uint qmin = p.q_pos0 + tg.x * PF_Q;
+    const uint hi = min(p.q_pos0 + p.t, qmin + PF_Q);
+    uint lo = p.key_base;
+    if (p.window != 0 && qmin + 1 > p.window) {
+        lo = max(lo, qmin + 1 - p.window);
+    }
+    device const half *kh = k + (ulong)kvh * p.kv_head_stride;
+    device const half *vh = v + (ulong)kvh * p.kv_head_stride;
+    threadgroup float *sc = scr + sg * 8 * PF_K;
+    threadgroup float *dg = scr + 4 * 8 * PF_K + sg * 64;
+    threadgroup half *pp = ph + sg * 8 * PF_K;
+    for (uint kb = lo; kb < hi; kb += PF_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < PF_K * D / 4; i += PF_THREADS) {
+            const uint kp = kb + (i * 4) / D;
+            ((threadgroup half4 *)kv)[i] = kp < hi
+                ? ((device const half4 *)(kh + (ulong)(kp - p.key_base) * D))[i % (D / 4)]
+                : half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < PF_K / 8; ++j) {
+            simdgroup_float8x8 s = simdgroup_float8x8(0.0f);
+            for (uint i = 0; i < D / 8; ++i) {
+                simdgroup_half8x8 kt;
+                simdgroup_load(kt, kv + (j * 8) * D + i * 8, D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qt[i], kt, s);
+            }
+            simdgroup_store(s, sc + j * 8, PF_K);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint kp = kb + lane;
+        float corr[8];
+        for (uint r = 0; r < 8; ++r) {
+            const uint qi = row0 + r;
+            const uint qp = p.q_pos0 + qi;
+            const bool seen = qi < p.t && kp < hi && kp <= qp && (p.window == 0 || qp - kp < p.window);
+            const float sv = seen ? sc[r * PF_K + lane] * p.scale : -INFINITY;
+            const float mn = max(m[r], simd_max(sv));
+            corr[r] = exp(m[r] - mn);
+            const float pv = exp(sv - mn);
+            l[r] = l[r] * corr[r] + simd_sum(pv);
+            m[r] = mn;
+            pp[r * PF_K + lane] = half(pv);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < PF_K * D / 4; i += PF_THREADS) {
+            const uint kp2 = kb + (i * 4) / D;
+            ((threadgroup half4 *)kv)[i] = kp2 < hi
+                ? ((device const half4 *)(vh + (ulong)(kp2 - p.key_base) * D))[i % (D / 4)]
+                : half4(0.0h);
+        }
+        for (uint e = lane; e < 64; e += SIMD_WIDTH) {
+            dg[e] = e % 9 == 0 ? corr[e / 9] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dm;
+        simdgroup_load(dm, dg, 8);
+        simdgroup_half8x8 pm[PF_K / 8];
+        for (uint j = 0; j < PF_K / 8; ++j) {
+            simdgroup_load(pm[j], pp + j * 8, PF_K);
+        }
+        for (uint i = 0; i < D / 8; ++i) {
+            simdgroup_multiply(o[i], dm, o[i]);
+            for (uint j = 0; j < PF_K / 8; ++j) {
+                simdgroup_half8x8 vt;
+                simdgroup_load(vt, kv + (j * 8) * D + i * 8, D);
+                simdgroup_multiply_accumulate(o[i], pm[j], vt, o[i]);
+            }
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lane; e < 64; e += SIMD_WIDTH) {
+        dg[e] = e % 9 == 0 ? 1.0f / l[e / 9] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dm;
+    simdgroup_load(dm, dg, 8);
+    device float *oh = out + ((ulong)h * p.t_pad + row0) * D;
+    for (uint i = 0; i < D / 8; ++i) {
+        simdgroup_multiply(o[i], dm, o[i]);
+        simdgroup_store(o[i], oh + i * 8, D);
+    }
+}
+
+kernel void attn_prefill_h(
+    device const half *q [[buffer(0)]],
+    device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]],
+    device const float *sinks [[buffer(3)]],
+    device float *out [[buffer(4)]],
+    constant PrefillParams &p [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup half kv[PF_K * ATTN_HEAD_DIM];
+    threadgroup float scr[4 * 8 * PF_K + 4 * 64];
+    threadgroup half ph[4 * 8 * PF_K];
+    attn_prefill_half(q, k, v, sinks, out, p, tg, tid, sg, lane, kv, scr, ph);
+}
+
 #define ATTN_PREFILL_KERNEL(NAME, T)                                           \
     kernel void NAME(                                                          \
         device const float *q [[buffer(0)]],                                   \
@@ -437,4 +575,3 @@ inline void attn_prefill_impl(
     }
 
 ATTN_PREFILL_KERNEL(attn_prefill_f32, float)
-ATTN_PREFILL_KERNEL(attn_prefill_f16, half)

@@ -159,6 +159,7 @@ fn source() -> String {
 pub(crate) struct Pipelines {
     pub mv: ComputePipeline,
     pub mm: ComputePipeline,
+    pub mm_f32: ComputePipeline,
     pub moe_gate_up: ComputePipeline,
     pub moe_down: ComputePipeline,
     pub moe_sum: ComputePipeline,
@@ -224,6 +225,7 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
     let p = Arc::new(Pipelines {
         mv: get("mv_nvfp4", MV_THREADS)?,
         mm: get("mm_nvfp4", MM_THREADS)?,
+        mm_f32: get("mm_nvfp4_f32", MM_THREADS)?,
         moe_gate_up: get("moe_gate_up", MV_THREADS)?,
         moe_down: get("moe_down", MV_THREADS)?,
         moe_sum: get("moe_sum", SUM_THREADS)?,
@@ -239,7 +241,7 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
         dec_combine_norm: get("dec_combine_norm", NORM_THREADS)?,
         moe_group: get("moe_group", GROUP_THREADS)?,
         attn_prefill: get("attn_prefill_f32", PF_THREADS)?,
-        attn_prefill_f16: get("attn_prefill_f16", PF_THREADS)?,
+        attn_prefill_f16: get("attn_prefill_h", PF_THREADS)?,
         moe_mm_gate_up: get("moe_mm_gate_up", MM_THREADS)?,
         moe_mm_down: get("moe_mm_down", MM_THREADS)?,
     });
@@ -397,11 +399,13 @@ pub(crate) struct MatParams {
     pub(crate) scale: f32,
 }
 
-/// `x [tokens, cols]` times a dense weight on the GPU.
+/// `x [tokens, cols]` times a dense weight on the GPU. From `MM_MIN_TOKENS`
+/// up the tiled kernel multiplies in f16 unless `exact` asks for f32.
 pub(crate) fn matmul(
     w: &NvWeight,
     x: &MetalStorage,
     dims: MatDims,
+    exact: bool,
 ) -> candle_core::Result<(MetalStorage, Shape)> {
     if x.dtype() != DType::F32 {
         candle_core::bail!("nvfp4 matmul wants f32 input");
@@ -431,7 +435,7 @@ pub(crate) fn matmul(
             grid(MV_THREADS, 1),
         );
     } else {
-        enc.set_compute_pipeline_state(&pipes.mm);
+        enc.set_compute_pipeline_state(if exact { &pipes.mm_f32 } else { &pipes.mm });
         enc.dispatch_thread_groups(
             grid(n.div_ceil(MM_TILE), tokens.div_ceil(MM_TILE)),
             grid(MM_THREADS, 1),
@@ -579,7 +583,7 @@ struct PrefillParams {
 }
 
 /// Where prefill attention's queries sit: `[heads][t_pad][ATTN_HEAD_DIM]`
-/// f32 from `offset` bytes, `t` of each head's `t_pad` rows live, the first
+/// in the cache's element type from `offset` bytes, `t` of each head's `t_pad` rows live, the first
 /// at absolute position `pos0`.
 pub(crate) struct PrefillQueries<'a> {
     pub storage: &'a MetalStorage,
@@ -604,7 +608,8 @@ pub(crate) fn prefill_attention(
     scale: f32,
 ) -> candle_core::Result<MetalStorage> {
     let kv_dtype = k.storage.dtype();
-    if q.storage.dtype() != DType::F32
+    // Queries come in the cache's type: f16 multiplies with an f16 cache.
+    if q.storage.dtype() != kv_dtype
         || v.storage.dtype() != kv_dtype
         || !matches!(kv_dtype, DType::F32 | DType::F16)
         || kv_heads == 0

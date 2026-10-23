@@ -887,10 +887,12 @@ mod tests {
             .unwrap();
         let mut s = Session::new(model_on(&dev, 0.5, 4), 64);
         let gpu = s.prefill(&PROMPT, &|| false).unwrap().unwrap();
-        assert!(close(&gpu, &cpu, 1e-3));
+        // Metal's prefill multiplies in f16 (accumulating in f32), as
+        // llama.cpp does, so it agrees with the f32 CPU to about 1e-2.
+        assert!(close(&gpu, &cpu, 2e-2));
         let mut c = Session::new(model(), 64);
         c.prefill(&PROMPT, &|| false).unwrap();
-        assert!(close(&s.step(42).unwrap(), &c.step(42).unwrap(), 1e-3));
+        assert!(close(&s.step(42).unwrap(), &c.step(42).unwrap(), 2e-2));
     }
 
     /// The decode graph against the candle path on Metal, step by step past

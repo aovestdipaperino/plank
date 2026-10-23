@@ -101,22 +101,27 @@ kernel void mv_nvfp4(
 static_assert(MM_THREADS == 4 * MM_TN && MM_TN == MM_TT, "mm_nvfp4 thread mapping");
 static_assert(MM_TN == 32, "mm_nvfp4 uses a 2x2 grid of 16x16 simdgroup patches");
 
+// mm_nvfp4 stages in f16, as llama.cpp's matmul does: the weights decode
+// exactly into f16 and the activations round to it, and the products
+// accumulate in f32. mm_nvfp4_f32 stages in f32, for inputs that can exceed
+// f16's range (a down projection's SiLU(gate) * up).
 // MM_THREADS threads = 4 simdgroups in a 2x2 arrangement, each owning a
 // 16x16 patch of the MM_TN x MM_TT (rows x tokens) output tile as 2x2 8x8
 // f32 matrices. Each step decodes one 64-value block column of MM_TN weight
 // rows into threadgroup memory next to the matching MM_TT tokens of x.
-kernel void mm_nvfp4(
-    device const uchar *w [[buffer(0)]],
-    device const float *x [[buffer(1)]],
-    device float *y [[buffer(2)]],
-    constant MatParams &p [[buffer(3)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]])
+template <typename T>
+inline void mm_impl(
+    device const uchar *w,
+    device const float *x,
+    device float *y,
+    constant MatParams &p,
+    uint3 tg,
+    uint tid,
+    uint sg,
+    threadgroup T *ws,
+    threadgroup T *xs,
+    threadgroup float *cs)
 {
-    threadgroup float ws[MM_TN * 64];
-    threadgroup float xs[MM_TT * 64];
-    threadgroup float cs[MM_TT * MM_TN];
     uint n0 = tg.x * MM_TN;
     uint t0 = tg.y * MM_TT;
     uint sn = (sg & 1) * 16;
@@ -131,7 +136,7 @@ kernel void mm_nvfp4(
     uint s = tid % 4; // 0..3: which 16-value run
     uint nb = p.k / 64;
     for (uint b = 0; b < nb; ++b) {
-        threadgroup float *wd = ws + r * 64 + s * 16;
+        threadgroup T *wd = ws + r * 64 + s * 16;
         uint row = n0 + r;
         if (row < p.n) {
             device const uchar *blk = w + (ulong)row * p.row_bytes + b * 36;
@@ -139,30 +144,30 @@ kernel void mm_nvfp4(
             device const uchar *qs = blk + 4 + s * 8;
             for (uint j = 0; j < 8; ++j) {
                 uchar q = qs[j];
-                wd[j] = KVALUES[q & 0xF] * d;
-                wd[j + 8] = KVALUES[q >> 4] * d;
+                wd[j] = T(KVALUES[q & 0xF] * d);
+                wd[j + 8] = T(KVALUES[q >> 4] * d);
             }
         } else {
             for (uint j = 0; j < 16; ++j) {
-                wd[j] = 0.0f;
+                wd[j] = T(0.0f);
             }
         }
-        threadgroup float *xd = xs + r * 64 + s * 16;
+        threadgroup T *xd = xs + r * 64 + s * 16;
         uint t = t0 + r;
         if (t < p.tokens) {
             device const float *src = x + (ulong)t * p.k + b * 64 + s * 16;
             for (uint j = 0; j < 16; ++j) {
-                xd[j] = src[j];
+                xd[j] = T(src[j]);
             }
         } else {
             for (uint j = 0; j < 16; ++j) {
-                xd[j] = 0.0f;
+                xd[j] = T(0.0f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 64; kk += 8) {
-            simdgroup_float8x8 a[2];
-            simdgroup_float8x8 bm[2];
+            simdgroup_matrix<T, 8, 8> a[2];
+            simdgroup_matrix<T, 8, 8> bm[2];
             for (uint i = 0; i < 2; ++i) {
                 // A[n][k] straight from ws.
                 simdgroup_load(a[i], ws + (sn + i * 8) * 64 + kk, 64);
@@ -196,6 +201,25 @@ kernel void mm_nvfp4(
         }
     }
 }
+
+#define MM_KERNEL(NAME, T)                                                     \
+    kernel void NAME(                                                          \
+        device const uchar *w [[buffer(0)]],                                   \
+        device const float *x [[buffer(1)]],                                   \
+        device float *y [[buffer(2)]],                                         \
+        constant MatParams &p [[buffer(3)]],                                   \
+        uint3 tg [[threadgroup_position_in_grid]],                             \
+        uint tid [[thread_index_in_threadgroup]],                              \
+        uint sg [[simdgroup_index_in_threadgroup]])                            \
+    {                                                                          \
+        threadgroup T ws[MM_TN * 64];                                          \
+        threadgroup T xs[MM_TT * 64];                                          \
+        threadgroup float cs[MM_TT * MM_TN];                                   \
+        mm_impl<T>(w, x, y, p, tg, tid, sg, ws, xs, cs);                       \
+    }
+
+MM_KERNEL(mm_nvfp4, half)
+MM_KERNEL(mm_nvfp4_f32, float)
 
 struct MoeParams {
     uint d;                 // model width (gate/up columns, down rows)
