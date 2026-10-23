@@ -4841,6 +4841,7 @@ dependencies = [
  "crt-off",
  "edit",
  "extism",
+ "flint-engine",
  "gemma-engine",
  "gguf-delta",
  "git2",

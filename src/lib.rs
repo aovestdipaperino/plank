@@ -84,6 +84,10 @@ pub mod feedback;
 /// The ds4 C API, re-exported from `crates/local-inference-engine` so `crate::ffi` paths
 /// keep working.
 pub use local_inference_engine::ffi;
+/// Flint behind [`engine::Engine`], over the native-Rust `flint-engine`
+/// crate (candle on Metal). On by default, like Gemma.
+#[cfg(feature = "flint")]
+pub mod flintengine;
 pub mod framebridge;
 /// Gemma 4 behind [`engine::Engine`], over the native-Rust `gemma-engine`
 /// crate (candle on Metal). Needs no submodule, so it is on by default.
@@ -120,8 +124,8 @@ pub mod mempressure;
 pub mod miniedit;
 pub mod names;
 /// A native-Rust model behind [`engine::Engine`], generic over its family
-/// (Gemma today): the transcript reconcile, the KV and the warm walk.
-#[cfg(feature = "gemma")]
+/// (Gemma and Flint): the transcript reconcile, the KV and the warm walk.
+#[cfg(any(feature = "gemma", feature = "flint"))]
 pub mod nativeengine;
 pub mod notify;
 #[cfg(feature = "use_obscura")]

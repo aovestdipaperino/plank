@@ -33,7 +33,7 @@ rust-version = "1.93"
 exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
-default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins", "gemma"]
+default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins", "gemma", "flint"]
 # Image pasting (Cmd-V clipboard images, image file paths). This was off while
 # the model had no way to act on an image-file reference — the attachment named
 # a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
@@ -77,6 +77,11 @@ plugins = ["dep:extism"]
 # `GemmaEngine` behind `Engine`. On by default; it needs no submodule and no C,
 # so it builds wherever plank does. `--no-default-features` drops candle.
 gemma = ["dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/gemma"]
+# Flint in native Rust (`crates/flint-engine`, candle on Metal): the
+# `FlintEngine` behind `Engine`. On by default, like `gemma`. It runs on
+# `nativeengine`, whose session and sampler are gemma-engine's, so it pulls
+# gemma-engine in too (without the `local-inference-engine` Gemma half).
+flint = ["dep:flint-engine", "flint-engine/candle", "dep:gemma-engine", "gemma-engine/candle"]
 # Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
 # the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
 # sidecar wiring, and the downloader's Qwen artifacts.
@@ -104,6 +109,7 @@ gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
 turbo-debug-client = "0.2.1"
 libc = "0.2"
 gemma-engine = { path = "crates/gemma-engine", optional = true }
+flint-engine = { path = "crates/flint-engine", optional = true }
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
 # produces more rows than a char-packing estimate).
@@ -231,6 +237,7 @@ extism = { version = "1.30", default-features = false, features = [
 [dev-dependencies]
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0", features = ["testing"] }
 gemma-engine = { path = "crates/gemma-engine", features = ["testgguf"] }
+flint-engine = { path = "crates/flint-engine", features = ["testgguf"] }
 
 [lints]
 workspace = true
