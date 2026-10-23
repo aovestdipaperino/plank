@@ -236,6 +236,36 @@ pub fn evaluate(
         .collect()
 }
 
+/// The page a Metal no-copy buffer is bound in on Apple silicon. The open-time
+/// check (`flintengine`) compares the mapping rounded up to whole pages, so
+/// the menu rounds the same way and never offers a file the open refuses.
+const METAL_PAGE_BYTES: u64 = 16 * 1024;
+
+/// Why this build cannot run an engine of catalog `family`, or `None` when it
+/// can. No hint means the C engine. A hint this build does not know is
+/// refused rather than handed to the C engine: a newer catalog can name a
+/// family a released binary has never heard of, and treating it as `DeepSeek`
+/// would download the file only for the open to fail.
+fn unsupported_family(family: Option<&str>, caps: BuildCaps) -> Option<String> {
+    let (supported, feature) = match family {
+        None => (caps.ds4, None),
+        Some("gemma") => (caps.gemma, Some("gemma")),
+        Some("flint") => (caps.flint, Some("flint")),
+        Some(other) => {
+            return Some(format!(
+                "needs a newer plank (unknown engine family \"{other}\")"
+            ));
+        }
+    };
+    if supported {
+        return None;
+    }
+    Some(feature.map_or_else(
+        || "not supported by this build".to_owned(),
+        |f| format!("built without {f}"),
+    ))
+}
+
 fn fit_of(
     entry: &EngineEntry,
     sel: &crate::engines::Selection,
@@ -275,15 +305,8 @@ fn fit_of(
     }
     let family = raw_str(entry, "family");
     let native = matches!(family.as_deref(), Some("gemma" | "flint"));
-    let supported = match family.as_deref() {
-        Some("gemma") => m.caps.gemma,
-        Some("flint") => m.caps.flint,
-        _ => m.caps.ds4,
-    };
-    if !supported {
-        return Fit::Disabled {
-            reason: "not supported by this build".to_owned(),
-        };
+    if let Some(reason) = unsupported_family(family.as_deref(), m.caps) {
+        return Fit::Disabled { reason };
     }
     if let Some(ram) = m.ram {
         let need = if native {
@@ -307,7 +330,7 @@ fn fit_of(
     }
     if family.as_deref() == Some("flint")
         && let (Some(lim), Some(main)) = (m.metal_max_buffer, entry.files.get("main"))
-        && main.bytes > lim
+        && main.bytes.div_ceil(METAL_PAGE_BYTES) * METAL_PAGE_BYTES > lim
     {
         return Fit::Disabled {
             reason: format!(
@@ -451,7 +474,77 @@ mod tests {
         assert_eq!(
             flint_row(&m).fit,
             Fit::Disabled {
-                reason: "not supported by this build".into()
+                reason: "built without flint".into()
+            }
+        );
+    }
+
+    /// The open-time check rounds the file up to whole 16 KiB pages; a file
+    /// whose raw size fits but whose rounded size does not is refused here
+    /// too, not offered and then refused at open.
+    #[test]
+    fn flint_within_a_page_of_the_gpu_buffer_is_disabled() {
+        let mut m = machine(Some(64), Some(500));
+        // The FLINT main is 22863084160 bytes, not a multiple of 16 KiB.
+        m.metal_max_buffer = Some(22_863_084_160);
+        assert!(!flint_row(&m).selectable());
+        m.metal_max_buffer = Some(22_863_084_160_u64.div_ceil(16 * 1024) * 16 * 1024);
+        assert!(flint_row(&m).selectable());
+    }
+
+    fn family_row(family: &str, caps: BuildCaps) -> EngineRow {
+        let json = format!(
+            r#"{{"version": 9, "engines": {{"future": {{"version": 1, "family": "{family}",
+              "main": {{"name": "f.gguf", "url": "https://h/f", "bytes": 1000,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}}}}"#
+        );
+        let mut w = Vec::new();
+        let cat = parse(&json, Layer::Published, &mut w).expect("parses");
+        let mut m = machine(Some(512), Some(500));
+        m.caps = caps;
+        let rows = evaluate(Path::new("/r"), &cat, &m, &none, None, &no_staged);
+        row(&rows, "future").clone()
+    }
+
+    /// A family hint this build does not know is refused, never routed to the
+    /// C engine, even on a machine that has it and the RAM for it.
+    #[test]
+    fn an_unknown_family_needs_a_newer_plank() {
+        let all = BuildCaps {
+            ds4: true,
+            gemma: true,
+            flint: true,
+        };
+        assert_eq!(
+            family_row("nova", all).fit,
+            Fit::Disabled {
+                reason: "needs a newer plank (unknown engine family \"nova\")".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_compiled_out_native_family_names_its_feature() {
+        let no_gemma = BuildCaps {
+            ds4: true,
+            gemma: false,
+            flint: true,
+        };
+        assert_eq!(
+            family_row("gemma", no_gemma).fit,
+            Fit::Disabled {
+                reason: "built without gemma".into()
+            }
+        );
+        let only_ds4 = BuildCaps {
+            ds4: true,
+            gemma: false,
+            flint: false,
+        };
+        assert_eq!(
+            family_row("flint", only_ds4).fit,
+            Fit::Disabled {
+                reason: "built without flint".into()
             }
         );
     }

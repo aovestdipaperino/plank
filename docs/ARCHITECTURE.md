@@ -150,6 +150,13 @@ A fourth family, Flint (`ModelFamily::Flint`, `ToolSyntax::Flint`,
 as the Gemma ones, and the shape name the engine reports (`Flint …`, from
 `general.name`) selects the dialect. See `docs/FLINT.md`.
 
+A `family` hint the build does not know is never taken for DeepSeek: the
+engine menu (`enginefit::fit_of`) shows such an entry disabled, as "needs a
+newer plank", so a catalog published ahead of a release cannot send an
+older binary to download a model it would then fail to open. A known native
+family whose feature is compiled out reads "built without gemma" or "built
+without flint".
+
 The second family is DeepSeek V4.1 Flash. It is not a revision of V4 but a
 separate model: different weights, tokenizer and vision encoder, and its own
 DSML dialect (the same markers respelled with a leading space). Nothing
