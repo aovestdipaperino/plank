@@ -915,8 +915,9 @@ fn select_session_family(cfg: &plank::config::AgentConfig) {
 }
 
 /// The model family a selection runs as: the file's own when it is on disk,
-/// else the catalog's declared `family` (so a Gemma engine not downloaded yet
-/// still routes to `GemmaEngine` and names `.gemma.kv` files), else `Ds4`.
+/// else the catalog's declared `family` (so a Gemma or Flint engine not
+/// downloaded yet still routes to its native engine and names `.gemma.kv` or
+/// `.flint.kv` files), else `Ds4`.
 fn selection_family(
     sel: &plank::engines::Selection,
     path: &std::path::Path,
@@ -925,6 +926,8 @@ fn selection_family(
         plank::gguf::family_of(path)
     } else if sel.family.as_deref() == Some("gemma") {
         plank::gguf::ModelFamily::Gemma
+    } else if sel.family.as_deref() == Some("flint") {
+        plank::gguf::ModelFamily::Flint
     } else {
         plank::gguf::ModelFamily::Ds4
     }
@@ -1518,10 +1521,11 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     if cfg.fake_gpu {
         return Ok((make_fake_engine(cfg), None));
     }
-    // Gemma first, in both cfgs: none of the DeepSeek-sized gates below apply.
-    #[cfg(feature = "gemma")]
-    if let Some(gemma) = route_gemma(cfg) {
-        return gemma;
+    // The native families first, in both cfgs: none of the DeepSeek-sized
+    // gates below apply to Gemma or Flint.
+    #[cfg(any(feature = "gemma", feature = "flint"))]
+    if let Some(native) = route_native(cfg) {
+        return native;
     }
     #[cfg(ds4_engine)]
     {
@@ -1659,8 +1663,8 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
 }
 
 /// The echo stub, on a build without the ds4 engine. A named model is refused
-/// rather than silently answered by the stub; a Gemma model never gets here
-/// (see [`route_gemma`]).
+/// rather than silently answered by the stub; a Gemma or Flint model never
+/// gets here (see [`route_native`]).
 #[cfg(not(ds4_engine))]
 fn make_echo_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     if let Some(model) = &cfg.model_spec {
@@ -1674,58 +1678,101 @@ fn make_echo_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
 /// A local engine and the factory that reopens it after a GPU yield.
 type LocalEngine = (Box<dyn Engine>, Option<plank::gpuyield::ReopenFn>);
 
-/// Opens the model on `GemmaEngine` when it is a Gemma model, `None` when it
-/// is not. Decided ahead of every DeepSeek-sized gate in
-/// [`make_local_engine`] (the RAM floor and the single-instance model lock).
-#[cfg(feature = "gemma")]
-fn route_gemma(cfg: &AgentConfig) -> Option<Result<LocalEngine, String>> {
+/// Opens the model on its native Rust engine when it is a Gemma or Flint
+/// model, `None` when it is neither. Decided ahead of every DeepSeek-sized
+/// gate in [`make_local_engine`] (the RAM floor and the single-instance model
+/// lock).
+#[cfg(any(feature = "gemma", feature = "flint"))]
+fn route_native(cfg: &AgentConfig) -> Option<Result<LocalEngine, String>> {
     let model = cfg.model_path.clone()?;
     let sel = cfg.selection.as_ref()?;
-    (selection_family(sel, &model) == plank::gguf::ModelFamily::Gemma)
-        .then(|| make_gemma_engine(cfg, sel, model))
+    match selection_family(sel, &model) {
+        #[cfg(feature = "gemma")]
+        plank::gguf::ModelFamily::Gemma => Some(make_gemma_engine(cfg, sel, model)),
+        #[cfg(feature = "flint")]
+        plank::gguf::ModelFamily::Flint => Some(make_flint_engine(cfg, sel, model)),
+        _ => None,
+    }
 }
 
 /// Loads a Gemma 4 model on [`plank::gemmaengine::GemmaEngine`].
 ///
-/// Downloads a missing managed main like the ds4 path does, but takes none of
-/// its DeepSeek-sized gates and no side artifacts: Gemma has no `mtp` or
-/// `vision` companion. The reopen factory only re-checks the file, since the
-/// native engine holds no process lock.
-///
 /// # Errors
-/// When the model is absent and cannot be fetched, or fails to open.
+/// As [`make_native_engine`].
 #[cfg(feature = "gemma")]
 fn make_gemma_engine(
     cfg: &AgentConfig,
     sel: &plank::engines::Selection,
     model: std::path::PathBuf,
 ) -> Result<LocalEngine, String> {
-    use plank::gemmaengine::GemmaEngine;
+    make_native_engine::<plank::gemmaengine::GemmaFamily>(cfg, sel, model)
+}
+
+/// Loads a Flint model on [`plank::flintengine::FlintEngine`].
+///
+/// # Errors
+/// As [`make_native_engine`].
+#[cfg(feature = "flint")]
+fn make_flint_engine(
+    cfg: &AgentConfig,
+    sel: &plank::engines::Selection,
+    model: std::path::PathBuf,
+) -> Result<LocalEngine, String> {
+    make_native_engine::<plank::flintengine::FlintFamily>(cfg, sel, model)
+}
+
+/// Loads a model on the native Rust engine of family `F`
+/// ([`plank::nativeengine::NativeEngine`]).
+///
+/// Downloads a missing managed main like the ds4 path does, but takes none of
+/// its DeepSeek-sized gates and no side artifacts: neither Gemma nor Flint has
+/// an `mtp` or `vision` companion. The reopen factory only re-checks the file,
+/// since the native engine holds no process lock.
+///
+/// # Errors
+/// When the model is absent and cannot be fetched, or fails to open.
+#[cfg(any(feature = "gemma", feature = "flint"))]
+fn make_native_engine<F: plank::nativeengine::NativeFamily>(
+    cfg: &AgentConfig,
+    sel: &plank::engines::Selection,
+    model: std::path::PathBuf,
+) -> Result<LocalEngine, String> {
+    use plank::nativeengine::NativeEngine;
     plank::download::check_manifest_at_startup(sel);
     plank::downloader::spawn_watcher();
     plank::download::ensure_model(sel)?;
     eprintln!("plank: loading model {}...", model.display());
     // With no explicit `-c`, the configured window is the DeepSeek default
     // (1,048,576 tokens) and says nothing about this model: `0` lets the
-    // engine size it from the RAM (`gemmaengine::default_ctx`).
+    // engine size it from the RAM (`nativeengine::default_ctx`), under the
+    // family's own cap when it has one.
     let ctx = if cfg.ctx_size_explicit {
         cfg.generation.ctx_size
     } else {
         0
     };
-    let engine = GemmaEngine::open(&model, ctx).map_err(|e| e.to_string())?;
+    let engine = NativeEngine::<F>::open(&model, ctx).map_err(|e| e.to_string())?;
     eprintln!("plank: model ready: {}", engine.model_name());
     if ctx == 0 {
         #[allow(clippy::cast_precision_loss)]
         let kv_gb = engine.kv_bytes_at_ctx() as f64 / f64::from(1u32 << 30);
+        // Gemma has no cap, so its line always reads "sized to this
+        // machine's RAM"; Flint's reads "capped" when the cap is what bound.
+        let capped = F::default_ctx_cap()
+            .is_some_and(|cap| usize::try_from(engine.ctx_size()).is_ok_and(|n| n == cap));
+        let sizing = if capped {
+            "this model's default cap"
+        } else {
+            "sized to this machine's RAM"
+        };
         eprintln!(
-            "plank: context {} tokens ({kv_gb:.1} GB of KV, sized to this machine's RAM; -c to change)",
+            "plank: context {} tokens ({kv_gb:.1} GB of KV, {sizing}; -c to change)",
             engine.ctx_size()
         );
     }
     let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
         plank::gpuyield::check_model_files(vec![("model", model.as_path())])?;
-        GemmaEngine::open(&model, ctx)
+        NativeEngine::<F>::open(&model, ctx)
             .map(|e| Box::new(e) as Box<dyn Engine>)
             .map_err(|e| e.to_string())
     });
@@ -1920,10 +1967,13 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         session_ctx_size: (cfg.session_ctx_size > 0).then_some(cfg.session_ctx_size),
         kv_budget_bytes: (cfg.kv_budget_bytes > 0).then_some(cfg.kv_budget_bytes),
     };
-    // The shared host is built on the ds4 engine's shared model; a Gemma model
-    // must not fall into its DeepSeek-sized gates and C open.
-    if selection_family_or_file(cfg) == plank::gguf::ModelFamily::Gemma {
-        return Err("--shared-engine does not support Gemma models yet".to_string());
+    // The shared host is built on the ds4 engine's shared model; a Gemma or
+    // Flint model must not fall into its DeepSeek-sized gates and C open.
+    if matches!(
+        selection_family_or_file(cfg),
+        plank::gguf::ModelFamily::Gemma | plank::gguf::ModelFamily::Flint
+    ) {
+        return Err("--shared-engine does not support Gemma or Flint models yet".to_string());
     }
     #[cfg(ds4_engine)]
     {
@@ -2292,6 +2342,39 @@ mod tests {
             vec!["plank: c has finished downloading; run /engines to switch to it".to_owned()]
         );
         assert_eq!(staged_others(names.iter().copied(), None, &staged).len(), 2);
+    }
+
+    /// A Flint engine not downloaded yet routes by the catalog's hint, as a
+    /// Gemma one does, so it still reaches `FlintEngine` and `.flint.kv`.
+    #[test]
+    fn a_missing_flint_engine_routes_by_its_catalog_hint() {
+        let missing = std::env::temp_dir().join(format!(
+            "plank-flint-hint-{}-absent.gguf",
+            std::process::id()
+        ));
+        let mut sel = plank::engines::Selection {
+            id: None,
+            main: missing.clone(),
+            mtp: None,
+            vision: None,
+            managed_main: true,
+            urls: std::collections::BTreeMap::new(),
+            family: Some("flint".to_string()),
+        };
+        assert_eq!(
+            selection_family(&sel, &missing),
+            plank::gguf::ModelFamily::Flint
+        );
+        sel.family = Some("gemma".to_string());
+        assert_eq!(
+            selection_family(&sel, &missing),
+            plank::gguf::ModelFamily::Gemma
+        );
+        sel.family = None;
+        assert_eq!(
+            selection_family(&sel, &missing),
+            plank::gguf::ModelFamily::Ds4
+        );
     }
 
     #[test]

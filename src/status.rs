@@ -733,11 +733,12 @@ pub fn set_local_family(family: crate::gguf::ModelFamily) {
         crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => 0,
         crate::gguf::ModelFamily::Qwen => 1,
         crate::gguf::ModelFamily::Gemma => 2,
+        crate::gguf::ModelFamily::Flint => 3,
     };
     LOCAL_FAMILY_TAG.store(tag, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The family tag the origin label carries: `ds`, `qwen` or `gemma`.
+/// The family tag the origin label carries: `ds`, `qwen`, `gemma` or `flint`.
 ///
 /// Short on purpose. It sits in the footer's tightest segment, and the point
 /// is to answer "which model is this" at a glance, not to name the release.
@@ -745,6 +746,7 @@ fn local_family_tag() -> &'static str {
     match LOCAL_FAMILY_TAG.load(std::sync::atomic::Ordering::Relaxed) {
         1 => "qwen",
         2 => "gemma",
+        3 => "flint",
         _ => "ds",
     }
 }
@@ -4013,6 +4015,11 @@ mod tests {
         let line = build_status_text(&st, false, true);
         assert!(line.contains("(local:gemma"), "{line}");
         assert!(!line.contains("(local:ds"), "Gemma is not DeepSeek: {line}");
+
+        set_local_family(crate::gguf::ModelFamily::Flint);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local:flint"), "{line}");
+        assert!(!line.contains("(local:gemma"), "Flint is not Gemma: {line}");
         set_local_family(crate::gguf::ModelFamily::Ds4);
 
         // The bare form is the registration key, not a rendering: it must

@@ -391,11 +391,13 @@ const STEADY_MIN_TOKENS: i32 = 8;
 /// separate `qwen38-vision` target). Either way the `view_image` tool refuses
 /// at call time instead of the open failing.
 fn model_supports_vision(family: crate::gguf::ModelFamily, path: &Path) -> bool {
-    // Gemma never opens on this engine; listed so it can never read as
-    // `DeepSeek` here.
+    // Gemma and Flint never open on this engine; listed so neither can ever
+    // read as `DeepSeek` here.
     !matches!(
         family,
-        crate::gguf::ModelFamily::Qwen | crate::gguf::ModelFamily::Gemma
+        crate::gguf::ModelFamily::Qwen
+            | crate::gguf::ModelFamily::Gemma
+            | crate::gguf::ModelFamily::Flint
     ) && crate::gguf::supports_vision(path)
 }
 
@@ -412,9 +414,13 @@ fn report_text_only(
     model_supports_vision: bool,
     vision_path: Option<&Path>,
 ) {
-    // Gemma never opens on this engine (it is routed to `GemmaEngine`), so
-    // there is no DeepSeek encoder story to tell.
-    if family == crate::gguf::ModelFamily::Gemma {
+    // Gemma and Flint never open on this engine (they are routed to
+    // `GemmaEngine` and `FlintEngine`), so there is no DeepSeek encoder story
+    // to tell.
+    if matches!(
+        family,
+        crate::gguf::ModelFamily::Gemma | crate::gguf::ModelFamily::Flint
+    ) {
         return;
     }
     if family == crate::gguf::ModelFamily::Qwen {
@@ -3511,8 +3517,9 @@ fn warn_on_companion_mismatch(family: crate::gguf::ModelFamily, companion: &Path
     let expected = match family {
         crate::gguf::ModelFamily::Qwen => "qwen4-exp-ple",
         crate::gguf::ModelFamily::Ds4 | crate::gguf::ModelFamily::Ds41 => "deepseek4-dspark",
-        // Gemma never opens on this engine and has no drafter to compare to.
-        crate::gguf::ModelFamily::Gemma => return,
+        // Gemma and Flint never open on this engine and have no drafter to
+        // compare to.
+        crate::gguf::ModelFamily::Gemma | crate::gguf::ModelFamily::Flint => return,
     };
     if arch != expected {
         eprintln!(

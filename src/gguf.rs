@@ -33,6 +33,8 @@ pub enum ModelFamily {
     Ds41,
     /// Gemma 4 (`gemma4`), run on the native Rust engine (`gemmaengine`).
     Gemma,
+    /// Flint (`flint`), run on the native Rust engine (`flintengine`).
+    Flint,
 }
 
 impl ModelFamily {
@@ -44,6 +46,7 @@ impl ModelFamily {
             Self::Ds41 => "ds41",
             Self::Qwen => "qwen",
             Self::Gemma => "gemma",
+            Self::Flint => "flint",
         }
     }
 }
@@ -58,13 +61,9 @@ impl From<trace_stream::syntax::ToolSyntax> for ModelFamily {
         match syntax {
             trace_stream::syntax::ToolSyntax::Qwen => Self::Qwen,
             trace_stream::syntax::ToolSyntax::Dsml41 => Self::Ds41,
-            // `Flint` is a placeholder until Task 5 adds `ModelFamily::Flint`:
-            // a Flint name read as `Ds4` before the dialect existed, so this
-            // keeps that.
-            trace_stream::syntax::ToolSyntax::Dsml | trace_stream::syntax::ToolSyntax::Flint => {
-                Self::Ds4
-            }
+            trace_stream::syntax::ToolSyntax::Dsml => Self::Ds4,
             trace_stream::syntax::ToolSyntax::Gemma => Self::Gemma,
+            trace_stream::syntax::ToolSyntax::Flint => Self::Flint,
         }
     }
 }
@@ -80,6 +79,9 @@ const DS41_ARCH: &str = "deepseek41";
 
 /// The `general.architecture` value of a Gemma 4 GGUF.
 pub const GEMMA4_ARCH: &str = "gemma4";
+
+/// The `general.architecture` value of a Flint GGUF.
+pub const FLINT_ARCH: &str = "flint";
 
 /// Refuses to allocate for a declared length beyond this. The file may be
 /// truncated or not a GGUF at all, and a bogus 64-bit length would otherwise
@@ -102,6 +104,7 @@ pub fn family_of(path: &Path) -> ModelFamily {
         Some(QWEN_ARCH) => ModelFamily::Qwen,
         Some(DS41_ARCH) => ModelFamily::Ds41,
         Some(GEMMA4_ARCH) => ModelFamily::Gemma,
+        Some(FLINT_ARCH) => ModelFamily::Flint,
         _ => ModelFamily::Ds4,
     }
 }
@@ -610,6 +613,23 @@ mod tests {
         use trace_stream::syntax::ToolSyntax;
         assert_eq!(ModelFamily::from(ToolSyntax::Gemma), ModelFamily::Gemma);
         assert_eq!(ModelFamily::Gemma.as_str(), "gemma");
+    }
+
+    #[test]
+    fn flint_arch_is_its_own_family() {
+        let p = Gguf::default()
+            .str_val("general.architecture", FLINT_ARCH)
+            .write("flint");
+        assert_eq!(FLINT_ARCH, "flint");
+        assert_eq!(family_of(&p), ModelFamily::Flint);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn flint_dialect_maps_to_the_flint_family() {
+        use trace_stream::syntax::ToolSyntax;
+        assert_eq!(ModelFamily::from(ToolSyntax::Flint), ModelFamily::Flint);
+        assert_eq!(ModelFamily::Flint.as_str(), "flint");
     }
 
     /// `deepseek41` is not a prefix match away from `deepseek4` and must not

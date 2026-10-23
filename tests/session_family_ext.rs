@@ -40,6 +40,21 @@ fn setting_the_family_changes_the_transcript_extension() {
     assert_ne!(v41, before);
     assert_ne!(v41, after);
 
+    // The two native-engine families round-trip too, each to its own name.
+    set_family(ModelFamily::Gemma);
+    assert_eq!(family(), ModelFamily::Gemma);
+    let gemma = store.path_for_id("cheeky-bell");
+    assert!(gemma.to_string_lossy().ends_with(".gemma.kv"), "{gemma:?}");
+
+    set_family(ModelFamily::Flint);
+    assert_eq!(family(), ModelFamily::Flint);
+    let flint = store.path_for_id("cheeky-bell");
+    assert!(flint.to_string_lossy().ends_with(".flint.kv"), "{flint:?}");
+    assert_eq!(family_ext(ModelFamily::Flint), ".flint.kv");
+    for other in [&before, &after, &v41, &gemma] {
+        assert_ne!(&flint, other);
+    }
+
     set_family(ModelFamily::Ds4);
     assert_eq!(family(), ModelFamily::Ds4);
 

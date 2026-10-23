@@ -599,6 +599,7 @@ pub struct GateBias {
     pub ds41: i32,
     pub qwen: i32,
     pub gemma: i32,
+    pub flint: i32,
 }
 
 impl GateBias {
@@ -613,6 +614,7 @@ impl GateBias {
             crate::gguf::ModelFamily::Ds41 => "ds41",
             crate::gguf::ModelFamily::Qwen => "qwen",
             crate::gguf::ModelFamily::Gemma => "gemma",
+            crate::gguf::ModelFamily::Flint => "flint",
         }
     }
 
@@ -624,6 +626,7 @@ impl GateBias {
             crate::gguf::ModelFamily::Ds41 => self.ds41,
             crate::gguf::ModelFamily::Qwen => self.qwen,
             crate::gguf::ModelFamily::Gemma => self.gemma,
+            crate::gguf::ModelFamily::Flint => self.flint,
         }
     }
 }
@@ -998,6 +1001,7 @@ impl Settings {
             set("ds41", &mut self.memory.gate_bias.ds41);
             set("qwen", &mut self.memory.gate_bias.qwen);
             set("gemma", &mut self.memory.gate_bias.gemma);
+            set("flint", &mut self.memory.gate_bias.flint);
             self.note("memory.gateBias", origin);
         }
     }
@@ -1636,6 +1640,7 @@ impl Settings {
                         ("ds41".to_string(), inum(b.ds41)),
                         ("qwen".to_string(), inum(b.qwen)),
                         ("gemma".to_string(), inum(b.gemma)),
+                        ("flint".to_string(), inum(b.flint)),
                     ])
                 }),
             );
@@ -2923,6 +2928,35 @@ mod tests {
                 .gate_threshold_percent(crate::gguf::ModelFamily::Ds41),
             100
         );
+    }
+
+    #[test]
+    fn memory_gate_bias_flint_round_trips_through_a_settings_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-gate-bias-flint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.overlay(r#"{"memory":{"gateBias":{"flint":-9}}}"#);
+        assert_eq!(s.memory.gate_bias.flint, -9);
+        assert_eq!(GateBias::key(crate::gguf::ModelFamily::Flint), "flint");
+        assert_eq!(
+            s.memory
+                .gate_bias
+                .for_family(crate::gguf::ModelFamily::Flint),
+            -9
+        );
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert_eq!(reloaded.memory.gate_bias.flint, -9);
+        assert_eq!(reloaded.memory.gate_bias.gemma, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -429,11 +429,14 @@ pub fn ensure_side_artifacts(
     // Neither side artifact is Qwen's either: no `DeepSeek` vision encoder, and
     // speculation runs off the block embedded in its own GGUF.
     let family = crate::gguf::family_of(model_path);
-    // Gemma takes none of it either, and has no MTP of its own: it runs on the
-    // native Rust engine, which streams nothing from SSD and opens no
-    // companion. `make_local_engine` routes it away before this is reached;
-    // this keeps any other caller from treating it as `DeepSeek`.
-    if family == crate::gguf::ModelFamily::Gemma {
+    // Gemma and Flint take none of it either, and have no MTP of their own:
+    // both run on the native Rust engine, which streams nothing from SSD and
+    // opens no companion. `make_local_engine` routes them away before this is
+    // reached; this keeps any other caller from treating them as `DeepSeek`.
+    if matches!(
+        family,
+        crate::gguf::ModelFamily::Gemma | crate::gguf::ModelFamily::Flint
+    ) {
         crate::status::set_ssd_streaming(false);
         engine.vision_path = None;
         engine.mtp_path = None;
@@ -3299,6 +3302,34 @@ mod tests {
         assert!(
             !e.mtp && !e.mtp_strict,
             "Gemma has no MTP to speculate from"
+        );
+        assert!(!e.ssd_streaming, "no DeepSeek-sized streaming heuristic");
+        let _ = std::fs::remove_file(model);
+    }
+
+    #[test]
+    fn a_flint_model_skips_the_ds4_side_artifacts() {
+        let model = stub_model("flint", "flint");
+        // Sparse, as in the Gemma case: big enough for the DeepSeek SSD
+        // heuristic to fire if Flint were mistaken for DeepSeek.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&model)
+            .unwrap()
+            .set_len(1 << 42)
+            .unwrap();
+        let sel = stub_selection(crate::manifest::EngineId::DS4VISION, &model);
+        let mut e = crate::config::EngineTuning {
+            mtp: true,
+            mtp_strict: true,
+            ..Default::default()
+        };
+        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert_eq!(e.vision_path, None, "Flint opens no vision encoder");
+        assert_eq!(e.mtp_path, None, "Flint opens no draft checkpoint");
+        assert!(
+            !e.mtp && !e.mtp_strict,
+            "Flint has no MTP to speculate from"
         );
         assert!(!e.ssd_streaming, "no DeepSeek-sized streaming heuristic");
         let _ = std::fs::remove_file(model);

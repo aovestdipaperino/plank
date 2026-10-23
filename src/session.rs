@@ -90,6 +90,8 @@ const DS4_FILE_EXT: &str = ".ds4.kv";
 const QWEN_FILE_EXT: &str = ".qwn.kv";
 /// Transcript extension for a Gemma 4 session.
 const GEMMA_FILE_EXT: &str = ".gemma.kv";
+/// Transcript extension for a Flint session.
+const FLINT_FILE_EXT: &str = ".flint.kv";
 /// Transcript extension for a `DeepSeek` V4.1 session.
 ///
 /// Note it is not a suffix of, nor suffixed by, [`DS4_FILE_EXT`]: `.ds4.kv`
@@ -117,6 +119,7 @@ const FAMILY_TAG_DS4: u8 = 0;
 const FAMILY_TAG_QWEN: u8 = 1;
 const FAMILY_TAG_DS41: u8 = 2;
 const FAMILY_TAG_GEMMA: u8 = 3;
+const FAMILY_TAG_FLINT: u8 = 4;
 
 /// The [`FAMILY_TAG`] value stored for `family`.
 fn family_tag(family: crate::gguf::ModelFamily) -> u8 {
@@ -125,6 +128,7 @@ fn family_tag(family: crate::gguf::ModelFamily) -> u8 {
         crate::gguf::ModelFamily::Qwen => FAMILY_TAG_QWEN,
         crate::gguf::ModelFamily::Ds41 => FAMILY_TAG_DS41,
         crate::gguf::ModelFamily::Gemma => FAMILY_TAG_GEMMA,
+        crate::gguf::ModelFamily::Flint => FAMILY_TAG_FLINT,
     }
 }
 
@@ -134,6 +138,7 @@ fn family_from_tag(tag: u8) -> crate::gguf::ModelFamily {
         FAMILY_TAG_QWEN => crate::gguf::ModelFamily::Qwen,
         FAMILY_TAG_DS41 => crate::gguf::ModelFamily::Ds41,
         FAMILY_TAG_GEMMA => crate::gguf::ModelFamily::Gemma,
+        FAMILY_TAG_FLINT => crate::gguf::ModelFamily::Flint,
         // Including any value never stored: unset and unknown both read as the
         // pre-split family, never as a wrong one.
         _ => crate::gguf::ModelFamily::Ds4,
@@ -172,6 +177,7 @@ pub fn family_ext(family: crate::gguf::ModelFamily) -> &'static str {
         crate::gguf::ModelFamily::Qwen => QWEN_FILE_EXT,
         crate::gguf::ModelFamily::Ds41 => DS41_FILE_EXT,
         crate::gguf::ModelFamily::Gemma => GEMMA_FILE_EXT,
+        crate::gguf::ModelFamily::Flint => FLINT_FILE_EXT,
     }
 }
 /// Extension of the engine KV payload written beside a transcript.
@@ -3013,6 +3019,28 @@ mod tests {
         for f in [ModelFamily::Ds4, ModelFamily::Qwen, ModelFamily::Ds41] {
             assert_ne!(family_tag(f), family_tag(ModelFamily::Gemma));
             assert_ne!(family_ext(f), family_ext(ModelFamily::Gemma));
+        }
+    }
+
+    /// Flint is tag 4: tags 0 to 3 are already persisted for the other
+    /// families and must keep their meaning.
+    #[test]
+    fn flint_transcripts_have_their_own_extension() {
+        use crate::gguf::ModelFamily;
+        assert_eq!(family_ext(ModelFamily::Flint), ".flint.kv");
+        assert_eq!(family_tag(ModelFamily::Flint), 4);
+        assert_eq!(
+            family_from_tag(family_tag(ModelFamily::Flint)),
+            ModelFamily::Flint
+        );
+        for f in [
+            ModelFamily::Ds4,
+            ModelFamily::Qwen,
+            ModelFamily::Ds41,
+            ModelFamily::Gemma,
+        ] {
+            assert_ne!(family_tag(f), family_tag(ModelFamily::Flint));
+            assert_ne!(family_ext(f), family_ext(ModelFamily::Flint));
         }
     }
 
