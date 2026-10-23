@@ -13,7 +13,7 @@ the `refs/ds4` submodule nor any C.
 
 ```sh
 plank --model flint                            # catalog engine; downloads ~22.9 GB on first use
-plank -m ~/.plank/models/flint-nvfp4.gguf      # the same file by path
+plank -m ~/.plank/flint.gguf                   # the same file by path
 PLANK_NO_DS4=1 cargo build --release           # a build without the C engine
 ```
 
@@ -92,7 +92,11 @@ turn. The tokenizer parity test asserts this on a corpus string where
 llama.cpp emits three control ids and plank emits the same bytes with none.
 On top of that, the template's `flint_text` escaping applies to every system,
 user and tool section: it drops `<think>` and `</think>` and spells each turn
-marker as `&lt;|…|&gt;`.
+marker as `&lt;|…|&gt;`. That is why plank's model-facing Flint text never
+names the think tags: the in-think guidance line
+(`sysprompt::FLINT_IN_THINK_LINE`) and the in-think tool error say "finish
+thinking first" instead, and a test runs both through the escape to prove
+they arrive unchanged.
 
 ### Thinking is always on
 
@@ -153,12 +157,14 @@ syntax. `tools.editUpto` still overrides the default.
 
 ## Sampling
 
-`FlintConfig::sampling` reads the GGUF's suggestion: temperature 1.0, top_p
-0.95 and top_k 20. The shared sampler has no top_k, so `FlintFamily` applies
-the GGUF's top_k (20) to the logits itself before the sampler runs, keeping
-the 20 largest and anything tied with the twentieth (plan decision 5). The
-model's authors ship that value with the weights, and sampling at
-temperature 1.0 without it would let the long tail through. Greedy
+The GGUF suggests temperature 1.0, top_p 0.95 and top_k 20
+(`FlintConfig::sampling`), but only its top_k is applied. Temperature and
+top_p come from plank's generation options like any other engine's (the
+temperature default is 0.6, and `/temp` changes it). The shared sampler has
+no top_k, so `FlintFamily` applies the GGUF's top_k (20) to the logits
+itself before the sampler runs, keeping the 20 largest and anything tied
+with the twentieth (plan decision 5). The model's authors ship that value
+with the weights, and it keeps the long tail out at any temperature. Greedy
 sampling skips the filter, since the maximum survives it anyway.
 
 ## KV discipline
