@@ -156,13 +156,18 @@ fn copied(dev: &MetalDevice, bytes: &[u8]) -> candle_core::Result<Arc<Buffer>> {
     Ok(Arc::new(b))
 }
 
+/// `maxBufferLength` of `dev`.
+pub(crate) fn max_buffer_len_of(dev: &MetalDevice) -> Option<u64> {
+    let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
+    u64::try_from(raw.maxBufferLength()).ok()
+}
+
 /// `maxBufferLength` of Metal device 0, or `None` when none opens.
 pub(crate) fn max_buffer_len() -> Option<u64> {
     let candle_core::Device::Metal(dev) = candle_core::Device::new_metal(0).ok()? else {
         return None;
     };
-    let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
-    u64::try_from(raw.maxBufferLength()).ok()
+    max_buffer_len_of(&dev)
 }
 
 /// One buffer over the whole mapping, without a copy, or `None` when Metal

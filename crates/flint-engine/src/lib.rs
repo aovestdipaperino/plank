@@ -52,6 +52,20 @@ pub fn metal_max_buffer_len() -> Option<u64> {
     }
 }
 
+/// `maxBufferLength` of `device` when it is a Metal device, else `None`:
+/// [`metal_max_buffer_len`] for a device the caller already holds, without
+/// opening another.
+#[cfg(feature = "candle")]
+#[must_use]
+pub fn max_buffer_len_of(device: &candle_core::Device) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if let candle_core::Device::Metal(dev) = device {
+        return nvfp4::metal::max_buffer_len_of(dev);
+    }
+    let _ = device;
+    None
+}
+
 /// Every failure this crate reports. A message, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -107,6 +121,17 @@ mod tests {
             return;
         }
         assert_eq!(got, None);
+    }
+
+    /// The held device answers as a fresh one does; the CPU has no limit.
+    #[cfg(feature = "candle")]
+    #[test]
+    fn a_held_device_reports_its_own_limit() {
+        assert_eq!(max_buffer_len_of(&candle_core::Device::Cpu), None);
+        #[cfg(target_os = "macos")]
+        if let Ok(d) = candle_core::Device::new_metal(0) {
+            assert_eq!(max_buffer_len_of(&d), metal_max_buffer_len());
+        }
     }
 
     #[test]

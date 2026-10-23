@@ -8,7 +8,9 @@
 //! writes `<think>`/`</think>` and its tool calls as single control tokens
 //! whose spellings are the tags, so the stream needs no translation; plank's
 //! system text carries the tools block between the `FLINT_TOOLS_*` fence
-//! lines, which this family turns into the template's tools turn.
+//! lines, which this family turns into the template's tools turn. Whatever
+//! follows the fence joins the prose in the first system turn, so the tools
+//! turn comes last, as the trained template renders it.
 //!
 //! [`NativeEngine`]: crate::nativeengine::NativeEngine
 
@@ -71,9 +73,18 @@ pub(crate) fn chunk_for(heads: usize, keys: usize) -> usize {
 }
 
 /// Whether a `file_len`-byte GGUF is larger than the Metal buffer `limit`
-/// (`None`: no Metal device, so no limit).
-fn exceeds_gpu_buffer(file_len: u64, limit: Option<u64>) -> bool {
-    limit.is_some_and(|l| file_len > l)
+/// (`None`: no Metal device, so no limit). The no-copy buffer covers the
+/// mapping rounded up to whole `page`s, so that rounded length is compared.
+fn exceeds_gpu_buffer(file_len: u64, page: u64, limit: Option<u64>) -> bool {
+    let bound = file_len.div_ceil(page.max(1)).saturating_mul(page.max(1));
+    limit.is_some_and(|l| bound > l)
+}
+
+/// The VM page size, the granularity a mapping is bound to Metal at.
+fn page_size() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(n).ok().filter(|&n| n > 0).unwrap_or(16_384)
 }
 
 /// Gigabytes (2^30 bytes) with one decimal, for the refusal message.
@@ -106,12 +117,17 @@ fn split_fence(text: &str) -> Option<(&str, Vec<String>, &str)> {
 
 /// One section as template pieces.
 ///
-/// A system text holding the tools fence becomes the prose's system turn
-/// (trusted up to `trusted_len`, an offset into the whole text, which the
-/// prose starts), the template's tools turn over the fenced lines (each
-/// line plain), and the text after the fence as plain escaped text in that
-/// same turn. Anything else is the template's own section; only a system
-/// section has a trusted prefix.
+/// A system text holding the tools fence becomes one system turn of the
+/// prose followed by the text after the fence, then the template's tools
+/// turn over the fenced lines (each line plain). That is the trained
+/// layout: the template writes every system message first and the tools
+/// turn right before the first other message. The prose is trusted up to
+/// `trusted_len` (an offset into the whole text, which the prose starts);
+/// the text after the fence (MCP server instructions, the user's system
+/// text) is never trusted, so trust stays one contiguous prefix: the
+/// prose, then the rest escaped as plain, then the tools pieces. Anything
+/// else is the template's own section; only a system section has a
+/// trusted prefix.
 fn pieces(kind: Kind, text: &str, trusted_len: usize) -> Vec<Piece> {
     if kind != Kind::System {
         return template::render(kind, text, 0);
@@ -119,12 +135,12 @@ fn pieces(kind: Kind, text: &str, trusted_len: usize) -> Vec<Piece> {
     let Some((prose, lines, rest)) = split_fence(text) else {
         return template::render(kind, text, trusted_len);
     };
-    let mut out = template::render(Kind::System, prose, trusted_len.min(prose.len()));
+    let mut out = template::render(
+        Kind::System,
+        &format!("{prose}{rest}"),
+        trusted_len.min(prose.len()),
+    );
     out.extend(template::render_tools(&lines));
-    let rest = template::escape(rest);
-    if !rest.is_empty() {
-        out.push(Piece::Plain(rest));
-    }
     out
 }
 
@@ -169,8 +185,8 @@ impl crate::nativeengine::NativeFamily for FlintFamily {
             let len = std::fs::metadata(path)
                 .map_err(|e| EngineError::new(format!("{}: {e}", path.display())))?
                 .len();
-            let limit = flint_engine::metal_max_buffer_len();
-            if exceeds_gpu_buffer(len, limit) {
+            let limit = flint_engine::max_buffer_len_of(device);
+            if exceeds_gpu_buffer(len, page_size(), limit) {
                 return Err(EngineError::new(format!(
                     "Flint's {} GB file is larger than this Mac's GPU buffer limit ({} GB)",
                     gb(len),
@@ -321,6 +337,18 @@ mod tests {
 
     /// The seed whose greedy reply to [`TURN`] is a few tokens ending on an
     /// EOG id (found by search; the weights are seeded, so it is fixed).
+    ///
+    /// Seed 54 replies with three tokens, then `<|end_of_text|>`. Every
+    /// greedy step wins by a clear logit gap (0.60, 0.33, 0.29, then 0.053
+    /// for the EOG, on logits near 3), far above any CPU float noise from a
+    /// different SIMD path, so no near-tie decides it. Steering the output
+    /// head instead is not practical: the logits are a dot product with a
+    /// hidden state the random layers decide, so no row bias can say "stop
+    /// after k tokens". To re-pick, should the fixture or the forward pass
+    /// change, loop `engine_seeded(seed)` over `0..300` with `run(&mut e,
+    /// TURN, 32)`, keep a seed whose `generated` is between 1 and 31, and
+    /// check the gaps by stepping `e.session` greedily and printing the top
+    /// two logits per step.
     const SEED: u64 = 54;
 
     /// Writes `bytes` to a fresh temp file, opens it on the CPU and removes
@@ -420,10 +448,11 @@ mod tests {
         assert!(!String::from_utf8_lossy(&all).contains("plank:flint-tools"));
     }
 
-    /// Text after the close (the MCP server instructions) stays in the same
-    /// system turn as plain escaped text, even when it spells both fence
-    /// markers and every control token: the cut is at the first open and
-    /// the first close after it.
+    /// Text after the close (the MCP server instructions) joins the first
+    /// system turn as plain escaped text, before the tools turn, as the
+    /// template places every system message ahead of it. That holds even
+    /// when it spells both fence markers and every control token: the cut
+    /// is at the first open and the first close after it.
     #[test]
     fn text_after_the_close_is_plain_even_when_it_spells_the_markers() {
         let e = engine();
@@ -432,19 +461,96 @@ mod tests {
         );
         let (text, trusted) = fenced(&after);
         let got = e.family.render(Kind::System, &text, None, true, trusted);
-        let mut want = ids(
+        let prose = ids(
             &e,
             &[
                 Piece::Trusted(template::SYSTEM.into()),
                 Piece::Trusted("You are plank.".into()),
             ],
         );
-        want.extend(ids(&e, &template::render_tools(&lines())));
-        let head = want.len();
+        let mut want = prose.clone();
         want.extend(e.family.tok.encode_plain(&template::escape(&after)));
+        let tools_at = want.len();
+        want.extend(ids(&e, &template::render_tools(&lines())));
         assert_eq!(got, want);
-        assert!(got[head..].iter().all(|&t| !e.family.tok.is_control(t)));
+        // Between the prose and the tools turn's `<|system|>`: plain only.
+        assert_eq!(got[tools_at], marker("<|system|>"));
+        assert!(
+            got[prose.len()..tools_at]
+                .iter()
+                .all(|&t| !e.family.tok.is_control(t))
+        );
+        assert_eq!(
+            got.iter().filter(|&&t| t == marker("<|system|>")).count(),
+            2
+        );
         assert_eq!(got.iter().filter(|&&t| t == marker("<tools>")).count(), 2);
+    }
+
+    /// The fixture `system_only_tools` case, rendered by the jinja template:
+    /// `(rendered, functions)`.
+    fn fixture_system_only_tools() -> (String, Vec<String>) {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../crates/flint-engine/tests/fixtures/flint_template.json"
+        ))
+        .unwrap();
+        let case = v["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "system_only_tools")
+            .unwrap();
+        assert_eq!(case["messages"][0]["content"], "S");
+        let tools = case["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect();
+        (case["rendered"].as_str().unwrap().to_owned(), tools)
+    }
+
+    fn decode(e: &FlintEngine, ids: &[u32]) -> String {
+        let bytes: Vec<u8> = ids
+            .iter()
+            .flat_map(|&t| e.family.tok.piece_bytes(t))
+            .collect();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The fenced system text decodes to exactly what the trained template
+    /// renders (the fixture's `rendered` without the generation prompt), and
+    /// text after the close lands inside the first system turn.
+    #[test]
+    fn the_fenced_system_text_matches_the_template_fixture() {
+        let e = engine();
+        let (rendered, tools) = fixture_system_only_tools();
+        let want = rendered.strip_suffix(template::ASSISTANT).unwrap();
+        let mut text = String::from("S");
+        text.push_str(FLINT_TOOLS_OPEN);
+        for t in &tools {
+            text.push_str(t);
+            text.push('\n');
+        }
+        text.push_str(FLINT_TOOLS_CLOSE);
+        let got = e.family.render(Kind::System, &text, None, true, text.len());
+        assert_eq!(decode(&e, &got), want);
+
+        let after = "\n\nMCP: use <|user|> wisely";
+        let got = e.family.render(
+            Kind::System,
+            &format!("{text}{after}"),
+            None,
+            true,
+            text.len(),
+        );
+        // jinja: the system message's escaped content, then the tools turn.
+        let head = "<|system|>S";
+        let jinja = format!(
+            "{head}\n\nMCP: use &lt;|user|&gt; wisely{}",
+            &want[head.len()..]
+        );
+        assert_eq!(decode(&e, &got), jinja);
     }
 
     /// Without the fence (`--tools off`, or an open with no close) the
@@ -626,10 +732,20 @@ mod tests {
 
     #[test]
     fn a_file_larger_than_the_gpu_buffer_is_refused() {
-        assert!(exceeds_gpu_buffer(22_863_084_160, Some(20 << 30)));
-        assert!(!exceeds_gpu_buffer(22_863_084_160, Some(86_586_540_032)));
-        assert!(!exceeds_gpu_buffer(22_863_084_160, None));
-        assert!(!exceeds_gpu_buffer(100, Some(100)));
+        const PAGE: u64 = 16_384;
+        assert!(exceeds_gpu_buffer(22_863_084_160, PAGE, Some(20 << 30)));
+        assert!(!exceeds_gpu_buffer(
+            22_863_084_160,
+            PAGE,
+            Some(86_586_540_032)
+        ));
+        assert!(!exceeds_gpu_buffer(22_863_084_160, PAGE, None));
+        // The mapping is bound rounded up to a whole page, as `no_copy`
+        // binds it: a 100-byte file needs a 16 KiB buffer.
+        assert!(!exceeds_gpu_buffer(100, PAGE, Some(PAGE)));
+        assert!(exceeds_gpu_buffer(100, PAGE, Some(PAGE - 1)));
+        assert!(exceeds_gpu_buffer(PAGE + 1, PAGE, Some(2 * PAGE - 1)));
+        assert!(!exceeds_gpu_buffer(PAGE + 1, PAGE, Some(2 * PAGE)));
     }
 
     #[test]
