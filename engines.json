@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "default": "ds4vision",
   "engines": {
     "ds4vision": {
@@ -83,6 +83,19 @@
         "url": "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf",
         "bytes": 6975879296,
         "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
+      }
+    },
+    "flint": {
+      "version": 1,
+      "released": "2026-10-23",
+      "notes": "Flint 40B MoE (NVFP4) by Recursive; runs on the native Rust engine",
+      "family": "flint",
+      "kvBytesPerToken": 200704,
+      "main": {
+        "name": "flint-nvfp4.gguf",
+        "url": "https://huggingface.co/RecursiveSI/flint-nvfp4-gguf/resolve/main/flint-nvfp4.gguf",
+        "bytes": 22863084160,
+        "sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde"
       }
     }
   }

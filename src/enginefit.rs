@@ -17,20 +17,21 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// whole of "runs at all" for those families.
 pub const MIN_RAM_BYTES: u64 = 96 * GIB;
 
-/// RAM a Gemma engine needs beyond its weights when its catalog entry does
+/// RAM a native-engine family (Gemma, Flint) needs beyond its weights when its catalog entry does
 /// not say: generous on purpose (4 GiB holds 8K tokens of KV at up to
 /// ~500 KB a token). An entry's `kvBytesPerToken` replaces it.
-pub const GEMMA_KV_RESERVE_BYTES: u64 = 4 * GIB;
+pub const NATIVE_KV_RESERVE_BYTES: u64 = 4 * GIB;
 
-/// Share of physical RAM a Gemma engine's default context may spend on its
-/// KV cache, as a divisor: a third (`gemmaengine::default_ctx`).
-pub const GEMMA_KV_RAM_DIVISOR: usize = 3;
+/// Share of physical RAM a native-engine family's (Gemma, Flint) default
+/// context may spend on its KV cache, as a divisor: a third
+/// (`nativeengine::default_ctx`).
+pub const NATIVE_KV_RAM_DIVISOR: usize = 3;
 
-/// The smallest context a Gemma engine opens by default, however little RAM
+/// The smallest context a native-engine family (Gemma, Flint) opens by default, however little RAM
 /// there is: below this an agent session cannot hold its own system prompt
 /// and a few tool results. Also what the fit rule reserves KV for, since a
 /// machine that can hold the weights and this much KV can run the engine.
-pub const GEMMA_MIN_CTX: usize = 8_192;
+pub const NATIVE_MIN_CTX: usize = 8_192;
 
 /// Free space a download must leave behind, so the disk is not filled to the
 /// last byte by a model.
@@ -43,6 +44,8 @@ pub struct BuildCaps {
     pub ds4: bool,
     /// The native Gemma engine (`feature = "gemma"`).
     pub gemma: bool,
+    /// The native Flint engine (`feature = "flint"`).
+    pub flint: bool,
 }
 
 impl BuildCaps {
@@ -52,6 +55,7 @@ impl BuildCaps {
         Self {
             ds4: cfg!(ds4_engine),
             gemma: cfg!(feature = "gemma"),
+            flint: cfg!(feature = "flint"),
         }
     }
 }
@@ -65,6 +69,9 @@ pub struct Machine {
     pub free_disk: Option<u64>,
     /// The engines this build can run.
     pub caps: BuildCaps,
+    /// The largest buffer the Metal device makes, when known (Flint builds on
+    /// a Mac with a device only). A model file larger than this cannot run.
+    pub metal_max_buffer: Option<u64>,
 }
 
 /// This machine, with downloads landing under `root`.
@@ -74,7 +81,21 @@ pub fn machine(root: &Path) -> Machine {
         ram: crate::download::total_ram_bytes(),
         free_disk: free_bytes(root),
         caps: BuildCaps::current(),
+        metal_max_buffer: metal_max_buffer(),
     }
+}
+
+/// `MTLDevice::maxBufferLength`, probed at most once per process: opening a
+/// Metal device is not free, and the menu asks on every evaluation.
+#[cfg(feature = "flint")]
+fn metal_max_buffer() -> Option<u64> {
+    static CACHE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(flint_engine::metal_max_buffer_len)
+}
+
+#[cfg(not(feature = "flint"))]
+fn metal_max_buffer() -> Option<u64> {
+    None
 }
 
 /// Whether and how an engine can be used here.
@@ -114,20 +135,20 @@ impl EngineRow {
     }
 }
 
-/// The KV a Gemma engine needs at the smallest window it opens by default:
-/// the entry's `kvBytesPerToken` times [`GEMMA_MIN_CTX`], else
-/// [`GEMMA_KV_RESERVE_BYTES`]. A larger machine gets a larger window, so this
+/// The KV a native-engine family (Gemma, Flint) needs at the smallest window it opens by default:
+/// the entry's `kvBytesPerToken` times [`NATIVE_MIN_CTX`], else
+/// [`NATIVE_KV_RESERVE_BYTES`]. A larger machine gets a larger window, so this
 /// is the floor that decides whether the engine runs at all.
 ///
 /// Declared per engine because it varies five-fold between the two models
 /// (E4B shares KV across 18 layers; 12B keeps 8 heads on 40 sliding layers)
 /// and cannot be read from a file that has not been downloaded yet.
-fn gemma_kv_reserve(entry: &EngineEntry) -> u64 {
+fn native_kv_reserve(entry: &EngineEntry) -> u64 {
     serde_json::from_str::<serde_json::Value>(&entry.raw)
         .ok()
         .and_then(|v| v["kvBytesPerToken"].as_u64())
-        .map_or(GEMMA_KV_RESERVE_BYTES, |b| {
-            b.saturating_mul(GEMMA_MIN_CTX as u64)
+        .map_or(NATIVE_KV_RESERVE_BYTES, |b| {
+            b.saturating_mul(NATIVE_MIN_CTX as u64)
         })
 }
 
@@ -248,16 +269,22 @@ fn fit_of(
             };
         }
     }
-    let gemma = raw_str(entry, "family").as_deref() == Some("gemma");
-    if !(if gemma { m.caps.gemma } else { m.caps.ds4 }) {
+    let family = raw_str(entry, "family");
+    let native = matches!(family.as_deref(), Some("gemma" | "flint"));
+    let supported = match family.as_deref() {
+        Some("gemma") => m.caps.gemma,
+        Some("flint") => m.caps.flint,
+        _ => m.caps.ds4,
+    };
+    if !supported {
         return Fit::Disabled {
             reason: "not supported by this build".to_owned(),
         };
     }
     if let Some(ram) = m.ram {
-        let need = if gemma {
+        let need = if native {
             entry.files.get("main").map(|f| {
-                f.bytes.saturating_add(gemma_kv_reserve(entry))
+                f.bytes.saturating_add(native_kv_reserve(entry))
                     / crate::download::SSD_STREAMING_RAM_PERCENT
                     * 100
             })
@@ -273,6 +300,18 @@ fn fit_of(
                 ),
             };
         }
+    }
+    if family.as_deref() == Some("flint")
+        && let (Some(lim), Some(main)) = (m.metal_max_buffer, entry.files.get("main"))
+        && main.bytes > lim
+    {
+        return Fit::Disabled {
+            reason: format!(
+                "needs a {} GB GPU buffer (this Mac allows {} GB)",
+                need_gb(main.bytes),
+                have_gb(lim)
+            ),
+        };
     }
     if installed {
         return Fit::Installed;
@@ -351,8 +390,66 @@ mod tests {
             caps: BuildCaps {
                 ds4: true,
                 gemma: true,
+                flint: true,
             },
+            metal_max_buffer: None,
         }
+    }
+
+    const FLINT: &str = r#"{"version": 3, "engines": {"flint": {"version": 1,
+      "family": "flint", "kvBytesPerToken": 200704,
+      "main": {"name": "flint-nvfp4.gguf", "url": "https://h/f", "bytes": 22863084160,
+        "sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde"}}}}"#;
+
+    fn flint_row(m: &Machine) -> EngineRow {
+        let mut w = Vec::new();
+        let cat = parse(FLINT, Layer::Published, &mut w).expect("parses");
+        let rows = evaluate(Path::new("/r"), &cat, m, &none, None, &no_staged);
+        row(&rows, "flint").clone()
+    }
+
+    #[test]
+    fn flint_is_selectable_when_ram_and_gpu_buffer_allow() {
+        let mut m = machine(Some(64), Some(500));
+        m.metal_max_buffer = Some(48 << 30);
+        assert!(flint_row(&m).selectable());
+    }
+
+    #[test]
+    fn flint_larger_than_the_gpu_buffer_is_disabled() {
+        let mut m = machine(Some(64), Some(500));
+        m.metal_max_buffer = Some(16 << 30);
+        assert_eq!(
+            flint_row(&m).fit,
+            Fit::Disabled {
+                reason: "needs a 22 GB GPU buffer (this Mac allows 16 GB)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn flint_needs_its_file_and_kv_within_eighty_percent_of_ram() {
+        let mut m = machine(Some(24), Some(500));
+        m.metal_max_buffer = Some(48 << 30);
+        let Fit::Disabled { reason } = flint_row(&m).fit else {
+            panic!("selectable at 24 GB");
+        };
+        assert!(
+            reason.starts_with("needs ") && reason.contains("RAM"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn flint_is_unsupported_without_the_build_cap() {
+        let mut m = machine(Some(64), Some(500));
+        m.caps.flint = false;
+        assert_eq!(
+            flint_row(&m).fit,
+            Fit::Disabled {
+                reason: "not supported by this build".into()
+            }
+        );
     }
 
     fn row<'a>(rows: &'a [EngineRow], name: &str) -> &'a EngineRow {
@@ -577,6 +674,7 @@ mod tests {
         m.caps = BuildCaps {
             ds4: false,
             gemma: true,
+            flint: true,
         };
         let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None, &no_staged);
         assert_eq!(

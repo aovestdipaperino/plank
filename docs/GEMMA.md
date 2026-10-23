@@ -28,7 +28,7 @@ has been downloaded and its header can be read. A file given by path is
 classified by its own `general.architecture` (`gemma4`).
 
 With no `-c` (or `engine.ctx`), Gemma sizes its own context from the RAM
-(`gemmaengine::default_ctx`): the window whose f32 KV fits a third of
+(`nativeengine::default_ctx`): the window whose f32 KV fits a third of
 physical memory, in 1024-token steps, never below 8192 and never past the
 GGUF's `context_length`. The KV is what the window costs, about 115 KB a
 token on E4B and 688 KB on 12B, so on a 128 GB Mac E4B opens its full 131072

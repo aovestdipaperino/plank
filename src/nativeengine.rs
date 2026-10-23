@@ -112,8 +112,8 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
 }
 
 /// The context opened when the caller asks for none (`ctx <= 0`): the KV a
-/// third of `ram` can hold ([`crate::enginefit::GEMMA_KV_RAM_DIVISOR`]), in
-/// whole 1024-token steps, never below [`crate::enginefit::GEMMA_MIN_CTX`]
+/// third of `ram` can hold ([`crate::enginefit::NATIVE_KV_RAM_DIVISOR`]), in
+/// whole 1024-token steps, never below [`crate::enginefit::NATIVE_MIN_CTX`]
 /// and never past the model's own `context_length` (nor `cap`, when given).
 ///
 /// The cache is f32 and keeps every position, so the window is what decides
@@ -134,9 +134,9 @@ pub(crate) fn default_ctx(
     if ram == 0 || ram == usize::MAX || kv_bytes_per_token == 0 {
         return fallback;
     }
-    let fits = ram / crate::enginefit::GEMMA_KV_RAM_DIVISOR / kv_bytes_per_token;
+    let fits = ram / crate::enginefit::NATIVE_KV_RAM_DIVISOR / kv_bytes_per_token;
     (fits / 1024 * 1024)
-        .max(crate::enginefit::GEMMA_MIN_CTX)
+        .max(crate::enginefit::NATIVE_MIN_CTX)
         .min(limit)
 }
 

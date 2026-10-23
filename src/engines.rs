@@ -776,7 +776,14 @@ mod tests {
         let c = parse(COMPILED_IN, Layer::Published, &mut w).expect("compiled-in parses");
         assert!(w.is_empty(), "warnings: {w:?}");
         assert_eq!(c.default_name(), "ds4vision");
-        for n in ["ds4vision", "ds41", "qwen", "gemma4-e4b", "gemma4-12b"] {
+        for n in [
+            "ds4vision",
+            "ds41",
+            "qwen",
+            "gemma4-e4b",
+            "gemma4-12b",
+            "flint",
+        ] {
             assert!(c.get(n).is_some(), "{n} missing");
         }
         assert!(c.get("ds4vision").unwrap().files.contains_key("mtp"));
@@ -1024,7 +1031,10 @@ mod tests {
     fn names_lists_sorted_comma_separated() {
         let mut w = Vec::new();
         let c = parse(COMPILED_IN, Layer::Published, &mut w).unwrap();
-        assert_eq!(c.names(), "ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen");
+        assert_eq!(
+            c.names(),
+            "ds41, ds4vision, flint, gemma4-12b, gemma4-e4b, qwen"
+        );
     }
 
     fn root(tag: &str) -> PathBuf {
@@ -1272,7 +1282,7 @@ mod tests {
         let e = resolve_in(&r, &c, Choice::Spec("nope")).unwrap_err();
         assert_eq!(
             e,
-            "no engine or file named `nope`; known engines: ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen"
+            "no engine or file named `nope`; known engines: ds41, ds4vision, flint, gemma4-12b, gemma4-e4b, qwen"
         );
     }
 
@@ -1283,7 +1293,7 @@ mod tests {
         assert!(resolve_in(&r, &c, Choice::Named("ds41")).is_ok());
         assert_eq!(
             resolve_in(&r, &c, Choice::Named("x.gguf")).unwrap_err(),
-            "unknown engine `x.gguf`; known engines: ds41, ds4vision, gemma4-12b, gemma4-e4b, qwen"
+            "unknown engine `x.gguf`; known engines: ds41, ds4vision, flint, gemma4-12b, gemma4-e4b, qwen"
         );
     }
 
