@@ -15011,7 +15011,8 @@ impl Agent<'_> {
                             continue;
                         }
                         log.push_user_echo(&line);
-                        let (result, panel) = self.tui_bang(&cmd, &mut log, terminal, &mut view, !feedback);
+                        let (result, panel) =
+                            self.tui_bang(&cmd, &mut log, terminal, &mut view, !feedback);
                         if feedback {
                             self.session
                                 .push(Message::user(bang_transcript_entry(&cmd, &result)));
@@ -15147,7 +15148,10 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         quiet: bool,
-    ) -> (Result<crate::tools::bash::ImmediateOutput, String>, tui::ReportPanel) {
+    ) -> (
+        Result<crate::tools::bash::ImmediateOutput, String>,
+        tui::ReportPanel,
+    ) {
         let mut panel = tui::ReportPanel::new(
             bang_panel_title_for(if quiet { "!!" } else { "!" }, cmd),
             &format!("\x1b[1m$ {cmd}{ANSI_RESET}\n"),
@@ -22915,7 +22919,10 @@ fn bang_panel_title(cmd: &str) -> String {
 /// [`bang_panel_title`] with the escape shape (`!` or `!!`) as the prefix.
 fn bang_panel_title_for(prefix: &str, cmd: &str) -> String {
     const MAX: usize = 60;
-    let head = format!("{prefix} {}", cmd.split_whitespace().collect::<Vec<_>>().join(" "));
+    let head = format!(
+        "{prefix} {}",
+        cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
     if head.chars().count() <= MAX {
         head
     } else {
@@ -42046,12 +42053,8 @@ or the user's next message aborts before its first token"
             log: &mut log2,
             quiet: false,
         };
-        crate::tools::bash::run_immediate(
-            std::path::Path::new("/tmp"),
-            "echo three",
-            &mut sink,
-        )
-        .unwrap();
+        crate::tools::bash::run_immediate(std::path::Path::new("/tmp"), "echo three", &mut sink)
+            .unwrap();
         assert_eq!(log2.line_count(), 1, "no panel: line lands in the log");
     }
 
