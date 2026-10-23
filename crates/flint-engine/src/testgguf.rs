@@ -167,6 +167,7 @@ pub const FLINT_MARKERS: [(&str, i32); 18] = [
 
 /// The markers a reply ends at, as the real file's `eog_token_ids` lists
 /// them.
+#[cfg(feature = "candle")]
 const EOG_MARKERS: [&str; 4] = [
     "<|end_of_text|>",
     "<|user|>",
