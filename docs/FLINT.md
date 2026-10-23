@@ -263,8 +263,8 @@ Measured on an Apple M5 Max with 128 GiB, on AC power.
 | cold prefill of plank's system prompt | 366.4 tok/s (5,073 tokens in 13.8 s) | smoke run, exit stats |
 
 For comparison, `llama-bench` at `970b51c` reported 116.42 tok/s prefill and
-9.78 tok/s decode on the same machine. The session figures include the
-thinking tokens, which are most of a short reply. After the first launch the
+9.78 tok/s decode on the same machine. The session figures count the
+thinking tokens along with the answer. After the first launch the
 system-prompt checkpoint restores the 5,059-token prefix from disk, and each
 turn prefills only its new suffix.
 
