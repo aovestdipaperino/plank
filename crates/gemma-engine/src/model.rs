@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use candle_core::quantized::{GgmlDType, QMatMul, ggml_file, gguf_file};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
@@ -996,6 +996,15 @@ pub struct Model {
     signature: [u8; 32],
     kv_shape: Vec<(usize, usize)>,
     kv_windows: Vec<Option<usize>>,
+    /// Held on Metal for a whole forward, and around a session's snapshot
+    /// and restore, which also run kernels on the cache. candle 0.9.2's
+    /// `MetalDevice` is only correct for one thread at a time: its encoders
+    /// come from a pool of command buffers that commit independently, and a
+    /// thread whose encoder finds another thread's still open takes a
+    /// different buffer, so one forward's kernels can land in several
+    /// buffers and run out of order on the GPU (FINDINGS, "Two threads on
+    /// one Metal device"). Serialising that work keeps it in order.
+    gpu: Mutex<()>,
 }
 
 impl std::fmt::Debug for Model {
@@ -1120,6 +1129,7 @@ impl Model {
             signature,
             kv_shape,
             kv_windows,
+            gpu: Mutex::new(()),
         })
     }
 
@@ -1161,6 +1171,15 @@ impl Model {
         &self.device
     }
 
+    /// The [`Self::gpu`] lock on Metal, `None` on the CPU. A panic while it
+    /// was held leaves nothing the next holder depends on, so a poisoned
+    /// lock is still usable.
+    pub(crate) fn gpu_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.device
+            .is_metal()
+            .then(|| self.gpu.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Runs `tokens` at positions `offset..`, extending `cache`, and
     /// returns the softcapped logits of the last position as f32.
     ///
@@ -1172,6 +1191,9 @@ impl Model {
         offset: usize,
         cache: &mut KvCache,
     ) -> crate::Result<Vec<f32>> {
+        // Released when the forward returns, after `to_vec1` has waited for
+        // the GPU.
+        let _gpu = self.gpu_guard();
         Ok(self.forward_inner(tokens, offset, cache)?)
     }
 

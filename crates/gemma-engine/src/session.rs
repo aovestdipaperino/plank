@@ -114,6 +114,11 @@ impl SessionModel for Model {
     fn device(&self) -> &Device {
         Model::device(self)
     }
+
+    fn device_exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _gpu = self.gpu_guard();
+        f()
+    }
 }
 
 /// One conversation's tokens and KV cache over a shared model.
@@ -484,6 +489,88 @@ mod tests {
         (0..n)
             .map(|i| 16 + u32::try_from(i % 200).unwrap())
             .collect()
+    }
+
+    /// The tiny model opened on a Metal device, or `None` (with a message)
+    /// on a machine without one.
+    #[cfg(target_os = "macos")]
+    fn metal_model() -> Option<Arc<Model>> {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return None;
+        };
+        let path = std::env::temp_dir().join(format!(
+            "gemma-sess-metal-{}-{:?}.gguf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        write_tiny(&path, &TinyConfig::default()).unwrap();
+        Some(Model::open(&path, &dev).unwrap())
+    }
+
+    /// One prefill of `long_prompt(40)` and eight steps, every step's logits.
+    #[cfg(target_os = "macos")]
+    fn prefill_and_steps(m: &Arc<Model>) -> Vec<Vec<f32>> {
+        let mut s = Session::new(m.clone(), 256);
+        let mut out = vec![s.prefill(&long_prompt(40), &|| false).unwrap().unwrap()];
+        for t in 0..8 {
+            out.push(s.step(t * 29 % 256).unwrap());
+        }
+        out
+    }
+
+    /// Sessions on two threads over one `Arc<Model>` on Metal each get what
+    /// a lone session gets: forwards from different threads must not
+    /// interleave their GPU work (see `Model::gpu`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_threads_on_one_metal_model_match_one_thread() {
+        let Some(m) = metal_model() else { return };
+        let want = prefill_and_steps(&m);
+        for round in 0..4 {
+            let runs: Vec<_> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..2).map(|_| s.spawn(|| prefill_and_steps(&m))).collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (th, got) in runs.iter().enumerate() {
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(close(g, w), "round {round}, thread {th}, forward {i}");
+                }
+            }
+        }
+    }
+
+    /// A snapshot and a restore also run kernels (the cache's copies), so
+    /// on Metal they must not interleave with another thread's forward.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshots_and_restores_beside_a_forward_on_metal_are_exact() {
+        let Some(m) = metal_model() else { return };
+        let mut a = Session::new(m.clone(), 256);
+        a.prefill(&long_prompt(100), &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        let next = {
+            let mut b = Session::new(m.clone(), 256);
+            b.restore(&blob).unwrap();
+            b.step(3).unwrap()
+        };
+        let want = prefill_and_steps(&m);
+        for round in 0..4 {
+            std::thread::scope(|s| {
+                let side = s.spawn(|| {
+                    for _ in 0..10 {
+                        assert!(a.snapshot().unwrap() == blob, "round {round}: snapshot");
+                        let mut b = Session::new(m.clone(), 256);
+                        b.restore(&blob).unwrap();
+                        assert!(close(&b.step(3).unwrap(), &next), "round {round}: restore");
+                    }
+                });
+                for (i, (g, w)) in prefill_and_steps(&m).iter().zip(&want).enumerate() {
+                    assert!(close(g, w), "round {round}, forward {i}");
+                }
+                side.join().unwrap();
+            });
+        }
     }
 
     /// A snapshot keeps `window + SNAPSHOT_SLACK` positions per sliding

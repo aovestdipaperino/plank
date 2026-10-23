@@ -3831,4 +3831,7 @@ beside another thread's forward came back wrong in about half the runs with
 only the forward locked). The lock is per `Model`: two models sharing one
 `Device` clone, or Flint and Gemma on the same device, are not excluded from
 each other, and loading a model (its RoPE tables and tensor uploads) runs
-kernels before the lock exists. Gemma has the same bug and is not fixed here.
+kernels before the lock exists. Gemma now has the same lock: its `Model`
+holds a `Mutex` on Metal for a whole `forward` and overrides
+`device_exclusive` for `snapshot` and `restore`, with the same two-thread
+regression tests.
