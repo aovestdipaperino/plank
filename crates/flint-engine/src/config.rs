@@ -96,6 +96,14 @@ fn uint(h: &Header, k: &str) -> Result<usize> {
         .ok_or_else(|| err(format!("`{k}` is not a non-negative integer")))
 }
 
+/// A required count or width that the engine divides or indexes by.
+fn positive(h: &Header, k: &str) -> Result<usize> {
+    match uint(h, k)? {
+        0 => Err(err(format!("`{k}` is 0; it must be positive"))),
+        n => Ok(n),
+    }
+}
+
 fn float_of(v: &Value) -> Option<f32> {
     match v {
         Value::F32(x) => Some(*x),
@@ -108,6 +116,26 @@ fn float_of(v: &Value) -> Option<f32> {
 
 fn float(h: &Header, k: &str) -> Result<f32> {
     float_of(get(h, k)?).ok_or_else(|| err(format!("`{k}` is not a float")))
+}
+
+/// An optional sampling float: absent is `None`; present, it must be a
+/// float within `range`.
+fn sampling_float(
+    h: &Header,
+    k: &str,
+    range: std::ops::RangeInclusive<f32>,
+) -> Result<Option<f32>> {
+    let Some(v) = h.get(k) else {
+        return Ok(None);
+    };
+    match float_of(v) {
+        Some(x) if range.contains(&x) => Ok(Some(x)),
+        _ => Err(err(format!(
+            "`{k}` is {v:?}, not a float in {}..={}",
+            range.start(),
+            range.end()
+        ))),
+    }
 }
 
 fn flags(h: &Header, k: &str, layers: usize) -> Result<Vec<bool>> {
@@ -132,9 +160,10 @@ impl FlintConfig {
     /// Reads the config from a GGUF header.
     ///
     /// # Errors
-    /// Another architecture, a missing or mistyped key, an unsupported
-    /// gating function, inconsistent head counts or widths, or a per-layer
-    /// array whose length is not `block_count`.
+    /// Another architecture, a missing or mistyped key, a zero window or
+    /// dimension, rope scaling, an unsupported gating function, inconsistent head counts or widths, a
+    /// per-layer array whose length is not `block_count`, or a sampling key
+    /// that is present but mistyped or out of range.
     pub fn from_header(h: &Header) -> Result<Self> {
         let arch = get(h, "general.architecture")?
             .as_str()
@@ -148,15 +177,24 @@ impl FlintConfig {
                 "expert_gating_func {gating} is not sigmoid ({GATING_SIGMOID})"
             )));
         }
-        let layers = uint(h, &key("block_count"))?;
-        let heads = uint(h, &key("attention.head_count"))?;
+        if let Some(k) = h
+            .metadata
+            .keys()
+            .find(|k| k.starts_with(&key("rope.scaling.")))
+        {
+            return Err(err(format!(
+                "`{k}` is set; Flint runs without rope scaling"
+            )));
+        }
+        let layers = positive(h, &key("block_count"))?;
+        let heads = positive(h, &key("attention.head_count"))?;
         let kv_heads = uint(h, &key("attention.head_count_kv"))?;
         if kv_heads == 0 || heads == 0 || !heads.is_multiple_of(kv_heads) {
             return Err(err(format!(
                 "{heads} query heads cannot share {kv_heads} KV heads"
             )));
         }
-        let head_dim = uint(h, &key("attention.key_length"))?;
+        let head_dim = positive(h, &key("attention.key_length"))?;
         let value_dim = uint(h, &key("attention.value_length"))?;
         if value_dim != head_dim || head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(err(format!(
@@ -164,7 +202,7 @@ impl FlintConfig {
             )));
         }
         let dense_layers = uint(h, &key("leading_dense_block_count"))?;
-        let experts = uint(h, &key("expert_count"))?;
+        let experts = positive(h, &key("expert_count"))?;
         let experts_used = uint(h, &key("expert_used_count"))?;
         if dense_layers > layers || experts_used == 0 || experts_used > experts {
             return Err(err(format!(
@@ -177,15 +215,15 @@ impl FlintConfig {
         };
         Ok(Self {
             layers,
-            hidden: uint(h, &key("embedding_length"))?,
+            hidden: positive(h, &key("embedding_length"))?,
             ffn: uint(h, &key("feed_forward_length"))?,
             heads,
             kv_heads,
             head_dim,
             rope_base: float(h, &key("rope.freq_base"))?,
             rms_eps: float(h, &key("attention.layer_norm_rms_epsilon"))?,
-            context_length: uint(h, &key("context_length"))?,
-            sliding_window: uint(h, &key("attention.sliding_window"))?,
+            context_length: positive(h, &key("context_length"))?,
+            sliding_window: positive(h, &key("attention.sliding_window"))?,
             swa: flags(h, &key("attention.sliding_window_pattern"), layers)?,
             rope: flags(h, &key("attention.rope_pattern"), layers)?,
             dense_layers,
@@ -198,12 +236,18 @@ impl FlintConfig {
                 .ok_or_else(|| err("`expert_weights_norm` is not a bool"))?,
             weights_scale,
             sampling: Sampling {
-                temperature: h.get("general.sampling.temp").and_then(float_of),
-                top_p: h.get("general.sampling.top_p").and_then(float_of),
-                top_k: h
-                    .get("general.sampling.top_k")
-                    .and_then(uint_of)
-                    .and_then(|n| u32::try_from(n).ok()),
+                temperature: sampling_float(h, "general.sampling.temp", 0.0..=f32::MAX)?,
+                top_p: sampling_float(h, "general.sampling.top_p", 0.0..=1.0)?,
+                top_k: match h.get("general.sampling.top_k") {
+                    None => None,
+                    Some(v) => Some(uint_of(v).and_then(|n| u32::try_from(n).ok()).ok_or_else(
+                        || {
+                            err(format!(
+                                "`general.sampling.top_k` is {v:?}, not a u32 integer"
+                            ))
+                        },
+                    )?),
+                },
             },
         })
     }
@@ -389,6 +433,60 @@ mod tests {
         assert!(
             err(with(m, "flint.attention.value_length", Value::U32(64))).contains("value_length")
         );
+    }
+
+    #[test]
+    fn refuses_a_zero_window_or_dimension() {
+        let m = test_config().metadata();
+        let err =
+            |meta: Vec<(String, Value)>| FlintConfig::from_header(&header(&meta)).unwrap_err().0;
+        for k in [
+            "flint.attention.sliding_window",
+            "flint.embedding_length",
+            "flint.block_count",
+            "flint.attention.head_count",
+            "flint.expert_count",
+            "flint.attention.key_length",
+            "flint.context_length",
+        ] {
+            let e = err(with(m.clone(), k, Value::U32(0)));
+            assert!(e.contains(k) && e.contains("positive"), "{k}: {e}");
+        }
+    }
+
+    #[test]
+    fn refuses_rope_scaling() {
+        let m = test_config().metadata();
+        let err =
+            |meta: Vec<(String, Value)>| FlintConfig::from_header(&header(&meta)).unwrap_err().0;
+        let e = err(with(
+            m.clone(),
+            "flint.rope.scaling.type",
+            Value::Str("yarn".into()),
+        ));
+        assert!(e.contains("flint.rope.scaling.type"), "{e}");
+        let e = err(with(m, "flint.rope.scaling.factor", Value::F32(4.0)));
+        assert!(e.contains("flint.rope.scaling.factor"), "{e}");
+    }
+
+    #[test]
+    fn refuses_a_mistyped_or_out_of_range_sampling_key() {
+        let m = test_config().metadata();
+        let err =
+            |meta: Vec<(String, Value)>| FlintConfig::from_header(&header(&meta)).unwrap_err().0;
+        for (k, v) in [
+            ("general.sampling.temp", Value::Str("hot".into())),
+            ("general.sampling.temp", Value::F32(-1.0)),
+            ("general.sampling.temp", Value::F32(f32::NAN)),
+            ("general.sampling.top_p", Value::U32(1)),
+            ("general.sampling.top_p", Value::F32(1.5)),
+            ("general.sampling.top_k", Value::F32(20.0)),
+            ("general.sampling.top_k", Value::I32(-1)),
+            ("general.sampling.top_k", Value::U64(1 << 40)),
+        ] {
+            let e = err(with(m.clone(), k, v.clone()));
+            assert!(e.contains(k), "{k} = {v:?}: {e}");
+        }
     }
 
     #[test]

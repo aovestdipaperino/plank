@@ -137,10 +137,20 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 /// # Panics
 /// When a width is not a multiple of 64, which NVFP4 needs.
 #[must_use]
+pub fn tiny_flint(c: &FlintConfig, vocab: usize, sink: f32, seed: u64) -> Vec<u8> {
+    tiny_flint_builder(c, vocab, sink, seed).bytes()
+}
+
+/// [`tiny_flint`] before it is serialised, so a test can add a tensor the
+/// real file does not have.
+///
+/// # Panics
+/// As [`tiny_flint`].
+#[must_use]
 // Fixture shapes are tiny; every u64/u32 conversion is exact. One tensor
 // per statement mirrors the real file's layout, so length is not complexity.
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-pub fn tiny_flint(c: &FlintConfig, vocab: usize, sink: f32, seed: u64) -> Vec<u8> {
+pub fn tiny_flint_builder(c: &FlintConfig, vocab: usize, sink: f32, seed: u64) -> Builder {
     let mut vals = Values(seed);
     let mut b = Builder::new();
     for (k, v) in c.metadata() {
@@ -279,7 +289,7 @@ pub fn tiny_flint(c: &FlintConfig, vocab: usize, sink: f32, seed: u64) -> Vec<u8
             b = nv(b, &format!("{p}.ffn_down"), c.ffn, c.hidden, 1, &mut vals);
         }
     }
-    b.bytes()
+    b
 }
 
 #[cfg(test)]

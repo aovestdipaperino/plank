@@ -215,10 +215,22 @@ impl Model {
     /// Loads every tensor of an already mapped file.
     ///
     /// # Errors
-    /// A config [`FlintConfig::from_header`] refuses, a missing tensor, or a
-    /// tensor whose type or shape is not the one Flint has.
+    /// A config [`FlintConfig::from_header`] refuses, an expert bias tensor
+    /// (`blk.N.ffn_exp_probs_b.bias`, which the engine does not apply), a
+    /// missing tensor, or a tensor whose type or shape is not the one Flint
+    /// has.
     pub fn from_file(file: GgufFile, device: &Device, ctx_cap: usize) -> Result<Arc<Self>> {
         let config = FlintConfig::from_header(&file.header)?;
+        if let Some(name) = file
+            .header
+            .tensors
+            .keys()
+            .find(|n| n.contains(".ffn_exp_probs_b."))
+        {
+            return Err(err(format!(
+                "{name} is present; the engine does not apply an expert bias"
+            )));
+        }
         let embd = file.header.tensor("token_embd.weight")?;
         let [cols, rows] = embd.dims[..] else {
             return Err(err(format!("token_embd.weight has shape {:?}", embd.dims)));
@@ -543,6 +555,24 @@ mod tests {
             "9 tokens cross a 4-token window"
         );
         assert!(!close(&base, &sunk, 1e-4), "the sink logit takes mass");
+    }
+
+    #[test]
+    fn an_expert_bias_tensor_is_refused() {
+        let c = test_config();
+        let bytes = crate::testgguf::tiny_flint_builder(&c, VOCAB, 0.5, 7)
+            .tensor(
+                "blk.1.ffn_exp_probs_b.bias",
+                &[c.experts as u64],
+                crate::gguf::GGML_F32,
+                &vec![0; 4 * c.experts],
+            )
+            .bytes();
+        let file = GgufFile::from_bytes(&bytes).unwrap();
+        let Err(e) = Model::from_file(file, &Device::Cpu, 64) else {
+            panic!("a file with an expert bias loaded");
+        };
+        assert!(e.0.contains("blk.1.ffn_exp_probs_b.bias"), "{e}");
     }
 
     #[test]
