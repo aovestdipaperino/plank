@@ -77,6 +77,14 @@ pub trait SessionModel: std::fmt::Debug {
 
     /// The device the cache lives on.
     fn device(&self) -> &Device;
+
+    /// Runs `f`, which reads or rebuilds a cache on [`Self::device`]
+    /// outside a forward (a snapshot or a restore), excluded from this
+    /// model's forwards on other threads when the device needs that. The
+    /// default runs `f` as is.
+    fn device_exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 
 impl SessionModel for Model {
@@ -241,7 +249,9 @@ impl<M: SessionModel> Session<M> {
             .iter()
             .map(|w| w.map(|w| w + self.slack))
             .collect();
-        let body = self.cache.to_bytes_windowed(&keep)?;
+        let body = self
+            .model
+            .device_exclusive(|| self.cache.to_bytes_windowed(&keep))?;
         let n = u32::try_from(self.tokens.len()).map_err(|_| {
             Error(format!(
                 "{} tokens do not fit a snapshot",
@@ -313,7 +323,8 @@ impl<M: SessionModel> Session<M> {
             .collect();
         let shape = self.model.kv_shape();
         let mut cache = KvCache::new(shape.len());
-        cache.restore(body, self.model.device(), &shape)?;
+        self.model
+            .device_exclusive(|| cache.restore(body, self.model.device(), &shape))?;
         if let Some(i) = cache.layers.iter().position(|l| l.len() != n) {
             return Err(Error(format!(
                 "snapshot: n_tokens {n} but KV layer {i} holds {}",

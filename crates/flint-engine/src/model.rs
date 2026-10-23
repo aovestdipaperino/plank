@@ -9,7 +9,7 @@
 //! the CPU, so it never occupies device memory.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use candle_core::{Device, Tensor};
 use gemma_engine::kv::KvCache;
@@ -55,6 +55,15 @@ pub struct Model {
     device: Device,
     context_length: usize,
     signature: [u8; 32],
+    /// Held on Metal for a whole forward, and around a session's snapshot
+    /// and restore, which also run kernels on the cache. candle 0.9.2's
+    /// `MetalDevice` is only correct for one thread at a time: its encoders
+    /// come from a pool of command buffers that commit independently, and a
+    /// thread whose encoder finds another thread's still open takes a
+    /// different buffer, so one forward's kernels can land in several
+    /// buffers and run out of order on the GPU (FINDINGS, "Two threads on
+    /// one Metal device"). Serialising that work keeps it in order.
+    gpu: Mutex<()>,
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
@@ -273,6 +282,7 @@ impl Model {
             device: device.clone(),
             context_length,
             signature,
+            gpu: Mutex::new(()),
         }))
     }
 
@@ -358,6 +368,15 @@ impl Model {
         Ok(Tensor::from_vec(out, (tokens.len(), d), &self.device)?)
     }
 
+    /// The [`Self::gpu`] lock on Metal, `None` on the CPU. A panic while it
+    /// was held leaves nothing the next holder depends on, so a poisoned
+    /// lock is still usable.
+    fn gpu_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.device
+            .is_metal()
+            .then(|| self.gpu.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Runs `tokens` at positions `offset..`, extending `cache`, and returns
     /// the last position's logits.
     ///
@@ -366,6 +385,9 @@ impl Model {
     /// match the model, or a device failure. On an error the cache may hold
     /// part of this forward; the caller truncates it back to `offset`.
     pub fn forward(&self, tokens: &[u32], offset: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        // Released when the forward returns, after `to_vec1` has waited for
+        // the GPU.
+        let _gpu = self.gpu_guard();
         let t = tokens.len();
         if t == 0 {
             return Err(err("forward over no tokens"));
@@ -464,6 +486,11 @@ impl SessionModel for Model {
 
     fn device(&self) -> &Device {
         Model::device(self)
+    }
+
+    fn device_exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _gpu = self.gpu_guard();
+        f()
     }
 }
 #[cfg(test)]
@@ -681,6 +708,81 @@ mod tests {
             return;
         };
         a_trimmed_restore_matches_a_session_never_snapshotted(&dev);
+    }
+
+    /// One prefill of `long_prompt(40)` and eight steps, every step's logits.
+    fn prefill_and_steps(m: &Arc<Model>) -> Vec<Vec<f32>> {
+        let mut s = Session::new(m.clone(), 256);
+        let mut out = vec![s.prefill(&long_prompt(40), &|| false).unwrap().unwrap()];
+        for t in 0..8 {
+            out.push(s.step(t * 29 % 256).unwrap());
+        }
+        out
+    }
+
+    /// Sessions on two threads over one `Arc<Model>` on Metal each get what
+    /// a lone session gets: forwards from different threads must not
+    /// interleave their GPU work (see `Model::gpu`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_threads_on_one_metal_model_match_one_thread() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let m = long_model_on(&dev);
+        let want = prefill_and_steps(&m);
+        for round in 0..4 {
+            let runs: Vec<_> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..2).map(|_| s.spawn(|| prefill_and_steps(&m))).collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (th, got) in runs.iter().enumerate() {
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(close(g, w, 1e-5), "round {round}, thread {th}, forward {i}");
+                }
+            }
+        }
+    }
+
+    /// A snapshot and a restore also run kernels (the cache's copies), so
+    /// on Metal they must not interleave with another thread's forward.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshots_and_restores_beside_a_forward_on_metal_are_exact() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let m = long_model_on(&dev);
+        let mut a = Session::new(m.clone(), 256);
+        a.prefill(&long_prompt(100), &|| false).unwrap();
+        let blob = a.snapshot().unwrap();
+        let next = {
+            let mut b = Session::new(m.clone(), 256);
+            b.restore(&blob).unwrap();
+            b.step(3).unwrap()
+        };
+        let want = prefill_and_steps(&m);
+        for round in 0..4 {
+            std::thread::scope(|s| {
+                let side = s.spawn(|| {
+                    for _ in 0..10 {
+                        assert!(a.snapshot().unwrap() == blob, "round {round}: snapshot");
+                        let mut b = Session::new(m.clone(), 256);
+                        b.restore(&blob).unwrap();
+                        assert!(
+                            close(&b.step(3).unwrap(), &next, 1e-5),
+                            "round {round}: restore"
+                        );
+                    }
+                });
+                for (i, (g, w)) in prefill_and_steps(&m).iter().zip(&want).enumerate() {
+                    assert!(close(g, w, 1e-5), "round {round}, forward {i}");
+                }
+                side.join().unwrap();
+            });
+        }
     }
 
     #[cfg(target_os = "macos")]

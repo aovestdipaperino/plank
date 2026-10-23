@@ -3799,3 +3799,35 @@ Two spec deviations remain. The KV cache is f32, reusing gemma-engine's
 cache, at 200,704 bytes per token instead of f16's 100,352. The shared
 sampler does not apply top_k; the GGUF suggests 20, recorded in
 `FlintConfig::sampling` for part C to apply.
+
+## Two threads on one Metal device: candle 0.9.2 runs their kernels out of order
+
+Two sessions over one `Arc<flint_engine::model::Model>` on Metal, prefilling
+on two threads at once, returned garbage logits (argmax 0 everywhere), while
+each alone was exact. The cause is candle, not the NVFP4 kernels: the same
+two-thread check fails 16 of 16 runs with nothing but stock candle ops (a
+matmul, `tanh` and `rms_norm` chain), and on a gemma-engine tiny model too.
+
+A `MetalDevice` encodes into a pool of five command buffers
+(`candle-metal-kernels` 0.9.2, `metal/commands.rs`). `command_encoder()`
+takes the first entry whose encoder is not open, and each entry commits on
+its own, when it reaches 50 encoders or at a flush. One thread always ends
+its encoder before asking for the next, so it always gets entry 0 and its
+kernels run in program order. With two threads, a thread whose next encoder
+finds entry 0 still open on the other thread gets entry 1, and its following
+kernel may go back to entry 0: one thread's work is now split over command
+buffers whose GPU order is their commit order, not the order the work was
+encoded, so a kernel can read its input before the kernel writing it has
+run. Buffer recycling makes it worse: candle reuses a buffer as soon as no
+tensor holds it, which is only safe when everything runs in one order.
+`CANDLE_METAL_COMMAND_POOL_SIZE=1` makes every probe and the model check
+pass, which confirms the mechanism.
+
+Flint therefore serialises its own GPU work: `Model` holds a `Mutex` on
+Metal for a whole `forward`, and `SessionModel::device_exclusive` (a no-op
+by default) lets it hold the same lock around a session's `snapshot` and
+`restore`, which run kernels on the cache outside any forward (a snapshot
+beside another thread's forward came back wrong in about half the runs with
+only the forward locked). The lock is per `Model`: two models sharing one
+`Device` clone, or Flint and Gemma on the same device, are not excluded from
+each other. Gemma has the same bug and is not fixed here.
