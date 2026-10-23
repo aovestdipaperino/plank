@@ -302,9 +302,10 @@ fn parse_stanza(s: &[u8]) -> Stanza {
         if key.is_empty() {
             return Stanza::Malformed("empty argument key".to_owned());
         }
-        if call.args.iter().any(|a| a.name == key) {
-            return Stanza::Malformed(format!("duplicate key {key}"));
-        }
+        // A key may repeat with the very same value (Flint ends some `edit`
+        // calls with their `path` again); the repeat is dropped once its
+        // value is read. A repeat with another value is an error.
+        let seen = call.args.iter().position(|a| a.name == key);
         i = skip_ws(s, key_at + rel + KEY_CLOSE.len());
         let rest = &s[i..];
         if !rest.starts_with(VALUE_OPEN) {
@@ -321,11 +322,20 @@ fn parse_stanza(s: &[u8]) -> Stanza {
             });
         };
         let raw_value = &s[value_at..value_at + rel];
-        call.args.push(ToolArg {
-            name: key,
-            value: String::from_utf8_lossy(raw_value).into_owned(),
-            is_string: !crate::qwen::value_is_json(raw_value),
-        });
+        let value = String::from_utf8_lossy(raw_value).into_owned();
+        match seen {
+            Some(at) if call.args[at].value == value => {}
+            Some(_) => {
+                return Stanza::Malformed(format!(
+                    "argument {key} given twice with different values; give each argument once"
+                ));
+            }
+            None => call.args.push(ToolArg {
+                name: key,
+                value,
+                is_string: !crate::qwen::value_is_json(raw_value),
+            }),
+        }
         i = value_at + rel + VALUE_CLOSE.len();
     }
 }
@@ -395,6 +405,25 @@ mod tests {
         }
     }
 
+    /// Flint sometimes ends an `edit` call with its `path` again, the same
+    /// value as the first: the call is unambiguous and parses as if the
+    /// repeat were not there.
+    #[test]
+    fn a_key_repeated_with_the_same_value_is_dropped() {
+        let p = parse_all(
+            "<tool_call>edit<arg_key>path</arg_key><arg_value>/a.rs</arg_value>\
+             <arg_key>old</arg_key><arg_value>x</arg_value>\
+             <arg_key>new</arg_key><arg_value>y</arg_value>\
+             <arg_key>path</arg_key><arg_value>/a.rs</arg_value></tool_call>",
+        );
+        assert_eq!(p.state(), DsmlState::Done);
+        let calls = p.calls();
+        assert_eq!(calls.len(), 1);
+        let names: Vec<&str> = calls[0].args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["path", "old", "new"]);
+        assert_eq!(calls[0].args[0].value, "/a.rs");
+    }
+
     #[test]
     fn malformed_stanzas_are_errors() {
         for (s, why) in [
@@ -404,7 +433,7 @@ mod tests {
             ),
             (
                 "<tool_call>x<arg_key>a</arg_key><arg_value>1</arg_value><arg_key>a</arg_key><arg_value>2</arg_value></tool_call>",
-                "duplicate key a",
+                "argument a given twice with different values",
             ),
             (
                 "<tool_call>x<arg_key>a</arg_key>junk<arg_value>1</arg_value></tool_call>",
