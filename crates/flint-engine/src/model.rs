@@ -579,6 +579,74 @@ mod tests {
         );
     }
 
+    /// A 256-position model with a 4-token window, so a snapshot after 100
+    /// tokens trims its sliding layers ([`SNAPSHOT_SLACK`] is 64).
+    ///
+    /// [`SNAPSHOT_SLACK`]: gemma_engine::session::SNAPSHOT_SLACK
+    fn long_model_on(device: &Device) -> Arc<Model> {
+        let mut c = test_config();
+        c.context_length = 256;
+        let file = GgufFile::from_bytes(&tiny_flint(&c, VOCAB, 0.5, 7)).unwrap();
+        Model::from_file(file, device, 256).unwrap()
+    }
+
+    fn long_prompt(n: u32) -> Vec<u32> {
+        (0..n).map(|i| (i * 37 + 11) % 256).collect()
+    }
+
+    fn a_trimmed_restore_matches_a_session_never_snapshotted(dev: &Device) {
+        let m = long_model_on(dev);
+        let prompt = long_prompt(100);
+        let tail = long_prompt(121)[101..].to_vec();
+        let fresh = || {
+            let mut s = Session::new(m.clone(), 256);
+            s.prefill(&prompt, &|| false).unwrap();
+            s
+        };
+        let blob = fresh().snapshot().unwrap();
+        let restored = || {
+            let mut s = Session::new(m.clone(), 256);
+            s.restore(&blob).unwrap();
+            s
+        };
+        assert_eq!(
+            restored().reusable(10),
+            0,
+            "the sliding layers were trimmed"
+        );
+
+        let (mut a, mut b) = (fresh(), restored());
+        assert!(close(&b.step(3).unwrap(), &a.step(3).unwrap(), 1e-5));
+        let want = a.prefill(&tail, &|| false).unwrap().unwrap();
+        let got = b.prefill(&tail, &|| false).unwrap().unwrap();
+        assert_eq!(tail.len(), 20);
+        assert!(close(&got, &want, 1e-5), "a 20-token prefill after restore");
+
+        let mut c = restored();
+        assert_eq!(c.truncate(50), 50);
+        let got = c.prefill(&prompt[50..], &|| false).unwrap().unwrap();
+        let want = Session::new(m.clone(), 256)
+            .prefill(&prompt, &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(close(&got, &want, 1e-4), "truncate(50) then re-prefill");
+    }
+
+    #[test]
+    fn a_trimmed_restore_matches_a_session_never_snapshotted_on_the_cpu() {
+        a_trimmed_restore_matches_a_session_never_snapshotted(&Device::Cpu);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_trimmed_restore_matches_a_session_never_snapshotted_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        a_trimmed_restore_matches_a_session_never_snapshotted(&dev);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_matches_the_cpu() {
