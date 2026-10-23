@@ -57,10 +57,13 @@ impl Sampler {
         if !max.is_finite() {
             return argmax(logits);
         }
+        // A -inf logit (one a top-k filter removed) has probability 0 and can
+        // never be drawn; leaving it out keeps the exps and the sort to the
+        // live candidates instead of the whole vocabulary.
         let mut probs: Vec<(usize, f64)> = logits
             .iter()
             .enumerate()
-            .filter(|(_, l)| !l.is_nan())
+            .filter(|(_, l)| !l.is_nan() && **l != f32::NEG_INFINITY)
             .map(|(i, &l)| (i, ((f64::from(l) - f64::from(max)) / t).exp()))
             .collect();
         let sum: f64 = probs.iter().map(|(_, p)| p).sum();
@@ -136,6 +139,20 @@ mod tests {
         // correct sampler draws one now and then: "dominate", not "only".
         let top2 = a.iter().filter(|&&t| t == 1 || t == 3).count();
         assert!(top2 >= 16, "top-2 dominate: {a:?}");
+    }
+
+    /// Masked logits are never drawn, even by the rounding fallback that
+    /// returns the last candidate.
+    #[test]
+    fn a_masked_logit_is_never_drawn() {
+        let mut logits = vec![f32::NEG_INFINITY; 1000];
+        logits[3] = 1.0;
+        logits[500] = 1.0;
+        let mut s = Sampler::new(2);
+        for _ in 0..200 {
+            let t = s.sample(&logits, 0.6, 1.0, 0.0, false);
+            assert!(t == 3 || t == 500, "{t}");
+        }
     }
 
     #[test]
