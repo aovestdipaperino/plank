@@ -25,15 +25,43 @@ use crate::{Error, Result};
 ///
 /// `base` is the absolute position of buffer index 0 and `len` the absolute
 /// end, so the buffer holds `len - base` positions.
-#[derive(Debug, Default)]
+///
+/// The buffers hold `dtype` (f32 unless the cache was made with another):
+/// [`LayerKv::append`] converts into it, and snapshots widen it to f32.
+#[derive(Debug)]
 pub struct LayerKv {
     k: Option<Tensor>,
     v: Option<Tensor>,
     base: usize,
     len: usize,
+    dtype: DType,
+}
+
+impl Default for LayerKv {
+    fn default() -> Self {
+        Self::with_dtype(DType::F32)
+    }
 }
 
 impl LayerKv {
+    /// An empty layer whose buffers will hold `dtype`.
+    #[must_use]
+    pub fn with_dtype(dtype: DType) -> Self {
+        Self {
+            k: None,
+            v: None,
+            base: 0,
+            len: 0,
+            dtype,
+        }
+    }
+
+    /// The element type of the buffers.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     /// The absolute length: one past the last live position.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -128,8 +156,8 @@ impl LayerKv {
             }
             _ => ((stored + n).max(256).next_power_of_two(), None),
         };
-        let new_k = Tensor::zeros((1, kv_heads, cap, head_dim), DType::F32, device)?;
-        let new_v = Tensor::zeros((1, kv_heads, cap, head_dim), DType::F32, device)?;
+        let new_k = Tensor::zeros((1, kv_heads, cap, head_dim), self.dtype, device)?;
+        let new_v = Tensor::zeros((1, kv_heads, cap, head_dim), self.dtype, device)?;
         if let Some((k, v)) = live
             && stored > 0
         {
@@ -181,8 +209,8 @@ impl LayerKv {
     /// # Panics
     /// Never in practice: [`LayerKv::reserve`] has just made both buffers.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
-        let k = k.to_dtype(DType::F32)?.contiguous()?;
-        let v = v.to_dtype(DType::F32)?.contiguous()?;
+        let k = k.to_dtype(self.dtype)?.contiguous()?;
+        let v = v.to_dtype(self.dtype)?.contiguous()?;
         let (_, kv_heads, n, head_dim) = k.dims4()?;
         if n == 0 {
             return Ok(());
@@ -200,15 +228,29 @@ impl LayerKv {
 #[derive(Debug)]
 pub struct KvCache {
     pub layers: Vec<LayerKv>,
+    dtype: DType,
 }
 
 impl KvCache {
-    /// `n_layers` empty layers.
+    /// `n_layers` empty f32 layers.
     #[must_use]
     pub fn new(n_layers: usize) -> Self {
+        Self::with_dtype(n_layers, DType::F32)
+    }
+
+    /// `n_layers` empty layers holding `dtype`.
+    #[must_use]
+    pub fn with_dtype(n_layers: usize, dtype: DType) -> Self {
         Self {
-            layers: (0..n_layers).map(|_| LayerKv::default()).collect(),
+            layers: (0..n_layers).map(|_| LayerKv::with_dtype(dtype)).collect(),
+            dtype,
         }
+    }
+
+    /// The element type every layer holds.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// The shared live length across all layers (0 when empty). All layers
@@ -312,8 +354,9 @@ impl KvCache {
                     out.extend_from_slice(
                         &u32::try_from(head_dim).unwrap_or(u32::MAX).to_le_bytes(),
                     );
-                    extend_f32_le(&mut out, &k.flatten_all()?.to_vec1::<f32>()?);
-                    extend_f32_le(&mut out, &v.flatten_all()?.to_vec1::<f32>()?);
+                    let wide = |t: &Tensor| t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>();
+                    extend_f32_le(&mut out, &wide(&k)?);
+                    extend_f32_le(&mut out, &wide(&v)?);
                 }
             }
         }
@@ -361,7 +404,7 @@ impl KvCache {
                 )));
             }
 
-            let mut layer = LayerKv::default();
+            let mut layer = LayerKv::with_dtype(self.dtype);
             if len > 0 {
                 let n_floats = len * kv_heads * head_dim;
                 let byte_len = n_floats * 4;
@@ -442,6 +485,30 @@ mod tests {
             .unwrap()
             .reshape((1, 1, n, 1))
             .unwrap()
+    }
+
+    /// An f16 cache stores f16, snapshots as f32, and restores into f16
+    /// with the same values (the test values are exact in f16).
+    #[test]
+    fn an_f16_cache_round_trips_through_an_f32_snapshot() {
+        let mut c = KvCache::with_dtype(1, DType::F16);
+        c.layers[0].append(&kv(0.0, 5), &kv(10.0, 5)).unwrap();
+        assert_eq!(c.layers[0].view().unwrap().unwrap().0.dtype(), DType::F16);
+        let bytes = c.to_bytes().unwrap();
+        let mut back = KvCache::with_dtype(1, DType::F16);
+        back.restore(&bytes, &Device::Cpu, &[(1, 1)]).unwrap();
+        let (k, v) = back.layers[0].view().unwrap().unwrap();
+        assert_eq!(k.dtype(), DType::F16);
+        let wide = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(wide(k), [0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(wide(v), [10.0, 11.0, 12.0, 13.0, 14.0]);
     }
 
     #[test]

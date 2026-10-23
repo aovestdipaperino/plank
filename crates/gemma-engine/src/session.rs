@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use candle_core::Device;
+use candle_core::{DType, Device};
 
 use crate::kv::KvCache;
 use crate::model::Model;
@@ -74,6 +74,12 @@ pub trait SessionModel: std::fmt::Debug {
 
     /// The sliding window of each KV layer: `Some` for a sliding layer.
     fn kv_windows(&self) -> Vec<Option<usize>>;
+
+    /// The element type the KV cache stores (f32 by default). Snapshots
+    /// hold f32 whatever it is.
+    fn kv_dtype(&self) -> DType {
+        DType::F32
+    }
 
     /// The device the cache lives on.
     fn device(&self) -> &Device;
@@ -143,9 +149,10 @@ impl<M: SessionModel> Session<M> {
         let n = model.kv_shape().len();
         let ctx = ctx.min(model.context_length());
         let windows = model.kv_windows();
+        let cache = KvCache::with_dtype(n, model.kv_dtype());
         Self {
             model,
-            cache: KvCache::new(n),
+            cache,
             tokens: Vec::new(),
             ctx,
             windows,
@@ -328,7 +335,7 @@ impl<M: SessionModel> Session<M> {
             .map(|c| u32::from_le_bytes(*c))
             .collect();
         let shape = self.model.kv_shape();
-        let mut cache = KvCache::new(shape.len());
+        let mut cache = KvCache::with_dtype(shape.len(), self.model.kv_dtype());
         self.model
             .device_exclusive(|| cache.restore(body, self.model.device(), &shape))?;
         if let Some(i) = cache.layers.iter().position(|l| l.len() != n) {
