@@ -81,7 +81,8 @@ pub trait SessionModel: std::fmt::Debug {
     /// Runs `f`, which reads or rebuilds a cache on [`Self::device`]
     /// outside a forward (a snapshot or a restore), excluded from this
     /// model's forwards on other threads when the device needs that. The
-    /// default runs `f` as is.
+    /// default runs `f` as is. `f` must not call [`Self::forward`]: an
+    /// implementation may hold a lock that `forward` also takes.
     fn device_exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
         f()
     }

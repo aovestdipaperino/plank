@@ -3830,4 +3830,5 @@ by default) lets it hold the same lock around a session's `snapshot` and
 beside another thread's forward came back wrong in about half the runs with
 only the forward locked). The lock is per `Model`: two models sharing one
 `Device` clone, or Flint and Gemma on the same device, are not excluded from
-each other. Gemma has the same bug and is not fixed here.
+each other, and loading a model (its RoPE tables and tensor uploads) runs
+kernels before the lock exists. Gemma has the same bug and is not fixed here.
