@@ -104,7 +104,15 @@ impl Attention {
         // Head dims are small integers, exact in f64.
         #[allow(clippy::cast_precision_loss)]
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let ctx = attend(&q, &keys, &values, &self.sinks, mask, scale)?;
+        let fused = if mask.is_none() {
+            decode_attend(&q, &keys, &values, &self.sinks, scale)?
+        } else {
+            None
+        };
+        let ctx = match fused {
+            Some(ctx) => ctx,
+            None => attend(&q, &keys, &values, &self.sinks, mask, scale)?,
+        };
         let ctx = ctx
             .squeeze(0)?
             .transpose(0, 1)?
@@ -159,6 +167,117 @@ pub(crate) fn attend(
         .reshape((1, kv_heads, rep * t, keys))?
         .matmul(value)?
         .reshape((1, heads, t, d))
+}
+
+/// [`attend`] for a single query through the fused Metal kernels
+/// (`fused.metal`), which read the cache in place instead of copying
+/// it into a transposed key matrix and a score tensor per head. `None` when
+/// they do not apply: not on Metal, more than one query, or a shape or
+/// layout they do not take; the caller then runs [`attend`].
+#[cfg(target_os = "macos")]
+pub(crate) fn decode_attend(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    sinks: &Tensor,
+    scale: f64,
+) -> Result<Option<Tensor>> {
+    use candle_core::Storage;
+    use candle_core::op::BackpropOp;
+
+    use crate::nvfp4::metal::{ATTN_HEAD_DIM, ATTN_SG, decode_attention};
+
+    let (_, heads, t, d) = query.dims4()?;
+    let (_, kv_heads, keys, key_d) = key.dims4()?;
+    let fits = query.device().is_metal()
+        && t == 1
+        && d == ATTN_HEAD_DIM
+        && key_d == d
+        && value.dims() == key.dims()
+        && keys > 0
+        && kv_heads > 0
+        && heads.is_multiple_of(kv_heads)
+        && heads / kv_heads <= ATTN_SG;
+    if !fits {
+        return Ok(None);
+    }
+    let query = query.contiguous()?;
+    let sinks = sinks.contiguous()?;
+    let (q_store, q_layout) = query.storage_and_layout();
+    let (k_store, k_layout) = key.storage_and_layout();
+    let (v_store, v_layout) = value.storage_and_layout();
+    let (s_store, s_layout) = sinks.storage_and_layout();
+    let (
+        Storage::Metal(q_metal),
+        Storage::Metal(k_metal),
+        Storage::Metal(v_metal),
+        Storage::Metal(s_metal),
+    ) = (&*q_store, &*k_store, &*v_store, &*s_store)
+    else {
+        return Ok(None);
+    };
+    let (Some(k_op), Some(v_op)) = (
+        kv_operand(k_metal, k_layout, d),
+        kv_operand(v_metal, v_layout, d),
+    ) else {
+        return Ok(None);
+    };
+    if !q_layout.start_offset().is_multiple_of(4) {
+        return Ok(None);
+    }
+    // The kernel takes the scale as f32, as every score is.
+    #[allow(clippy::cast_possible_truncation)]
+    let out = decode_attention(
+        q_metal,
+        q_layout.start_offset() * 4,
+        &k_op,
+        &v_op,
+        (s_metal, s_layout.start_offset() * 4),
+        heads,
+        kv_heads,
+        keys,
+        scale as f32,
+    )?;
+    Ok(Some(Tensor::from_storage(
+        Storage::Metal(out),
+        (1, heads, 1, d),
+        BackpropOp::none(),
+        false,
+    )))
+}
+
+/// Where [`decode_attend`] reads a KV operand: `[1, kv_heads, keys, d]` with
+/// each key's values adjacent and every head's first key on a 16-byte
+/// boundary, as the kernel's float4 loads need. `None` for any other layout.
+#[cfg(target_os = "macos")]
+fn kv_operand<'a>(
+    storage: &'a candle_core::MetalStorage,
+    layout: &candle_core::Layout,
+    d: usize,
+) -> Option<crate::nvfp4::metal::KvOperand<'a>> {
+    let stride = layout.stride();
+    (stride[3] == 1
+        && stride[2] == d
+        && stride[1].is_multiple_of(4)
+        && layout.start_offset().is_multiple_of(4))
+    .then(|| crate::nvfp4::metal::KvOperand {
+        storage,
+        offset: layout.start_offset() * 4,
+        head_stride: stride[1],
+    })
+}
+
+/// Off macOS there are no Metal kernels: always [`attend`].
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn decode_attend(
+    _query: &Tensor,
+    _key: &Tensor,
+    _value: &Tensor,
+    _sinks: &Tensor,
+    _scale: f64,
+) -> Result<Option<Tensor>> {
+    Ok(None)
 }
 
 /// The additive mask for `t` queries at `offset..` over keys at
@@ -372,5 +491,96 @@ mod tests {
         let k = Tensor::ones((1, 1, 2, 4), candle_core::DType::F32, &dev).unwrap();
         let s = Tensor::new(&[0f32], &dev).unwrap();
         assert!(attend(&q, &k, &k, &s, None, 1.0).is_err());
+    }
+
+    /// The fused single-query kernels against [`attend`] on Metal: several
+    /// grouping ratios, key counts on both sides of a chunk boundary, and
+    /// keys narrowed out of a larger cache buffer at an offset, as the
+    /// sliding layers read them. Large score magnitudes check the max
+    /// subtraction across chunks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fused_decode_kernels_match_attend_on_metal() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let d = 128;
+        for (case, &(heads, kv_heads, keys, cap, start, amp)) in [
+            (32, 4, 1, 256, 0, 1.0f32),
+            (32, 4, 7, 256, 0, 1.0),
+            (32, 4, 128, 256, 0, 1.0),
+            (32, 4, 129, 512, 0, 4.0),
+            (32, 4, 1000, 1024, 5, 1.0),
+            (8, 8, 300, 512, 3, 1.0),
+            (16, 2, 2500, 4096, 100, 8.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seed = case as u64 * 10;
+            let buf = |seed: u64| {
+                let v: Vec<f32> = rand(kv_heads * cap * d, seed)
+                    .iter()
+                    .map(|x| x * amp)
+                    .collect();
+                Tensor::from_vec(v, (1, kv_heads, cap, d), &dev).unwrap()
+            };
+            let k = buf(seed + 1).narrow(2, start, keys).unwrap();
+            let v = buf(seed + 2).narrow(2, start, keys).unwrap();
+            let q = Tensor::from_vec(rand(heads * d, seed + 3), (1, heads, 1, d), &dev).unwrap();
+            let sinks = Tensor::from_vec(rand(heads, seed + 4), heads, &dev).unwrap();
+            let scale = 1.0 / 128f64.sqrt();
+            let want: Vec<f32> = attend(&q, &k, &v, &sinks, None, scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let got: Vec<f32> = decode_attend(&q, &k, &v, &sinks, scale)
+                .unwrap()
+                .expect("the fused kernels take this shape")
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4 * amp, "case {case}: max diff {worst}");
+        }
+    }
+
+    /// More than one query, or a head size the kernels do not take, falls
+    /// back to [`attend`].
+    #[test]
+    fn the_fused_decode_kernels_decline_what_they_do_not_take() {
+        let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let z = |s: (usize, usize, usize, usize)| {
+            Tensor::zeros(s, candle_core::DType::F32, &dev).unwrap()
+        };
+        let sinks = Tensor::zeros(32, candle_core::DType::F32, &dev).unwrap();
+        let k = z((1, 4, 10, 128));
+        assert!(
+            decode_attend(&z((1, 32, 2, 128)), &k, &k, &sinks, 1.0)
+                .unwrap()
+                .is_none()
+        );
+        let k64 = z((1, 4, 10, 64));
+        assert!(
+            decode_attend(&z((1, 32, 1, 64)), &k64, &k64, &sinks, 1.0)
+                .unwrap()
+                .is_none()
+        );
+        let cpu = |s| Tensor::zeros(s, candle_core::DType::F32, &Device::Cpu).unwrap();
+        let kc = cpu((1, 4, 10, 128));
+        let sc = Tensor::zeros(32, candle_core::DType::F32, &Device::Cpu).unwrap();
+        assert!(
+            decode_attend(&cpu((1, 32, 1, 128)), &kc, &kc, &sc, 1.0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

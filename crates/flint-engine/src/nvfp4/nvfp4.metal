@@ -24,19 +24,40 @@ inline float ue4m3_to_f32(uchar x) {
     return raw * 0.5f;
 }
 
-// Dot of sub-block `sb` (16 values) of one row with the matching x values.
-inline float sub_dot(device const uchar *row, uint sb, device const float *x) {
-    uint b = sb >> 2;
-    uint s = sb & 3;
-    device const uchar *blk = row + b * 36;
-    device const uchar *qs = blk + 4 + s * 8;
-    device const float *xs = x + b * 64 + s * 16;
-    float acc = 0.0f;
-    for (uint j = 0; j < 8; ++j) {
-        uchar q = qs[j];
-        acc += KVALUES[q & 0xF] * xs[j] + KVALUES[q >> 4] * xs[j + 8];
+// Adds to acc[r] this lane's share of the dot of rows r < rows (row_bytes
+// apart from w0) with x, k values long. The lane takes every SIMD_WIDTH-th
+// 16-value run of all the rows at once, so one x load serves every row and
+// the rows' code loads are in flight together. Codes are read as 32-bit
+// words: rows, blocks and runs all start on 4-byte boundaries.
+inline void rows_dot(
+    device const uchar *w0,
+    uint row_bytes,
+    uint rows,
+    device const float *x,
+    uint k,
+    uint lane,
+    thread float *acc)
+{
+    uint nsub = k / 16;
+    for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
+        uint b = sb >> 2;
+        uint s = sb & 3;
+        device const packed_float4 *xs = (device const packed_float4 *)(x + b * 64 + s * 16);
+        float4 xv[4] = {float4(xs[0]), float4(xs[1]), float4(xs[2]), float4(xs[3])};
+        for (uint r = 0; r < rows; ++r) {
+            device const uchar *blk = w0 + r * row_bytes + b * 36;
+            device const uint *qw = (device const uint *)(blk + 4 + s * 8);
+            uint q[2] = {qw[0], qw[1]};
+            float lo = 0.0f;
+            float hi = 0.0f;
+            for (uint j = 0; j < 8; ++j) {
+                uint byte = (q[j >> 2] >> ((j & 3) * 8)) & 0xFF;
+                lo += KVALUES[byte & 0xF] * xv[j >> 2][j & 3];
+                hi += KVALUES[byte >> 4] * xv[2 + (j >> 2)][j & 3];
+            }
+            acc[r] += (lo + hi) * ue4m3_to_f32(blk[s]);
+        }
     }
-    return acc * ue4m3_to_f32(blk[s]);
 }
 
 struct MatParams {
@@ -60,21 +81,17 @@ kernel void mv_nvfp4(
 {
     uint t = tg.y;
     uint row0 = (tg.x * MV_SG_PER_TG + sg) * MV_ROWS_PER_SG;
+    if (row0 >= p.n) {
+        return; // uniform across the simdgroup
+    }
+    uint rows = min(uint(MV_ROWS_PER_SG), p.n - row0);
     device const float *xt = x + (ulong)t * p.k;
-    uint nsub = p.k / 16;
-    for (uint r = 0; r < MV_ROWS_PER_SG; ++r) {
-        uint row = row0 + r;
-        if (row >= p.n) {
-            break; // uniform across the simdgroup
-        }
-        device const uchar *wr = w + (ulong)row * p.row_bytes;
-        float acc = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
-            acc += sub_dot(wr, sb, xt);
-        }
-        acc = simd_sum(acc);
+    float acc[MV_ROWS_PER_SG] = {};
+    rows_dot(w + (ulong)row0 * p.row_bytes, p.row_bytes, rows, xt, p.k, lane, acc);
+    for (uint r = 0; r < rows; ++r) {
+        float a = simd_sum(acc[r]);
         if (lane == 0) {
-            y[(ulong)t * p.n + row] = acc * p.scale;
+            y[(ulong)t * p.n + row0 + r] = a * p.scale;
         }
     }
 }
@@ -219,26 +236,21 @@ kernel void moe_gate_up(
         }
         return;
     }
+    if (row0 >= p.f) {
+        return;
+    }
+    uint rows = min(uint(MV_ROWS_PER_SG), p.f - row0);
     device const float *xt = x + (ulong)(slot / p.k_used) * p.d;
-    ulong base = (ulong)e * p.gu_expert_bytes;
-    uint nsub = p.d / 16;
-    for (uint r = 0; r < MV_ROWS_PER_SG; ++r) {
-        uint row = row0 + r;
-        if (row >= p.f) {
-            break;
-        }
-        device const uchar *rg = wg + base + (ulong)row * p.gu_row_bytes;
-        device const uchar *ru = wu + base + (ulong)row * p.gu_row_bytes;
-        float g = 0.0f;
-        float u = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
-            g += sub_dot(rg, sb, xt);
-            u += sub_dot(ru, sb, xt);
-        }
-        g = simd_sum(g) * gs[e];
-        u = simd_sum(u) * us[e];
+    ulong off = (ulong)e * p.gu_expert_bytes + (ulong)row0 * p.gu_row_bytes;
+    float g[MV_ROWS_PER_SG] = {};
+    float u[MV_ROWS_PER_SG] = {};
+    rows_dot(wg + off, p.gu_row_bytes, rows, xt, p.d, lane, g);
+    rows_dot(wu + off, p.gu_row_bytes, rows, xt, p.d, lane, u);
+    for (uint r = 0; r < rows; ++r) {
+        float gr = simd_sum(g[r]) * gs[e];
+        float ur = simd_sum(u[r]) * us[e];
         if (lane == 0) {
-            hs[row] = g / (1.0f + exp(-g)) * u;
+            hs[row0 + r] = gr / (1.0f + exp(-gr)) * ur;
         }
     }
 }
@@ -268,22 +280,18 @@ kernel void moe_down(
         }
         return;
     }
+    if (row0 >= p.d) {
+        return;
+    }
+    uint rows = min(uint(MV_ROWS_PER_SG), p.d - row0);
     device const float *hs = h + (ulong)slot * p.f;
-    ulong base = (ulong)e * p.down_expert_bytes;
-    uint nsub = p.f / 16;
-    for (uint r = 0; r < MV_ROWS_PER_SG; ++r) {
-        uint row = row0 + r;
-        if (row >= p.d) {
-            break;
-        }
-        device const uchar *rw = wd + base + (ulong)row * p.down_row_bytes;
-        float acc = 0.0f;
-        for (uint sb = lane; sb < nsub; sb += SIMD_WIDTH) {
-            acc += sub_dot(rw, sb, hs);
-        }
-        acc = simd_sum(acc);
+    ulong off = (ulong)e * p.down_expert_bytes + (ulong)row0 * p.down_row_bytes;
+    float acc[MV_ROWS_PER_SG] = {};
+    rows_dot(wd + off, p.down_row_bytes, rows, hs, p.f, lane, acc);
+    for (uint r = 0; r < rows; ++r) {
+        float a = simd_sum(acc[r]);
         if (lane == 0) {
-            yo[row] = acc * ds[e] * route[slot];
+            yo[row0 + r] = a * ds[e] * route[slot];
         }
     }
 }

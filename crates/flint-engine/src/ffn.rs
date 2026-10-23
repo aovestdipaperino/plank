@@ -56,6 +56,74 @@ impl Moe {
 /// when `norm`, then times `scale` unless it is 0 or 1. Returns the expert
 /// ids (`u32`) and weights (`f32`), both `[t, k]`.
 pub(crate) fn route(logits: &Tensor, k: usize, norm: bool, scale: f32) -> Result<(Tensor, Tensor)> {
+    if let Some(fused) = route_fused(logits, k, norm, scale)? {
+        return Ok(fused);
+    }
+    route_generic(logits, k, norm, scale)
+}
+
+/// [`route`] as one Metal kernel (`moe_route`) instead of nine ops, or
+/// `None` off Metal or for a `k` the kernel does not take. Ties between
+/// equal probabilities go to the lower expert id.
+#[cfg(target_os = "macos")]
+fn route_fused(
+    logits: &Tensor,
+    k: usize,
+    norm: bool,
+    scale: f32,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use candle_core::Storage;
+    use candle_core::op::BackpropOp;
+
+    use crate::nvfp4::metal::{ROUTE_MAX_EXPERTS, ROUTE_MAX_K, moe_route};
+
+    let (tokens, experts) = logits.dims2()?;
+    if !logits.device().is_metal()
+        || k == 0
+        || k > ROUTE_MAX_K
+        || k > experts
+        || experts > ROUTE_MAX_EXPERTS
+        || tokens == 0
+    {
+        return Ok(None);
+    }
+    let logits = logits.contiguous()?;
+    let (store, layout) = logits.storage_and_layout();
+    let Storage::Metal(m) = &*store else {
+        return Ok(None);
+    };
+    let applied = if scale.abs() > f32::EPSILON && (scale - 1.0).abs() > f32::EPSILON {
+        scale
+    } else {
+        1.0
+    };
+    // The floor is the smallest f16 normal, exact in f32.
+    #[allow(clippy::cast_possible_truncation)]
+    let (ids, weights) = moe_route(
+        m,
+        layout.start_offset() * 4,
+        (tokens, experts),
+        k,
+        norm,
+        (applied, MIN_WEIGHT_SUM as f32),
+    )?;
+    let wrap = |s| Tensor::from_storage(Storage::Metal(s), (tokens, k), BackpropOp::none(), false);
+    Ok(Some((wrap(ids), wrap(weights))))
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn route_fused(_: &Tensor, _: usize, _: bool, _: f32) -> Result<Option<(Tensor, Tensor)>> {
+    Ok(None)
+}
+
+/// [`route`] from candle ops, on any device.
+pub(crate) fn route_generic(
+    logits: &Tensor,
+    k: usize,
+    norm: bool,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
     let probs = candle_nn::ops::sigmoid(logits)?;
     let ids = probs
         .arg_sort_last_dim(false)?
@@ -128,5 +196,43 @@ mod tests {
             "{:?}",
             w[1]
         );
+    }
+
+    /// The fused `moe_route` kernel against the candle op chain on Metal,
+    /// with and without normalisation and scale, at decode and prefill
+    /// widths.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fused_route_matches_the_op_chain_on_metal() {
+        let Ok(dev) = candle_core::Device::new_metal(0) else {
+            eprintln!("no Metal device; skipped");
+            return;
+        };
+        let mut seed = 7u64;
+        for (tokens, norm, scale) in [(1usize, true, 1.0f32), (37, true, 2.5), (5, false, 0.0)] {
+            let v: Vec<f32> = (0..tokens * 256)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    #[allow(clippy::cast_precision_loss)]
+                    let x = ((seed >> 40) as f32) / (1u64 << 24) as f32;
+                    x * 8.0 - 4.0
+                })
+                .collect();
+            let logits = Tensor::from_vec(v, (tokens, 256), &dev).unwrap();
+            let (want_ids, want_w) = route_generic(&logits, 6, norm, scale).unwrap();
+            let (got_ids, got_w) = route(&logits, 6, norm, scale).unwrap();
+            assert_eq!(
+                got_ids.to_vec2::<u32>().unwrap(),
+                want_ids.to_vec2::<u32>().unwrap(),
+                "{tokens} tokens"
+            );
+            let (w, g) = (
+                want_w.to_vec2::<f32>().unwrap(),
+                got_w.to_vec2::<f32>().unwrap(),
+            );
+            for (a, b) in w.iter().flatten().zip(g.iter().flatten()) {
+                assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+            }
+        }
     }
 }

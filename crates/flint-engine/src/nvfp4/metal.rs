@@ -24,6 +24,9 @@ use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 
 /// The kernels, without their launch constants: [`source`] prepends those.
 const SOURCE: &str = include_str!("nvfp4.metal");
+/// The single-token attention and routing kernels, compiled into the same
+/// library.
+const FUSED_SOURCE: &str = include_str!("fused.metal");
 
 /// From this many tokens up, a matmul runs the tiled `mm_nvfp4` kernel.
 pub(crate) const MM_MIN_TOKENS: usize = 8;
@@ -43,6 +46,22 @@ const MM_TILE: usize = 32;
 const MM_THREADS: usize = 4 * SIMD_WIDTH;
 /// Threads per `moe_sum` threadgroup, one output column each.
 const SUM_THREADS: usize = 256;
+/// The head dimension the attention kernels take: four values per lane.
+pub(crate) const ATTN_HEAD_DIM: usize = 4 * SIMD_WIDTH;
+/// Keys per `attn_dec_partial` threadgroup.
+const ATTN_CHUNK: usize = 128;
+/// Simdgroups per `attn_dec_partial` threadgroup, which is also the most
+/// query heads one KV head may serve.
+pub(crate) const ATTN_SG: usize = 8;
+/// The most experts `moe_route` picks per token.
+pub(crate) const ROUTE_MAX_K: usize = 8;
+/// Threads per `moe_route` threadgroup, which routes one token.
+const ROUTE_THREADS: usize = 256;
+/// Experts each `moe_route` thread holds, so a token may have up to
+/// `ROUTE_THREADS * ROUTE_PER_THREAD` experts.
+const ROUTE_PER_THREAD: usize = 4;
+/// The most experts `moe_route` takes.
+pub(crate) const ROUTE_MAX_EXPERTS: usize = ROUTE_THREADS * ROUTE_PER_THREAD;
 
 // The 2x2 simdgroups of 16x16 patches cover exactly one tile.
 const _: () = assert!(MM_TILE == 2 * 16);
@@ -65,8 +84,16 @@ fn source() -> String {
          #define MM_TT {MM_TILE}\n\
          #define MM_THREADS {MM_THREADS}\n\
          #define SUM_THREADS {SUM_THREADS}\n\
+         #define ATTN_HEAD_DIM {ATTN_HEAD_DIM}\n\
+         #define ATTN_CHUNK {ATTN_CHUNK}\n\
+         #define ATTN_SG {ATTN_SG}\n\
+         #define ROUTE_MAX_K {ROUTE_MAX_K}\n\
+         #define ROUTE_THREADS {ROUTE_THREADS}\n\
+         #define ROUTE_PER_THREAD {ROUTE_PER_THREAD}\n\
          #line 1 \"nvfp4.metal\"\n\
-         {SOURCE}"
+         {SOURCE}\n\
+         #line 1 \"fused.metal\"\n\
+         {FUSED_SOURCE}"
     )
 }
 
@@ -78,6 +105,9 @@ pub(crate) struct Pipelines {
     pub moe_gate_up: ComputePipeline,
     pub moe_down: ComputePipeline,
     pub moe_sum: ComputePipeline,
+    pub attn_partial: ComputePipeline,
+    pub attn_combine: ComputePipeline,
+    pub moe_route: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -128,6 +158,9 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
         moe_gate_up: get("moe_gate_up", MV_THREADS)?,
         moe_down: get("moe_down", MV_THREADS)?,
         moe_sum: get("moe_sum", SUM_THREADS)?,
+        attn_partial: get("attn_dec_partial", ATTN_SG * SIMD_WIDTH)?,
+        attn_combine: get("attn_dec_combine", ATTN_HEAD_DIM)?,
+        moe_route: get("moe_route", ROUTE_THREADS)?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -435,6 +468,155 @@ pub(crate) fn moe(
     ))
 }
 
+/// Mirrors `AttnParams` in the shader.
+#[repr(C)]
+struct AttnParams {
+    keys: u32,
+    chunks: u32,
+    rep: u32,
+    k_head_stride: u32,
+    v_head_stride: u32,
+    scale: f32,
+}
+
+/// Where single-token attention reads one KV operand: the buffer, the byte
+/// offset of head 0's first key, and the values between heads.
+pub(crate) struct KvOperand<'a> {
+    pub storage: &'a MetalStorage,
+    pub offset: usize,
+    pub head_stride: usize,
+}
+
+/// Single-token attention on the GPU: `q` is `heads × ATTN_HEAD_DIM`
+/// (contiguous from `q_offset` bytes), `k`/`v` hold `keys` positions per KV
+/// head, `sinks` one logit per head. Returns `[heads × ATTN_HEAD_DIM]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_attention(
+    q: &MetalStorage,
+    q_offset: usize,
+    k: &KvOperand<'_>,
+    v: &KvOperand<'_>,
+    sinks: (&MetalStorage, usize),
+    heads: usize,
+    kv_heads: usize,
+    keys: usize,
+    scale: f32,
+) -> candle_core::Result<MetalStorage> {
+    for s in [q, k.storage, v.storage, sinks.0] {
+        if s.dtype() != DType::F32 {
+            candle_core::bail!("decode attention wants f32 operands");
+        }
+    }
+    if keys == 0 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) || heads / kv_heads > ATTN_SG {
+        candle_core::bail!(
+            "decode attention cannot take {heads} heads over {kv_heads} KV heads and {keys} keys"
+        );
+    }
+    let dev = q.device();
+    let pipes = pipelines(dev)?;
+    let rep = heads / kv_heads;
+    let chunks = keys.div_ceil(ATTN_CHUNK);
+    let params = AttnParams {
+        keys: u32_of(keys)?,
+        chunks: u32_of(chunks)?,
+        rep: u32_of(rep)?,
+        k_head_stride: u32_of(k.head_stride)?,
+        v_head_stride: u32_of(v.head_stride)?,
+        scale,
+    };
+    let slots = kv_heads * chunks * rep;
+    let part_o = dev.new_buffer(slots * ATTN_HEAD_DIM, DType::F32, "attn_dec_part_o")?;
+    let part_ml = dev.new_buffer(slots * 2, DType::F32, "attn_dec_part_ml")?;
+    let out = dev.new_buffer(heads * ATTN_HEAD_DIM, DType::F32, "attn_dec_out")?;
+    // Each scoped encoder ends before the next `command_encoder()`, so the
+    // two passes keep their order (see `moe`).
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("attn_dec_partial");
+        enc.set_compute_pipeline_state(&pipes.attn_partial);
+        enc.set_buffer(0, Some(q.buffer()), q_offset);
+        enc.set_buffer(1, Some(k.storage.buffer()), k.offset);
+        enc.set_buffer(2, Some(v.storage.buffer()), v.offset);
+        enc.set_buffer(3, Some(&part_o), 0);
+        enc.set_buffer(4, Some(&part_ml), 0);
+        enc.set_bytes(5, &params);
+        enc.dispatch_thread_groups(grid(chunks, kv_heads), grid(ATTN_SG * SIMD_WIDTH, 1));
+    }
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("attn_dec_combine");
+        enc.set_compute_pipeline_state(&pipes.attn_combine);
+        enc.set_buffer(0, Some(&part_o), 0);
+        enc.set_buffer(1, Some(&part_ml), 0);
+        enc.set_buffer(2, Some(sinks.0.buffer()), sinks.1);
+        enc.set_buffer(3, Some(&out), 0);
+        enc.set_bytes(4, &params);
+        enc.dispatch_thread_groups(grid(heads, 1), grid(ATTN_HEAD_DIM, 1));
+    }
+    Ok(MetalStorage::new(
+        out,
+        dev.clone(),
+        heads * ATTN_HEAD_DIM,
+        DType::F32,
+    ))
+}
+
+/// Mirrors `RouteParams` in the shader.
+#[repr(C)]
+struct RouteParams {
+    experts: u32,
+    k: u32,
+    tokens: u32,
+    norm: u32,
+    scale: f32,
+    min_sum: f32,
+}
+
+/// Sigmoid top-`k` routing of `logits [tokens, experts]` (contiguous from
+/// `offset` bytes) on the GPU. Returns the ids (`u32`) and weights (`f32`),
+/// both `tokens × k`; `scale` multiplies every weight.
+pub(crate) fn moe_route(
+    logits: &MetalStorage,
+    offset: usize,
+    (tokens, experts): (usize, usize),
+    k: usize,
+    norm: bool,
+    (scale, min_sum): (f32, f32),
+) -> candle_core::Result<(MetalStorage, MetalStorage)> {
+    if logits.dtype() != DType::F32 {
+        candle_core::bail!("moe_route wants f32 logits");
+    }
+    if k == 0 || k > ROUTE_MAX_K || k > experts || experts > ROUTE_MAX_EXPERTS {
+        candle_core::bail!("moe_route cannot pick {k} of {experts} experts");
+    }
+    let dev = logits.device();
+    let pipes = pipelines(dev)?;
+    let params = RouteParams {
+        experts: u32_of(experts)?,
+        k: u32_of(k)?,
+        tokens: u32_of(tokens)?,
+        norm: u32::from(norm),
+        scale,
+        min_sum,
+    };
+    let ids = dev.new_buffer(tokens * k, DType::U32, "moe_route_ids")?;
+    let weights = dev.new_buffer(tokens * k, DType::F32, "moe_route_weights")?;
+    {
+        let enc = dev.command_encoder()?;
+        enc.set_label("moe_route");
+        enc.set_compute_pipeline_state(&pipes.moe_route);
+        enc.set_buffer(0, Some(logits.buffer()), offset);
+        enc.set_buffer(1, Some(&ids), 0);
+        enc.set_buffer(2, Some(&weights), 0);
+        enc.set_bytes(3, &params);
+        enc.dispatch_thread_groups(grid(tokens, 1), grid(ROUTE_THREADS, 1));
+    }
+    Ok((
+        MetalStorage::new(ids, dev.clone(), tokens * k, DType::U32),
+        MetalStorage::new(weights, dev.clone(), tokens * k, DType::F32),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,13 +632,20 @@ mod tests {
             ("MM_TT", MM_TILE),
             ("MM_THREADS", MM_THREADS),
             ("SUM_THREADS", SUM_THREADS),
+            ("ATTN_HEAD_DIM", ATTN_HEAD_DIM),
+            ("ATTN_CHUNK", ATTN_CHUNK),
+            ("ATTN_SG", ATTN_SG),
+            ("ROUTE_MAX_K", ROUTE_MAX_K),
+            ("ROUTE_THREADS", ROUTE_THREADS),
+            ("ROUTE_PER_THREAD", ROUTE_PER_THREAD),
         ] {
             let line = format!("#define {name} {value}\n");
             assert!(src.starts_with(PRELUDE_MARK), "the prelude comes first");
             assert!(src.contains(&line), "missing {line:?}");
             assert!(
-                !SOURCE.contains(&format!("#define {name} ")),
-                "nvfp4.metal still defines {name} itself"
+                !SOURCE.contains(&format!("#define {name} "))
+                    && !FUSED_SOURCE.contains(&format!("#define {name} ")),
+                "a kernel file still defines {name} itself"
             );
         }
         for literal in ["e += 128", "* 256 + tid", "sb += 32", "tid >> 2"] {
