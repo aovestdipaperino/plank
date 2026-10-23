@@ -1204,6 +1204,21 @@ pub const FLINT_IN_THINK_LINE: &str = concat!(
     "finish thinking first, then emit the call."
 );
 
+/// Flint's guidance against drafting whole files in its reasoning, taught
+/// beside [`FLINT_IN_THINK_LINE`]: in real sessions it wrote complete
+/// programs (about 4 KB each) while thinking, which the draft guard then
+/// stopped, about 50 s of generation each time. Worded without the think
+/// tags for the same reason as that line.
+pub const FLINT_NO_DRAFT_LINE: &str = concat!(
+    "Do not write out code or file contents while thinking: plan briefly, ",
+    "then put the code straight into a write or edit call."
+);
+
+/// [`FLINT_IN_THINK_LINE`] and [`FLINT_NO_DRAFT_LINE`], one paragraph each.
+fn flint_guidance() -> String {
+    format!("{FLINT_IN_THINK_LINE}\n\n{FLINT_NO_DRAFT_LINE}")
+}
+
 /// The anchored-edit example of [`TOOLS_PROMPT_EDIT_LINE`], as a Flint call.
 /// `path` stays first, as the editing rules above it ask.
 const FLINT_EDIT_EXAMPLE: &str = concat!(
@@ -1269,7 +1284,7 @@ fn build_flint_tools_prompt_parts(
                     out.push('\n');
                 }
                 out.push('\n');
-                out.push_str(FLINT_IN_THINK_LINE);
+                out.push_str(&flint_guidance());
             }
             (out, all_builtins().collect())
         };
@@ -1313,9 +1328,13 @@ fn build_flint_tools_prompt_parts(
 /// guidance under parity and to nothing otherwise; the call syntax itself
 /// comes from the template's tools turn.
 fn compose_flint_profile_prompt(profile_text: &str, parity: bool) -> String {
-    let guidance = if parity { FLINT_IN_THINK_LINE } else { "" };
+    let guidance = if parity {
+        flint_guidance()
+    } else {
+        String::new()
+    };
     if profile_text.contains(TOOL_PROTOCOL_TOKEN) {
-        profile_text.replace(TOOL_PROTOCOL_TOKEN, guidance)
+        profile_text.replace(TOOL_PROTOCOL_TOKEN, &guidance)
     } else {
         profile_text.trim_end().to_string()
     }
@@ -4564,6 +4583,7 @@ mod tests {
         ));
         assert!(text.contains("<arg_key>suspend_model</arg_key><arg_value>true</arg_value>"));
         assert!(text.contains(FLINT_IN_THINK_LINE));
+        assert!(text.contains(FLINT_NO_DRAFT_LINE));
     }
 
     /// The template's `flint_text` escape deletes `<think>` and `</think>`
@@ -4575,6 +4595,7 @@ mod tests {
     fn the_flint_in_think_guidance_survives_the_template_escape() {
         use flint_engine::template::escape;
         assert_eq!(escape(FLINT_IN_THINK_LINE), FLINT_IN_THINK_LINE);
+        assert_eq!(escape(FLINT_NO_DRAFT_LINE), FLINT_NO_DRAFT_LINE);
         assert!(!FLINT_IN_THINK_LINE.contains("DSML"));
         for gpu in [false, true] {
             let text = flint_tools_prompt_for_tests(gpu);
