@@ -4,9 +4,11 @@
 // moe_sum adds them up unchanged.
 //
 // moe_group sorts the slots by expert in one threadgroup and lists tiles of
-// up to MM_TT slots of one expert; moe_mm_gate_up and moe_mm_down then run
-// one tiled matmul per (MM_TN weight rows, tile), reading each expert's
-// weights once per tile instead of once per slot. Compiled after
+// up to MOE_TT slots of one expert; moe_mm_gate_up and moe_mm_down then run
+// one tiled matmul per (MOE_GU_TN or MOE_DN_TN weight rows, tile), reading
+// each expert's weights once per tile instead of once per slot. A prefill
+// chunk routes about a dozen slots to each expert, so tiles are 16 slots,
+// not the dense matmul's 32. Compiled after
 // nvfp4.metal, whose helpers and launch constants it uses (plus
 // GROUP_THREADS from metal.rs's prelude).
 
@@ -47,15 +49,15 @@ kernel void moe_group(
             offsets[e] = off;
             tile0[e] = t;
             off += c;
-            t += (c + MM_TT - 1) / MM_TT;
+            t += (c + MOE_TT - 1) / MOE_TT;
         }
         n_tiles[0] = t;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < p.experts; e += GROUP_THREADS) {
         const uint c = atomic_load_explicit(&counts[e], memory_order_relaxed);
-        for (uint i = 0; i * MM_TT < c; ++i) {
-            tiles[tile0[e] + i] = uint3(e, offsets[e] + i * MM_TT, min(uint(MM_TT), c - i * MM_TT));
+        for (uint i = 0; i * MOE_TT < c; ++i) {
+            tiles[tile0[e] + i] = uint3(e, offsets[e] + i * MOE_TT, min(uint(MOE_TT), c - i * MOE_TT));
         }
     }
     for (uint s = tid; s < p.slots; s += GROUP_THREADS) {
@@ -72,9 +74,9 @@ kernel void moe_group(
     }
 }
 
-// Decodes one 64-value block column of MM_TN weight rows (rows n0.. of the
-// expert at `w`) into ws, zero past `rows`; each thread one 16-value run.
-inline void load_weight_block(
+// Decodes one 64-value block column of weight row n0 + r (of the expert at
+// `w`) into ws row r, zero past `rows`: this thread's 16-value run s.
+inline void load_weight_run(
     device const uchar *w,
     uint row_bytes,
     uint n0,
@@ -102,33 +104,34 @@ inline void load_weight_block(
     }
 }
 
-// acc[i][j] += W[n][k] X[t][k]^T over one 64-wide block in ws and xs.
-inline void mma_block(
-    threadgroup const float *ws,
-    threadgroup const float *xs,
-    uint sn,
-    uint st,
-    thread simdgroup_float8x8 (&acc)[2][2])
+// Gathers this thread's 16-value run s of block b of slot r's input row
+// (row index `src`, of width k) into xs, zero for a dead slot.
+inline void load_input_run(
+    device const float *x,
+    uint src,
+    bool live,
+    uint k,
+    uint b,
+    uint r,
+    uint s,
+    threadgroup float *xs)
 {
-    for (uint kk = 0; kk < 64; kk += 8) {
-        simdgroup_float8x8 a[2];
-        simdgroup_float8x8 bm[2];
-        for (uint i = 0; i < 2; ++i) {
-            simdgroup_load(a[i], ws + (sn + i * 8) * 64 + kk, 64);
+    threadgroup float *xd = xs + r * 64 + s * 16;
+    if (live) {
+        device const float *row = x + (ulong)src * k + b * 64 + s * 16;
+        for (uint j = 0; j < 16; ++j) {
+            xd[j] = row[j];
         }
-        for (uint j = 0; j < 2; ++j) {
-            simdgroup_load(bm[j], xs + (st + j * 8) * 64 + kk, 64, ulong2(0, 0), true);
-        }
-        for (uint i = 0; i < 2; ++i) {
-            for (uint j = 0; j < 2; ++j) {
-                simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j], acc[i][j]);
-            }
+    } else {
+        for (uint j = 0; j < 16; ++j) {
+            xd[j] = 0.0f;
         }
     }
 }
 
 // h[slot][row] = silu(gs[e] gate_e[row] . x[token]) * (us[e] up_e[row] . x[token])
-// for MM_TN rows of one tile's expert and up to MM_TT of its slots.
+// for MOE_GU_TN rows of one tile's expert and up to MOE_TT of its slots. Each
+// simdgroup computes an 8-row strip across the MOE_TT slots, for gate and up.
 kernel void moe_mm_gate_up(
     device const uchar *wg [[buffer(0)]],
     device const uchar *wu [[buffer(1)]],
@@ -147,59 +150,55 @@ kernel void moe_mm_gate_up(
     if (tg.y >= n_tiles[0]) {
         return;
     }
-    threadgroup float wsg[MM_TN * 64];
-    threadgroup float wsu[MM_TN * 64];
-    threadgroup float xs[MM_TT * 64];
+    threadgroup float wsg[MOE_GU_TN * 64];
+    threadgroup float wsu[MOE_GU_TN * 64];
+    threadgroup float xs[MOE_TT * 64];
     const uint3 tile = tiles[tg.y];
     const uint e = tile.x;
-    const uint n0 = tg.x * MM_TN;
-    const uint sn = (sg & 1) * 16;
-    const uint st = (sg >> 1) * 16;
-    simdgroup_float8x8 ag[2][2];
-    simdgroup_float8x8 au[2][2];
-    for (uint i = 0; i < 2; ++i) {
-        for (uint j = 0; j < 2; ++j) {
-            ag[i][j] = simdgroup_float8x8(0.0f);
-            au[i][j] = simdgroup_float8x8(0.0f);
-        }
+    const uint n0 = tg.x * MOE_GU_TN;
+    const uint sn = sg * 8;
+    simdgroup_float8x8 ag[MOE_TT / 8];
+    simdgroup_float8x8 au[MOE_TT / 8];
+    for (uint j = 0; j < MOE_TT / 8; ++j) {
+        ag[j] = simdgroup_float8x8(0.0f);
+        au[j] = simdgroup_float8x8(0.0f);
     }
     const uint r = tid / 4;
     const uint s = tid % 4;
     const ulong base = (ulong)e * p.gu_expert_bytes;
-    // The token this thread gathers x for: tile slot r.
-    const bool live = r < tile.z;
+    const bool loads_x = r < MOE_TT;
+    const bool live = loads_x && r < tile.z;
     const uint token = live ? perm[tile.y + r] / p.k_used : 0;
     for (uint b = 0; b < p.d / 64; ++b) {
-        load_weight_block(wg + base, p.gu_row_bytes, n0, p.f, b, r, s, wsg);
-        load_weight_block(wu + base, p.gu_row_bytes, n0, p.f, b, r, s, wsu);
-        threadgroup float *xd = xs + r * 64 + s * 16;
-        if (live) {
-            device const float *src = x + (ulong)token * p.d + b * 64 + s * 16;
-            for (uint j = 0; j < 16; ++j) {
-                xd[j] = src[j];
-            }
-        } else {
-            for (uint j = 0; j < 16; ++j) {
-                xd[j] = 0.0f;
-            }
+        load_weight_run(wg + base, p.gu_row_bytes, n0, p.f, b, r, s, wsg);
+        load_weight_run(wu + base, p.gu_row_bytes, n0, p.f, b, r, s, wsu);
+        if (loads_x) {
+            load_input_run(x, token, live, p.d, b, r, s, xs);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_block(wsg, xs, sn, st, ag);
-        mma_block(wsu, xs, sn, st, au);
+        for (uint kk = 0; kk < 64; kk += 8) {
+            simdgroup_float8x8 a_g;
+            simdgroup_float8x8 a_u;
+            simdgroup_load(a_g, wsg + sn * 64 + kk, 64);
+            simdgroup_load(a_u, wsu + sn * 64 + kk, 64);
+            for (uint j = 0; j < MOE_TT / 8; ++j) {
+                simdgroup_float8x8 bm;
+                simdgroup_load(bm, xs + (j * 8) * 64 + kk, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(ag[j], a_g, bm, ag[j]);
+                simdgroup_multiply_accumulate(au[j], a_u, bm, au[j]);
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     // The weight buffers are free now: stage C[t][n] for gate and up there.
-    for (uint i = 0; i < 2; ++i) {
-        for (uint j = 0; j < 2; ++j) {
-            simdgroup_store(ag[i][j], wsg + (st + j * 8) * MM_TN + (sn + i * 8), MM_TN, ulong2(0, 0), true);
-            simdgroup_store(au[i][j], wsu + (st + j * 8) * MM_TN + (sn + i * 8), MM_TN, ulong2(0, 0), true);
-        }
+    for (uint j = 0; j < MOE_TT / 8; ++j) {
+        simdgroup_store(ag[j], wsg + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
+        simdgroup_store(au[j], wsu + (j * 8) * MOE_GU_TN + sn, MOE_GU_TN, ulong2(0, 0), true);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c = tid; c < MM_TT * MM_TN; c += MM_THREADS) {
-        const uint tt = c / MM_TN;
-        const uint nn = c % MM_TN;
-        const uint n = n0 + nn;
+    for (uint c = tid; c < MOE_TT * MOE_GU_TN; c += MM_THREADS) {
+        const uint tt = c / MOE_GU_TN;
+        const uint n = n0 + c % MOE_GU_TN;
         if (tt < tile.z && n < p.f) {
             const float g = wsg[c] * gs[e];
             const float u = wsu[c] * us[e];
@@ -208,8 +207,9 @@ kernel void moe_mm_gate_up(
     }
 }
 
-// ys[slot][row] = route[slot] * ds[e] * down_e[row] . h[slot] for MM_TN rows of
-// one tile's expert and up to MM_TT of its slots.
+// ys[slot][row] = route[slot] * ds[e] * down_e[row] . h[slot] for MOE_DN_TN
+// rows of one tile's expert and up to MOE_TT of its slots. Each simdgroup
+// computes a 16-row strip across the MOE_TT slots.
 kernel void moe_mm_down(
     device const uchar *wd [[buffer(0)]],
     device const float *h [[buffer(1)]],
@@ -227,51 +227,56 @@ kernel void moe_mm_down(
     if (tg.y >= n_tiles[0]) {
         return;
     }
-    threadgroup float ws[MM_TN * 64];
-    threadgroup float xs[MM_TT * 64];
+    threadgroup float ws[MOE_DN_TN * 64];
+    threadgroup float xs[MOE_TT * 64];
     const uint3 tile = tiles[tg.y];
     const uint e = tile.x;
-    const uint n0 = tg.x * MM_TN;
-    const uint sn = (sg & 1) * 16;
-    const uint st = (sg >> 1) * 16;
-    simdgroup_float8x8 acc[2][2];
+    const uint n0 = tg.x * MOE_DN_TN;
+    const uint sn = sg * 16;
+    simdgroup_float8x8 acc[2][MOE_TT / 8];
     for (uint i = 0; i < 2; ++i) {
-        for (uint j = 0; j < 2; ++j) {
+        for (uint j = 0; j < MOE_TT / 8; ++j) {
             acc[i][j] = simdgroup_float8x8(0.0f);
         }
     }
     const uint r = tid / 4;
     const uint s = tid % 4;
     const ulong base = (ulong)e * p.down_expert_bytes;
-    const bool live = r < tile.z;
+    const bool loads_x = r < MOE_TT;
+    const bool live = loads_x && r < tile.z;
     const uint slot = live ? perm[tile.y + r] : 0;
     for (uint b = 0; b < p.f / 64; ++b) {
-        load_weight_block(wd + base, p.down_row_bytes, n0, p.d, b, r, s, ws);
-        threadgroup float *xd = xs + r * 64 + s * 16;
-        if (live) {
-            device const float *src = h + (ulong)slot * p.f + b * 64 + s * 16;
-            for (uint j = 0; j < 16; ++j) {
-                xd[j] = src[j];
-            }
-        } else {
-            for (uint j = 0; j < 16; ++j) {
-                xd[j] = 0.0f;
-            }
+        for (uint rr = r; rr < MOE_DN_TN; rr += MM_THREADS / 4) {
+            load_weight_run(wd + base, p.down_row_bytes, n0, p.d, b, rr, s, ws);
+        }
+        if (loads_x) {
+            load_input_run(h, slot, live, p.f, b, r, s, xs);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_block(ws, xs, sn, st, acc);
+        for (uint kk = 0; kk < 64; kk += 8) {
+            simdgroup_float8x8 a[2];
+            for (uint i = 0; i < 2; ++i) {
+                simdgroup_load(a[i], ws + (sn + i * 8) * 64 + kk, 64);
+            }
+            for (uint j = 0; j < MOE_TT / 8; ++j) {
+                simdgroup_float8x8 bm;
+                simdgroup_load(bm, xs + (j * 8) * 64 + kk, 64, ulong2(0, 0), true);
+                for (uint i = 0; i < 2; ++i) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm, acc[i][j]);
+                }
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint i = 0; i < 2; ++i) {
-        for (uint j = 0; j < 2; ++j) {
-            simdgroup_store(acc[i][j], ws + (st + j * 8) * MM_TN + (sn + i * 8), MM_TN, ulong2(0, 0), true);
+        for (uint j = 0; j < MOE_TT / 8; ++j) {
+            simdgroup_store(acc[i][j], ws + (j * 8) * MOE_DN_TN + (sn + i * 8), MOE_DN_TN, ulong2(0, 0), true);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c = tid; c < MM_TT * MM_TN; c += MM_THREADS) {
-        const uint tt = c / MM_TN;
-        const uint nn = c % MM_TN;
-        const uint n = n0 + nn;
+    for (uint c = tid; c < MOE_TT * MOE_DN_TN; c += MM_THREADS) {
+        const uint tt = c / MOE_DN_TN;
+        const uint n = n0 + c % MOE_DN_TN;
         if (tt < tile.z && n < p.d) {
             const uint sl = perm[tile.y + tt];
             ys[(ulong)sl * p.d + n] = ws[c] * ds[e] * route[sl];

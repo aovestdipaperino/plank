@@ -91,6 +91,13 @@ pub(crate) const ROUTE_MAX_EXPERTS: usize = ROUTE_THREADS * ROUTE_PER_THREAD;
 /// Values of the residual stream each `dec_combine_norm` thread holds, so
 /// the graph takes a model width up to `NORM_THREADS * COMBINE_PER_THREAD`.
 pub(crate) const COMBINE_PER_THREAD: usize = 4;
+/// Slots per tile of the grouped `MoE` kernels.
+const MOE_TT: usize = 16;
+/// Weight rows per `moe_mm_gate_up` threadgroup: an 8-row strip per
+/// simdgroup.
+const MOE_GU_TN: usize = 32;
+/// Weight rows per `moe_mm_down` threadgroup: a 16-row strip per simdgroup.
+const MOE_DN_TN: usize = 64;
 /// Threads in `moe_group`'s one threadgroup.
 const GROUP_THREADS: usize = 1024;
 /// The most experts `moe_group` sorts slots over.
@@ -132,6 +139,9 @@ fn source() -> String {
          #define NORM_THREADS {NORM_THREADS}\n\
          #define COMBINE_PER_THREAD {COMBINE_PER_THREAD}\n\
          #define GROUP_THREADS {GROUP_THREADS}\n\
+         #define MOE_TT {MOE_TT}\n\
+         #define MOE_GU_TN {MOE_GU_TN}\n\
+         #define MOE_DN_TN {MOE_DN_TN}\n\
          #define GROUP_MAX_EXPERTS {GROUP_MAX_EXPERTS}\n\
          #line 1 \"nvfp4.metal\"\n\
          {SOURCE}\n\
@@ -658,7 +668,7 @@ fn grouped(
     let slots = dims.tokens * dims.k_used;
     let (hidden, ffn) = (params.d as usize, params.f as usize);
     // At most one partial tile per expert beyond the full ones.
-    let max_tiles = slots.div_ceil(MM_TILE) + slots.min(params.experts as usize);
+    let max_tiles = slots.div_ceil(MOE_TT) + slots.min(params.experts as usize);
     let perm = dev.new_buffer(slots, DType::U32, "nvfp4_moe_perm")?;
     // A `uint3` takes 16 bytes in a Metal buffer.
     let tiles = dev.new_buffer(max_tiles * 4, DType::U32, "nvfp4_moe_tiles")?;
@@ -691,7 +701,10 @@ fn grouped(
         enc.set_buffer(7, Some(up.2), 0);
         enc.set_buffer(8, Some(h), 0);
         enc.set_bytes(9, params);
-        enc.dispatch_thread_groups(grid(ffn.div_ceil(MM_TILE), max_tiles), grid(MM_THREADS, 1));
+        enc.dispatch_thread_groups(
+            grid(ffn.div_ceil(MOE_GU_TN), max_tiles),
+            grid(MM_THREADS, 1),
+        );
     }
     {
         let enc = dev.command_encoder()?;
@@ -707,7 +720,7 @@ fn grouped(
         enc.set_buffer(7, Some(ys), 0);
         enc.set_bytes(8, params);
         enc.dispatch_thread_groups(
-            grid(hidden.div_ceil(MM_TILE), max_tiles),
+            grid(hidden.div_ceil(MOE_DN_TN), max_tiles),
             grid(MM_THREADS, 1),
         );
     }
@@ -918,6 +931,9 @@ mod tests {
             ("NORM_THREADS", NORM_THREADS),
             ("COMBINE_PER_THREAD", COMBINE_PER_THREAD),
             ("GROUP_THREADS", GROUP_THREADS),
+            ("MOE_TT", MOE_TT),
+            ("MOE_GU_TN", MOE_GU_TN),
+            ("MOE_DN_TN", MOE_DN_TN),
             ("GROUP_MAX_EXPERTS", GROUP_MAX_EXPERTS),
         ] {
             let line = format!("#define {name} {value}\n");
