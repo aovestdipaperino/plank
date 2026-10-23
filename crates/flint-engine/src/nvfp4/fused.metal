@@ -1,30 +1,114 @@
 // Fused decode kernels that replace chains of candle ops: single-token
 // attention, and the MoE router.
 //
-// Single-token attention ("flash decoding") is split over key chunks.
-// attn_dec_partial: one threadgroup per (key chunk, KV head) scores every
-// query head that shares the KV head, reading each key and value once, and
-// writes the chunk's per-head max, exp-sum and unnormalised output.
-// attn_dec_combine: one threadgroup per query head merges the chunks and the
+// Single-token attention ("flash decoding") is split over runs of keys.
+// attn_dec_partial: one threadgroup per (run, KV head) scores every query
+// head that shares the KV head with an online softmax over the run and
+// writes the run's per-head max, exp-sum and unnormalised output.
+// attn_dec_combine: one threadgroup per query head merges the runs and the
 // head's sink logit, which takes softmax mass but adds no value.
 //
-// K and V are read in place from the KV cache: head h's key j is at
+// K and V are read in place from the KV cache, f32 or f16 (a kernel each): head h's key j is at
 // k[h * k_head_stride + j * ATTN_HEAD_DIM]. ATTN_HEAD_DIM is four values per
 // lane of one simdgroup. The launch constants (SIMD_WIDTH, ATTN_HEAD_DIM,
-// ATTN_CHUNK, ATTN_SG, ROUTE_MAX_K, ROUTE_THREADS, ROUTE_PER_THREAD) come
+// ATTN_BLOCK, ATTN_SG, ROUTE_MAX_K, ROUTE_THREADS, ROUTE_PER_THREAD) come
 // from metal.rs's prelude, and the file is compiled after nvfp4.metal, whose
 // includes it shares.
 
 struct AttnParams {
     uint keys;          // keys attended
-    uint chunks;        // ceil(keys / ATTN_CHUNK)
+    uint chunks;        // threadgroups per KV head: ceil(keys / per_tg)
     uint rep;           // query heads per KV head, at most ATTN_SG
     uint k_head_stride; // values between KV heads in k
     uint v_head_stride; // values between KV heads in v
     float scale;
+    uint per_tg;        // keys per threadgroup, a multiple of ATTN_BLOCK
 };
 
-kernel void attn_dec_partial(
+// One threadgroup per (run of per_tg keys, KV head); simdgroup h owns query
+// head h of the KV head. The run is walked in blocks of ATTN_BLOCK keys, one
+// key per lane: each lane scores its key against the head's q, the block's
+// max and exp-sum fold into a running (online) softmax, and the values are
+// accumulated with each lane holding four dimensions, every key's
+// probability broadcast from its lane. Writes the run's per-head max,
+// exp-sum and unnormalised output.
+template <typename T>
+inline void attn_partial(
+    device const float *q,
+    device const T *k,
+    device const T *v,
+    device float *part_o,
+    device float *part_ml,
+    constant AttnParams &p,
+    uint2 tg,
+    uint sg,
+    uint lane,
+    threadgroup float *qs)
+{
+    const uint c = tg.x;
+    const uint kvh = tg.y;
+    const uint tid = sg * SIMD_WIDTH + lane;
+    for (uint i = tid; i < p.rep * ATTN_HEAD_DIM; i += ATTN_SG * SIMD_WIDTH) {
+        qs[i] = q[kvh * p.rep * ATTN_HEAD_DIM + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg >= p.rep) {
+        return;
+    }
+    const uint begin = c * p.per_tg;
+    const uint end = min(p.keys, begin + p.per_tg);
+    device const T *kh = k + (ulong)kvh * p.k_head_stride;
+    device const T *vh = v + (ulong)kvh * p.v_head_stride;
+    threadgroup const float4 *qh = (threadgroup const float4 *)(qs + sg * ATTN_HEAD_DIM);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = 0.0f;
+    for (uint b = begin; b < end; b += ATTN_BLOCK) {
+        const uint j = b + lane;
+        float s = -INFINITY;
+        if (j < end) {
+            device const vec<T, 4> *kj = (device const vec<T, 4> *)(kh + (ulong)j * ATTN_HEAD_DIM);
+            float d = 0.0f;
+            for (uint i = 0; i < ATTN_HEAD_DIM / 4; ++i) {
+                d += dot(qh[i], float4(kj[i]));
+            }
+            s = d * p.scale;
+        }
+        const float m_new = max(m, simd_max(s));
+        const float corr = exp(m - m_new);
+        const float pj = exp(s - m_new);
+        l = l * corr + simd_sum(pj);
+        acc *= corr;
+        const uint n = min(uint(ATTN_BLOCK), end - b);
+        device const vec<T, 4> *vb = (device const vec<T, 4> *)(vh + (ulong)b * ATTN_HEAD_DIM) + lane;
+        if (n == ATTN_BLOCK) {
+            // A full block: four independent accumulators, so the loads and
+            // multiply-adds of different keys overlap.
+            float4 a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+            for (uint t = 0; t < ATTN_BLOCK; t += 4) {
+                a0 += simd_shuffle(pj, t) * float4(vb[(t + 0) * (ATTN_HEAD_DIM / 4)]);
+                a1 += simd_shuffle(pj, t + 1) * float4(vb[(t + 1) * (ATTN_HEAD_DIM / 4)]);
+                a2 += simd_shuffle(pj, t + 2) * float4(vb[(t + 2) * (ATTN_HEAD_DIM / 4)]);
+                a3 += simd_shuffle(pj, t + 3) * float4(vb[(t + 3) * (ATTN_HEAD_DIM / 4)]);
+            }
+            acc += (a0 + a1) + (a2 + a3);
+        } else {
+            for (uint t = 0; t < n; ++t) {
+                acc += simd_shuffle(pj, t) * float4(vb[t * (ATTN_HEAD_DIM / 4)]);
+            }
+        }
+        m = m_new;
+    }
+    const uint slot = (kvh * p.chunks + c) * p.rep + sg;
+    ((device float4 *)(part_o + slot * ATTN_HEAD_DIM))[lane] = acc;
+    if (lane == 0) {
+        part_ml[slot * 2] = m;
+        part_ml[slot * 2 + 1] = l;
+    }
+}
+
+kernel void attn_dec_partial_f32(
     device const float *q [[buffer(0)]],
     device const float *k [[buffer(1)]],
     device const float *v [[buffer(2)]],
@@ -36,66 +120,29 @@ kernel void attn_dec_partial(
     uint lane [[thread_index_in_simdgroup]])
 {
     threadgroup float qs[ATTN_SG * ATTN_HEAD_DIM];
-    threadgroup float sc[ATTN_SG * ATTN_CHUNK];
-    const uint c = tg.x;
-    const uint kvh = tg.y;
-    const uint tid = sg * SIMD_WIDTH + lane;
-    for (uint i = tid; i < p.rep * ATTN_HEAD_DIM; i += ATTN_SG * SIMD_WIDTH) {
-        qs[i] = q[kvh * p.rep * ATTN_HEAD_DIM + i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint k0 = c * ATTN_CHUNK;
-    const uint n = min(uint(ATTN_CHUNK), p.keys - k0);
-    device const float *kh = k + kvh * p.k_head_stride + k0 * ATTN_HEAD_DIM;
-    device const float *vh = v + kvh * p.v_head_stride + k0 * ATTN_HEAD_DIM;
-
-    // Scores: each simdgroup takes every ATTN_SG-th key of the chunk, its
-    // lanes holding four dimensions each.
-    for (uint j = sg; j < n; j += ATTN_SG) {
-        const float4 kj = ((device const float4 *)(kh + j * ATTN_HEAD_DIM))[lane];
-        for (uint h = 0; h < p.rep; ++h) {
-            const float4 qh = ((threadgroup const float4 *)(qs + h * ATTN_HEAD_DIM))[lane];
-            const float s = simd_sum(dot(qh, kj));
-            if (lane == 0) {
-                sc[h * ATTN_CHUNK + j] = s * p.scale;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Simdgroup h owns query head h: the chunk's max, the exps in place,
-    // their sum, then the exp-weighted sum of the values.
-    if (sg < p.rep) {
-        threadgroup float *s = sc + sg * ATTN_CHUNK;
-        float m = -INFINITY;
-        for (uint j = lane; j < n; j += SIMD_WIDTH) {
-            m = max(m, s[j]);
-        }
-        m = simd_max(m);
-        float l = 0.0f;
-        for (uint j = lane; j < n; j += SIMD_WIDTH) {
-            const float e = exp(s[j] - m);
-            s[j] = e;
-            l += e;
-        }
-        l = simd_sum(l);
-        // Every lane reads every exp below, written by other lanes above.
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        float4 acc = 0.0f;
-        for (uint j = 0; j < n; ++j) {
-            acc += s[j] * ((device const float4 *)(vh + j * ATTN_HEAD_DIM))[lane];
-        }
-        const uint slot = (kvh * p.chunks + c) * p.rep + sg;
-        ((device float4 *)(part_o + slot * ATTN_HEAD_DIM))[lane] = acc;
-        if (lane == 0) {
-            part_ml[slot * 2] = m;
-            part_ml[slot * 2 + 1] = l;
-        }
-    }
+    attn_partial<float>(q, k, v, part_o, part_ml, p, tg, sg, lane, qs);
 }
 
-// One threadgroup per query head, one thread per output dimension.
+kernel void attn_dec_partial_f16(
+    device const float *q [[buffer(0)]],
+    device const half *k [[buffer(1)]],
+    device const half *v [[buffer(2)]],
+    device float *part_o [[buffer(3)]],
+    device float *part_ml [[buffer(4)]],
+    constant AttnParams &p [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float qs[ATTN_SG * ATTN_HEAD_DIM];
+    attn_partial<half>(q, k, v, part_o, part_ml, p, tg, sg, lane, qs);
+}
+
+// One threadgroup per query head: COMBINE_GROUPS groups of ATTN_HEAD_DIM
+// threads, one per output dimension. All threads first find the max over
+// every run (and the sink) together; then group g sums every
+// COMBINE_GROUPS-th run's rescaled output and exp-sum, and the groups' sums
+// are added through threadgroup memory.
 kernel void attn_dec_combine(
     device const float *part_o [[buffer(0)]],
     device const float *part_ml [[buffer(1)]],
@@ -103,24 +150,54 @@ kernel void attn_dec_combine(
     device float *out [[buffer(3)]],
     constant AttnParams &p [[buffer(4)]],
     uint head [[threadgroup_position_in_grid]],
-    uint d [[thread_position_in_threadgroup]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
+    threadgroup float red[COMBINE_GROUPS * ATTN_HEAD_DIM / SIMD_WIDTH];
+    threadgroup float accs[COMBINE_GROUPS * ATTN_HEAD_DIM];
+    threadgroup float ls[COMBINE_GROUPS];
+    const uint threads = COMBINE_GROUPS * ATTN_HEAD_DIM;
     const uint kvh = head / p.rep;
     const uint h = head % p.rep;
     const float sink = sinks[head];
     float m = sink;
-    for (uint c = 0; c < p.chunks; ++c) {
+    for (uint c = tid; c < p.chunks; c += threads) {
         m = max(m, part_ml[((kvh * p.chunks + c) * p.rep + h) * 2]);
     }
-    float l = exp(sink - m);
+    m = simd_max(m);
+    if (lane == 0) {
+        red[sg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = sink;
+    for (uint s = 0; s < threads / SIMD_WIDTH; ++s) {
+        m = max(m, red[s]);
+    }
+    const uint g = tid / ATTN_HEAD_DIM;
+    const uint d = tid % ATTN_HEAD_DIM;
+    float l = 0.0f;
     float acc = 0.0f;
-    for (uint c = 0; c < p.chunks; ++c) {
+    for (uint c = g; c < p.chunks; c += COMBINE_GROUPS) {
         const uint slot = (kvh * p.chunks + c) * p.rep + h;
         const float w = exp(part_ml[slot * 2] - m);
         l += part_ml[slot * 2 + 1] * w;
         acc += part_o[slot * ATTN_HEAD_DIM + d] * w;
     }
-    out[head * ATTN_HEAD_DIM + d] = acc / l;
+    accs[tid] = acc;
+    if (d == 0) {
+        ls[g] = l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (g == 0) {
+        float total_l = exp(sink - m);
+        float total = 0.0f;
+        for (uint k = 0; k < COMBINE_GROUPS; ++k) {
+            total_l += ls[k];
+            total += accs[k * ATTN_HEAD_DIM + d];
+        }
+        out[head * ATTN_HEAD_DIM + d] = total / total_l;
+    }
 }
 
 // Sigmoid routing, one threadgroup per token, each thread holding up to

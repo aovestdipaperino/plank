@@ -145,7 +145,7 @@ impl EngineRow {
 /// Declared per engine because it varies six-fold across the catalog's native
 /// engines (about 115 KB a token on Gemma E4B, which shares KV across 18
 /// layers; 688 KB on Gemma 12B, which keeps 8 heads on 40 sliding layers;
-/// 200 KB on Flint) and cannot be read from a file that has not been
+/// 100 KB on Flint) and cannot be read from a file that has not been
 /// downloaded yet.
 fn native_kv_reserve(entry: &EngineEntry) -> u64 {
     serde_json::from_str::<serde_json::Value>(&entry.raw)
@@ -424,7 +424,7 @@ mod tests {
     }
 
     const FLINT: &str = r#"{"version": 3, "engines": {"flint": {"version": 1,
-      "family": "flint", "kvBytesPerToken": 200704,
+      "family": "flint", "kvBytesPerToken": 100352,
       "main": {"name": "flint-nvfp4.gguf", "url": "https://h/f", "bytes": 22863084160,
         "sha256": "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde"}}}}"#;
 

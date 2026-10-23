@@ -35,7 +35,7 @@ pub(crate) const MM_MIN_TOKENS: usize = 8;
 /// The simdgroup width every kernel assumes.
 pub(crate) const SIMD_WIDTH: usize = 32;
 /// Weight rows each simdgroup of the matvec kernels computes.
-pub(crate) const MV_ROWS_PER_SG: usize = 4;
+pub(crate) const MV_ROWS_PER_SG: usize = 2;
 /// Simdgroups per matvec threadgroup.
 pub(crate) const MV_SG_PER_TG: usize = 2;
 /// Weight rows per matvec threadgroup.
@@ -50,8 +50,24 @@ const MM_THREADS: usize = 4 * SIMD_WIDTH;
 const SUM_THREADS: usize = 256;
 /// The head dimension the attention kernels take: four values per lane.
 pub(crate) const ATTN_HEAD_DIM: usize = 4 * SIMD_WIDTH;
-/// Keys per `attn_dec_partial` threadgroup.
-pub(crate) const ATTN_CHUNK: usize = 128;
+/// Keys per block of `attn_dec_partial`: one per lane.
+pub(crate) const ATTN_BLOCK: usize = SIMD_WIDTH;
+/// The most `attn_dec_partial` threadgroups one KV head's keys split into:
+/// enough to fill the GPU, few enough that `attn_dec_combine` merges them
+/// quickly at any depth.
+pub(crate) const ATTN_MAX_CHUNKS: usize = 64;
+/// Groups of `ATTN_HEAD_DIM` threads in an `attn_dec_combine` threadgroup,
+/// each summing every `COMBINE_GROUPS`-th run.
+pub(crate) const COMBINE_GROUPS: usize = 8;
+
+/// How `keys` keys split over `attn_dec_partial` threadgroups:
+/// `(chunks, keys per threadgroup)`, as many single-block runs as fit in
+/// [`ATTN_MAX_CHUNKS`], longer runs beyond.
+pub(crate) fn attn_split(keys: usize) -> (usize, usize) {
+    let blocks = keys.div_ceil(ATTN_BLOCK).max(1);
+    let per_tg = blocks.div_ceil(blocks.min(ATTN_MAX_CHUNKS)) * ATTN_BLOCK;
+    (keys.div_ceil(per_tg), per_tg)
+}
 /// Simdgroups per `attn_dec_partial` threadgroup, which is also the most
 /// query heads one KV head may serve.
 pub(crate) const ATTN_SG: usize = 8;
@@ -64,10 +80,11 @@ pub(crate) const ROUTE_THREADS: usize = 256;
 const ROUTE_PER_THREAD: usize = 4;
 /// The most experts `moe_route` takes.
 pub(crate) const ROUTE_MAX_EXPERTS: usize = ROUTE_THREADS * ROUTE_PER_THREAD;
-/// Threads per `dec_combine` threadgroup, one value each.
-pub(crate) const COMBINE_THREADS: usize = 256;
+/// Values of the residual stream each `dec_combine_norm` thread holds, so
+/// the graph takes a model width up to `NORM_THREADS * COMBINE_PER_THREAD`.
+pub(crate) const COMBINE_PER_THREAD: usize = 4;
 /// Threads in the decode graph's one `dec_rmsnorm` threadgroup.
-pub(crate) const NORM_THREADS: usize = 256;
+pub(crate) const NORM_THREADS: usize = 1024;
 
 // The 2x2 simdgroups of 16x16 patches cover exactly one tile.
 const _: () = assert!(MM_TILE == 2 * 16);
@@ -91,12 +108,14 @@ fn source() -> String {
          #define MM_THREADS {MM_THREADS}\n\
          #define SUM_THREADS {SUM_THREADS}\n\
          #define ATTN_HEAD_DIM {ATTN_HEAD_DIM}\n\
-         #define ATTN_CHUNK {ATTN_CHUNK}\n\
+         #define ATTN_BLOCK {ATTN_BLOCK}\n\
+         #define COMBINE_GROUPS {COMBINE_GROUPS}\n\
          #define ATTN_SG {ATTN_SG}\n\
          #define ROUTE_MAX_K {ROUTE_MAX_K}\n\
          #define ROUTE_THREADS {ROUTE_THREADS}\n\
          #define ROUTE_PER_THREAD {ROUTE_PER_THREAD}\n\
          #define NORM_THREADS {NORM_THREADS}\n\
+         #define COMBINE_PER_THREAD {COMBINE_PER_THREAD}\n\
          #line 1 \"nvfp4.metal\"\n\
          {SOURCE}\n\
          #line 1 \"fused.metal\"\n\
@@ -115,13 +134,15 @@ pub(crate) struct Pipelines {
     pub moe_down: ComputePipeline,
     pub moe_sum: ComputePipeline,
     pub attn_partial: ComputePipeline,
+    pub attn_partial_f16: ComputePipeline,
     pub attn_combine: ComputePipeline,
     pub moe_route: ComputePipeline,
     pub dec_rmsnorm: ComputePipeline,
     pub dec_mv3: ComputePipeline,
     pub dec_qk_norm_rope: ComputePipeline,
+    pub dec_qk_norm_rope_f16: ComputePipeline,
     pub dec_mv_f32: ComputePipeline,
-    pub dec_combine: ComputePipeline,
+    pub dec_combine_norm: ComputePipeline,
 }
 
 static PIPELINES: Mutex<Vec<(u64, Arc<Pipelines>)>> = Mutex::new(Vec::new());
@@ -172,14 +193,16 @@ pub(crate) fn pipelines(dev: &MetalDevice) -> candle_core::Result<Arc<Pipelines>
         moe_gate_up: get("moe_gate_up", MV_THREADS)?,
         moe_down: get("moe_down", MV_THREADS)?,
         moe_sum: get("moe_sum", SUM_THREADS)?,
-        attn_partial: get("attn_dec_partial", ATTN_SG * SIMD_WIDTH)?,
-        attn_combine: get("attn_dec_combine", ATTN_HEAD_DIM)?,
+        attn_partial: get("attn_dec_partial_f32", ATTN_SG * SIMD_WIDTH)?,
+        attn_partial_f16: get("attn_dec_partial_f16", ATTN_SG * SIMD_WIDTH)?,
+        attn_combine: get("attn_dec_combine", COMBINE_GROUPS * ATTN_HEAD_DIM)?,
         moe_route: get("moe_route", ROUTE_THREADS)?,
         dec_rmsnorm: get("dec_rmsnorm", NORM_THREADS)?,
         dec_mv3: get("dec_mv3_nvfp4", MV_THREADS)?,
-        dec_qk_norm_rope: get("dec_qk_norm_rope", ATTN_HEAD_DIM)?,
+        dec_qk_norm_rope: get("dec_qk_norm_rope_f32", ATTN_HEAD_DIM)?,
+        dec_qk_norm_rope_f16: get("dec_qk_norm_rope_f16", ATTN_HEAD_DIM)?,
         dec_mv_f32: get("dec_mv_f32", MV_THREADS)?,
-        dec_combine: get("dec_combine", COMBINE_THREADS)?,
+        dec_combine_norm: get("dec_combine_norm", NORM_THREADS)?,
     });
     cache.push((id, Arc::clone(&p)));
     Ok(p)
@@ -496,10 +519,12 @@ pub(crate) struct AttnParams {
     pub(crate) k_head_stride: u32,
     pub(crate) v_head_stride: u32,
     pub(crate) scale: f32,
+    pub(crate) per_tg: u32,
 }
 
-/// Where single-token attention reads one KV operand: the buffer, the byte
-/// offset of head 0's first key, and the values between heads.
+/// Where single-token attention reads one KV operand: the buffer (f32 or
+/// f16), the byte offset of head 0's first key, and the values between
+/// heads.
 pub(crate) struct KvOperand<'a> {
     pub storage: &'a MetalStorage,
     pub offset: usize,
@@ -521,10 +546,13 @@ pub(crate) fn decode_attention(
     keys: usize,
     scale: f32,
 ) -> candle_core::Result<MetalStorage> {
-    for s in [q, k.storage, v.storage, sinks.0] {
-        if s.dtype() != DType::F32 {
-            candle_core::bail!("decode attention wants f32 operands");
-        }
+    let kv_dtype = k.storage.dtype();
+    if q.dtype() != DType::F32
+        || sinks.0.dtype() != DType::F32
+        || v.storage.dtype() != kv_dtype
+        || !matches!(kv_dtype, DType::F32 | DType::F16)
+    {
+        candle_core::bail!("decode attention wants an f32 q and sinks and an f32 or f16 cache");
     }
     if keys == 0 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) || heads / kv_heads > ATTN_SG {
         candle_core::bail!(
@@ -534,7 +562,7 @@ pub(crate) fn decode_attention(
     let dev = q.device();
     let pipes = pipelines(dev)?;
     let rep = heads / kv_heads;
-    let chunks = keys.div_ceil(ATTN_CHUNK);
+    let (chunks, per_tg) = attn_split(keys);
     let params = AttnParams {
         keys: u32_of(keys)?,
         chunks: u32_of(chunks)?,
@@ -542,6 +570,7 @@ pub(crate) fn decode_attention(
         k_head_stride: u32_of(k.head_stride)?,
         v_head_stride: u32_of(v.head_stride)?,
         scale,
+        per_tg: u32_of(per_tg)?,
     };
     let slots = kv_heads * chunks * rep;
     let part_o = dev.new_buffer(slots * ATTN_HEAD_DIM, DType::F32, "attn_dec_part_o")?;
@@ -552,7 +581,11 @@ pub(crate) fn decode_attention(
     {
         let enc = dev.command_encoder()?;
         enc.set_label("attn_dec_partial");
-        enc.set_compute_pipeline_state(&pipes.attn_partial);
+        enc.set_compute_pipeline_state(if kv_dtype == DType::F16 {
+            &pipes.attn_partial_f16
+        } else {
+            &pipes.attn_partial
+        });
         enc.set_buffer(0, Some(q.buffer()), q_offset);
         enc.set_buffer(1, Some(k.storage.buffer()), k.offset);
         enc.set_buffer(2, Some(v.storage.buffer()), v.offset);
@@ -570,7 +603,7 @@ pub(crate) fn decode_attention(
         enc.set_buffer(2, Some(sinks.0.buffer()), sinks.1);
         enc.set_buffer(3, Some(&out), 0);
         enc.set_bytes(4, &params);
-        enc.dispatch_thread_groups(grid(heads, 1), grid(ATTN_HEAD_DIM, 1));
+        enc.dispatch_thread_groups(grid(heads, 1), grid(COMBINE_GROUPS * ATTN_HEAD_DIM, 1));
     }
     Ok(MetalStorage::new(
         out,
@@ -640,6 +673,23 @@ pub(crate) fn moe_route(
 mod tests {
     use super::*;
 
+    /// Every key lands in exactly one run, runs are whole blocks, and no KV
+    /// head splits into more than `ATTN_MAX_CHUNKS` runs.
+    #[test]
+    fn attention_splits_into_bounded_whole_block_runs() {
+        assert_eq!(attn_split(1), (1, ATTN_BLOCK));
+        assert_eq!(attn_split(64), (2, ATTN_BLOCK));
+        for keys in [1, 31, 32, 33, 2048, 2049, 20_000, 262_144] {
+            let (chunks, per_tg) = attn_split(keys);
+            assert!(chunks <= ATTN_MAX_CHUNKS, "{keys}");
+            assert_eq!(per_tg % ATTN_BLOCK, 0, "{keys}");
+            assert!(
+                chunks * per_tg >= keys && (chunks - 1) * per_tg < keys,
+                "{keys}"
+            );
+        }
+    }
+
     #[test]
     fn the_shader_takes_its_launch_constants_from_the_host() {
         let src = source();
@@ -652,12 +702,14 @@ mod tests {
             ("MM_THREADS", MM_THREADS),
             ("SUM_THREADS", SUM_THREADS),
             ("ATTN_HEAD_DIM", ATTN_HEAD_DIM),
-            ("ATTN_CHUNK", ATTN_CHUNK),
+            ("ATTN_BLOCK", ATTN_BLOCK),
+            ("COMBINE_GROUPS", COMBINE_GROUPS),
             ("ATTN_SG", ATTN_SG),
             ("ROUTE_MAX_K", ROUTE_MAX_K),
             ("ROUTE_THREADS", ROUTE_THREADS),
             ("ROUTE_PER_THREAD", ROUTE_PER_THREAD),
             ("NORM_THREADS", NORM_THREADS),
+            ("COMBINE_PER_THREAD", COMBINE_PER_THREAD),
         ] {
             let line = format!("#define {name} {value}\n");
             assert!(src.starts_with(PRELUDE_MARK), "the prelude comes first");

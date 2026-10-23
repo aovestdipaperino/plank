@@ -90,7 +90,7 @@
       "released": "2026-10-23",
       "notes": "Flint 40B MoE (NVFP4) by Recursive; runs on the native Rust engine",
       "family": "flint",
-      "kvBytesPerToken": 200704,
+      "kvBytesPerToken": 100352,
       "main": {
         "name": "flint-nvfp4.gguf",
         "url": "https://huggingface.co/RecursiveSI/flint-nvfp4-gguf/resolve/main/flint-nvfp4.gguf",

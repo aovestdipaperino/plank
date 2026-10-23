@@ -1,5 +1,6 @@
 //! Decode speed of the Flint model on Metal at increasing context depths,
-//! where the global layers' attention reads ever more keys.
+//! where the global layers' attention reads ever more keys: greedy
+//! generation of [`STEPS`] tokens from each depth, best of [`ROUNDS`].
 //!
 //! ```sh
 //! PLANK_FLINT_GGUF=~/.plank/models/flint-nvfp4.gguf \
@@ -31,19 +32,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("interrupted")?;
         done = depth;
         let mut best = 0f64;
-        for _ in 0..ROUNDS {
-            // Each step is undone, so every one runs at `depth`.
-            s.step(1234)?;
-            s.truncate(depth);
+        for round in 0..ROUNDS {
+            // Greedy generation from `depth`: each step feeds back the last
+            // argmax, so the experts vary as in a real reply. The cache is
+            // cut back to `depth` after each round.
+            let mut tok = 1000 + u32::try_from(round).unwrap_or(0);
             dev.synchronize()?;
             let start = Instant::now();
             for _ in 0..STEPS {
-                s.step(1234)?;
-                s.truncate(depth);
+                let logits = s.step(tok)?;
+                tok = argmax(&logits);
             }
             best = best.max(f64::from(STEPS) / start.elapsed().as_secs_f64());
+            s.truncate(depth);
         }
         println!("depth {depth:>6}: decode {best:.1} tok/s");
     }
     Ok(())
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .and_then(|(i, _)| u32::try_from(i).ok())
+        .unwrap_or(0)
 }

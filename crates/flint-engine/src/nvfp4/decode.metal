@@ -123,30 +123,32 @@ struct QkParams {
 
 // From qkv = [q heads | k heads | v heads] of one token: each q and k head
 // RMS-normalised by its weight and, when rope is set, rotated NeoX-style
-// (pairs i and i + half) at pos; q to q_out, k and v into the cache at slot.
-// One threadgroup per q, k and v head (in that order), one thread per value.
-kernel void dec_qk_norm_rope(
-    device const float *qkv [[buffer(0)]],
-    device const float *qnw [[buffer(1)]],
-    device const float *knw [[buffer(2)]],
-    device const float *cos_t [[buffer(3)]],
-    device const float *sin_t [[buffer(4)]],
-    device float *q_out [[buffer(5)]],
-    device float *kc [[buffer(6)]],
-    device float *vc [[buffer(7)]],
-    constant QkParams &p [[buffer(8)]],
-    uint g [[threadgroup_position_in_grid]],
-    uint i [[thread_position_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]])
+// (pairs i and i + half) at pos; q to q_out, k and v into the cache at slot,
+// f32 or f16 (a kernel each). One threadgroup per q, k and v head (in that
+// order), one thread per value.
+template <typename T>
+inline void qk_norm_rope(
+    device const float *qkv,
+    device const float *qnw,
+    device const float *knw,
+    device const float *cos_t,
+    device const float *sin_t,
+    device float *q_out,
+    device T *kc,
+    device T *vc,
+    constant QkParams &p,
+    uint g,
+    uint i,
+    uint sg,
+    uint lane,
+    threadgroup float *part,
+    threadgroup float *xs)
 {
-    threadgroup float part[ATTN_HEAD_DIM / SIMD_WIDTH];
-    threadgroup float xs[ATTN_HEAD_DIM];
     const uint half_d = ATTN_HEAD_DIM / 2;
     if (g >= p.heads + p.kv_heads) {
         const uint h = g - p.heads - p.kv_heads;
         vc[h * p.v_head_stride + p.slot * ATTN_HEAD_DIM + i] =
-            qkv[(p.heads + p.kv_heads + h) * ATTN_HEAD_DIM + i];
+            T(qkv[(p.heads + p.kv_heads + h) * ATTN_HEAD_DIM + i]);
         return;
     }
     const bool is_q = g < p.heads;
@@ -173,9 +175,34 @@ kernel void dec_qk_norm_rope(
     if (is_q) {
         q_out[h * ATTN_HEAD_DIM + i] = y;
     } else {
-        kc[h * p.k_head_stride + p.slot * ATTN_HEAD_DIM + i] = y;
+        kc[h * p.k_head_stride + p.slot * ATTN_HEAD_DIM + i] = T(y);
     }
 }
+
+#define QK_NORM_ROPE_KERNEL(NAME, T)                                          \
+    kernel void NAME(                                                         \
+        device const float *qkv [[buffer(0)]],                                \
+        device const float *qnw [[buffer(1)]],                                \
+        device const float *knw [[buffer(2)]],                                \
+        device const float *cos_t [[buffer(3)]],                              \
+        device const float *sin_t [[buffer(4)]],                              \
+        device float *q_out [[buffer(5)]],                                    \
+        device T *kc [[buffer(6)]],                                           \
+        device T *vc [[buffer(7)]],                                           \
+        constant QkParams &p [[buffer(8)]],                                   \
+        uint g [[threadgroup_position_in_grid]],                              \
+        uint i [[thread_position_in_threadgroup]],                            \
+        uint sg [[simdgroup_index_in_threadgroup]],                           \
+        uint lane [[thread_index_in_simdgroup]])                              \
+    {                                                                         \
+        threadgroup float part[ATTN_HEAD_DIM / SIMD_WIDTH];                   \
+        threadgroup float xs[ATTN_HEAD_DIM];                                  \
+        qk_norm_rope<T>(qkv, qnw, knw, cos_t, sin_t, q_out, kc, vc, p, g, i, \
+                        sg, lane, part, xs);                                  \
+    }
+
+QK_NORM_ROPE_KERNEL(dec_qk_norm_rope_f32, float)
+QK_NORM_ROPE_KERNEL(dec_qk_norm_rope_f16, half)
 
 // y = W x for a dense f32 W [n, k] (k a multiple of 4), one simdgroup per row.
 kernel void dec_mv_f32(
@@ -207,28 +234,63 @@ struct CombineParams {
     uint d;
     uint slots;
     uint extra;
+    float eps;
 };
 
-// out = h + (the slots' rows of ys + e when extra is set): the residual
-// stream after an FFN block. Slots are summed in order, as moe_sum does.
-kernel void dec_combine(
+// The end of a layer, in one threadgroup: x = h + (the slots' rows of ys +
+// e when extra is set), the candle path's order, then xn = rmsnorm(x) * w,
+// the next layer's (or the output head's) normalised input. Each thread
+// keeps its values of x in registers between the two passes.
+kernel void dec_combine_norm(
     device const float *h [[buffer(0)]],
     device const float *ys [[buffer(1)]],
     device const float *e [[buffer(2)]],
-    device float *out [[buffer(3)]],
-    constant CombineParams &p [[buffer(4)]],
-    uint i [[thread_position_in_grid]])
+    device float *x [[buffer(3)]],
+    device const float *w [[buffer(4)]],
+    device float *xn [[buffer(5)]],
+    constant CombineParams &p [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    if (i >= p.d) {
-        return;
+    threadgroup float part[NORM_THREADS / SIMD_WIDTH];
+    float vals[COMBINE_PER_THREAD];
+    float ss = 0.0f;
+    for (uint r = 0; r < COMBINE_PER_THREAD; ++r) {
+        const uint i = tid + r * NORM_THREADS;
+        float v = 0.0f;
+        if (i < p.d) {
+            float routed = 0.0f;
+            for (uint s = 0; s < p.slots; ++s) {
+                routed += ys[(ulong)s * p.d + i];
+            }
+            if (p.extra != 0) {
+                routed += e[i];
+            }
+            v = h[i] + routed;
+            x[i] = v;
+        }
+        vals[r] = v;
+        ss += v * v;
     }
-    float routed = 0.0f;
-    for (uint s = 0; s < p.slots; ++s) {
-        routed += ys[(ulong)s * p.d + i];
+    ss = simd_sum(ss);
+    if (lane == 0) {
+        part[sg] = ss;
     }
-    // h + (routed + e), the candle path's order.
-    if (p.extra != 0) {
-        routed += e[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float t = lane < NORM_THREADS / SIMD_WIDTH ? part[lane] : 0.0f;
+        t = simd_sum(t);
+        if (lane == 0) {
+            part[0] = t;
+        }
     }
-    out[i] = h[i] + routed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = rsqrt(part[0] / float(p.d) + p.eps);
+    for (uint r = 0; r < COMBINE_PER_THREAD; ++r) {
+        const uint i = tid + r * NORM_THREADS;
+        if (i < p.d) {
+            xn[i] = vals[r] * scale * w[i];
+        }
+    }
 }

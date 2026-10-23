@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn the_default_context_is_the_files() {
         assert_eq!(
-            crate::nativeengine::default_ctx(128 << 30, 262_144, 200_704),
+            crate::nativeengine::default_ctx(128 << 30, 262_144, 100_352),
             262_144
         );
     }

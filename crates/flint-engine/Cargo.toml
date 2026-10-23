@@ -63,3 +63,7 @@ required-features = ["candle"]
 [[example]]
 name = "bench_depth"
 required-features = ["candle"]
+
+[[example]]
+name = "bench_vs"
+required-features = ["candle"]

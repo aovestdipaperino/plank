@@ -266,11 +266,11 @@ impl FlintConfig {
             .then_some(self.sliding_window)
     }
 
-    /// Bytes one position adds to the KV cache: K and V in f32 on every
+    /// Bytes one position adds to the KV cache: K and V in f16 on every
     /// layer, so a caller can size the cache from the header alone.
     #[must_use]
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.layers * 2 * self.kv_heads * self.head_dim * 4
+        self.layers * 2 * self.kv_heads * self.head_dim * 2
     }
 
     /// Whether `layer` routes through experts.
@@ -508,7 +508,7 @@ mod tests {
             head_dim: 128,
             ..test_config()
         };
-        assert_eq!(c.kv_bytes_per_token(), 200_704);
+        assert_eq!(c.kv_bytes_per_token(), 100_352);
     }
 
     #[test]

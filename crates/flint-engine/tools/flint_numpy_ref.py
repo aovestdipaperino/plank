@@ -20,6 +20,10 @@ causal pass and records the float64 softmax top 20 `[[id, p], ...]` at the
 prompt's last position and after each of the four teacher-forced tokens,
 which by causality equals a prefill followed by four single steps.
 
+K and V are rounded to f16 where the KV cache stores them, as llama.cpp
+(by default) and plank both keep it; `--kv f32` keeps them exact instead,
+which is what the fixture held before plank's cache went to f16.
+
 Run from the repository root (the venv is the fixtures one, plus numpy and
 the pinned gguf-py):
 
@@ -132,6 +136,12 @@ class Flint:
         pos = np.arange(T)
         if self.rope[il]:
             q, k = self.rope_neox(q, pos), self.rope_neox(k, pos)
+        # The KV cache: llama.cpp keeps K and V in f16 by default, and so does
+        # plank, both rounding k after its norm and RoPE and v as projected.
+        # Every key attended, the current one included, is read back from it.
+        if KV_F16:
+            k = k.astype(np.float16).astype(np.float64)
+            v = v.astype(np.float16).astype(np.float64)
         # build_attn_mha: kq = k.q * 1/sqrt(hd), masked; GQA maps q head h to
         # kv head h // (n_head / n_head_kv) (ggml_mul_mat broadcast).
         rep = self.n_head // self.n_head_kv
@@ -221,7 +231,13 @@ def top(logits, k):
 
 
 def main():
-    out = pathlib.Path(sys.argv[1])
+    global KV_F16
+    args = sys.argv[1:]
+    if "--kv" in args:
+        i = args.index("--kv")
+        KV_F16 = {"f16": True, "f32": False}[args[i + 1]]
+        del args[i:i + 2]
+    out = pathlib.Path(args[0])
     model = Flint(os.path.expanduser(os.environ["GGUF"]))
     ref = json.loads((out / "flint_reference.json").read_text())
     by_name = {c["name"]: c for c in ref["cases"]}
@@ -243,8 +259,13 @@ def main():
                      "decoded by that commit's gguf-py; `top` holds the float64 softmax top "
                      f"{TOP} after the prompt and after each of `forced` (llama.cpp's first "
                      f"{FORCED} greedy tokens)",
+           "kv": "f16" if KV_F16 else "f32",
            "file_sha256": ref["file_sha256"], "cases": cases}
     (out / "flint_numpy_reference.json").write_text(json.dumps(doc) + "\n")
+
+
+# Round K and V to f16 as the KV cache does (`--kv f32` keeps them exact).
+KV_F16 = True
 
 
 if __name__ == "__main__":

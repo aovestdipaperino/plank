@@ -111,7 +111,15 @@ impl Attention {
         };
         let ctx = match fused {
             Some(ctx) => ctx,
-            None => attend(&q, &keys, &values, &self.sinks, mask, scale)?,
+            // The op chain multiplies in f32, whatever the cache holds.
+            None => attend(
+                &q,
+                &keys.to_dtype(candle_core::DType::F32)?,
+                &values.to_dtype(candle_core::DType::F32)?,
+                &self.sinks,
+                mask,
+                scale,
+            )?,
         };
         let ctx = ctx
             .squeeze(0)?
@@ -169,7 +177,8 @@ pub(crate) fn attend(
         .reshape((1, heads, t, d))
 }
 
-/// [`attend`] for a single query through the fused Metal kernels
+/// [`attend`] for a single query (over an f32 or f16 cache) through the
+/// fused Metal kernels
 /// (`fused.metal`), which read the cache in place instead of copying
 /// it into a transposed key matrix and a score tensor per head. `None` when
 /// they do not apply: not on Metal, more than one query, or a shape or
@@ -194,6 +203,11 @@ pub(crate) fn decode_attend(
         && d == ATTN_HEAD_DIM
         && key_d == d
         && value.dims() == key.dims()
+        && value.dtype() == key.dtype()
+        && matches!(
+            key.dtype(),
+            candle_core::DType::F32 | candle_core::DType::F16
+        )
         && keys > 0
         && kv_heads > 0
         && heads.is_multiple_of(kv_heads)
@@ -256,13 +270,14 @@ fn kv_operand<'a>(
     d: usize,
 ) -> Option<crate::nvfp4::metal::KvOperand<'a>> {
     let stride = layout.stride();
+    let size = candle_core::backend::BackendStorage::dtype(storage).size_in_bytes();
     (stride[3] == 1
         && stride[2] == d
         && stride[1].is_multiple_of(4)
         && layout.start_offset().is_multiple_of(4))
     .then(|| crate::nvfp4::metal::KvOperand {
         storage,
-        offset: layout.start_offset() * 4,
+        offset: layout.start_offset() * size,
         head_stride: stride[1],
     })
 }

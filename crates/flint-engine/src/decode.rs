@@ -26,18 +26,68 @@
 //! for everything else, so prefill and the CPU are unchanged.
 
 use candle_core::{DType, Device, MetalDevice, Storage, Tensor};
-use candle_metal_kernels::metal::{Buffer, MTLResourceOptions};
+use std::ptr::NonNull;
+
+use candle_metal_kernels::metal::{Buffer, ComputePipeline, MTLResourceOptions};
 use gemma_engine::kv::KvCache;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLDevice, MTLDispatchType, MTLSize,
+};
 
 use crate::model::{Ffn, Layer, Model};
 use crate::nvfp4::metal::{
-    ATTN_CHUNK, ATTN_HEAD_DIM, ATTN_SG, AttnParams, COMBINE_THREADS, MV_ROWS_PER_SG,
-    MV_ROWS_PER_TG, MV_SG_PER_TG, MV_THREADS, MatParams, MoeParams, NORM_THREADS, Pipelines,
-    ROUTE_MAX_EXPERTS, ROUTE_MAX_K, ROUTE_THREADS, RouteParams, SIMD_WIDTH, binding, grid,
-    pipelines, u32_of,
+    ATTN_HEAD_DIM, ATTN_MAX_CHUNKS, ATTN_SG, AttnParams, COMBINE_GROUPS, COMBINE_PER_THREAD,
+    MV_ROWS_PER_SG, MV_ROWS_PER_TG, MV_SG_PER_TG, MV_THREADS, MatParams, MoeParams, NORM_THREADS,
+    Pipelines, ROUTE_MAX_EXPERTS, ROUTE_MAX_K, ROUTE_THREADS, RouteParams, SIMD_WIDTH, attn_split,
+    binding, grid, pipelines, u32_of,
 };
 use crate::nvfp4::tensor::NvWeight;
 use crate::{Result, err};
+
+/// A concurrent compute encoder: dispatches may overlap until a barrier, so
+/// [`Enc::dispatch`] ends each with one and [`Enc::dispatch_overlap`] lets
+/// the next dispatch run beside it.
+struct Enc(Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>);
+
+impl Enc {
+    fn pipeline(&self, p: &ComputePipeline) {
+        self.0.setComputePipelineState(p.as_ref());
+    }
+
+    fn buffer(&self, index: usize, b: &Buffer, offset: usize) {
+        // SAFETY: the buffer is retained by the graph or the cache for the
+        // whole step, and every offset is within it.
+        unsafe {
+            self.0
+                .setBuffer_offset_atIndex(Some(b.as_ref()), offset, index);
+        };
+    }
+
+    fn bytes<T>(&self, index: usize, v: &T) {
+        // SAFETY: Metal copies `size_of::<T>()` bytes from `v` now.
+        unsafe {
+            self.0
+                .setBytes_length_atIndex(NonNull::from(v).cast(), size_of::<T>(), index);
+        };
+    }
+
+    /// Dispatches, then a barrier: nothing later starts before this has
+    /// finished writing.
+    fn dispatch(&self, groups: MTLSize, threads: MTLSize) {
+        self.dispatch_overlap(groups, threads);
+        self.0.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+    }
+
+    /// Dispatches without a barrier: the next dispatch may run beside this
+    /// one, so it must not read what this one writes.
+    fn dispatch_overlap(&self, groups: MTLSize, threads: MTLSize) {
+        self.0
+            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+    }
+}
 
 /// A buffer and the byte offset its data starts at.
 #[derive(Debug, Clone)]
@@ -50,8 +100,16 @@ struct Slice {
 /// reference to the buffer, so it outlives nothing it needs; the model's
 /// tensors are never written after loading.
 fn slice_of(t: &Tensor) -> Result<Slice> {
-    if !t.is_contiguous() || t.dtype() != DType::F32 {
-        return Err(err("decode graph: a model tensor is not contiguous f32"));
+    if t.dtype() != DType::F32 {
+        return Err(err("decode graph: a model tensor is not f32"));
+    }
+    raw_slice(t)
+}
+
+/// [`slice_of`] for a tensor of any element type (a KV buffer).
+fn raw_slice(t: &Tensor) -> Result<Slice> {
+    if !t.is_contiguous() {
+        return Err(err("decode graph: a tensor is not contiguous"));
     }
     let (store, layout) = t.storage_and_layout();
     let Storage::Metal(m) = &*store else {
@@ -59,7 +117,7 @@ fn slice_of(t: &Tensor) -> Result<Slice> {
     };
     Ok(Slice {
         buf: m.buffer().clone(),
-        off: layout.start_offset() * 4,
+        off: layout.start_offset() * t.dtype().size_in_bytes(),
     })
 }
 
@@ -138,6 +196,19 @@ struct LayerRefs {
     ffn: LayerFfn,
 }
 
+/// One layer's cache as a step writes and reads it.
+#[derive(Clone, Copy)]
+struct CacheRefs<'a> {
+    /// The absolute position of buffer index 0.
+    base: usize,
+    /// Positions the buffers hold.
+    cap: usize,
+    /// f16 buffers (else f32).
+    half: bool,
+    k: &'a Slice,
+    v: &'a Slice,
+}
+
 /// The scratch buffers one step runs through, sized for the widest layer.
 #[derive(Debug)]
 struct Scratch {
@@ -174,7 +245,9 @@ struct Scratch {
 /// The decode graph of one model on one Metal device.
 #[derive(Debug)]
 pub(crate) struct DecodeGraph {
-    dev: MetalDevice,
+    /// The graph's own queue: its steps run in one concurrent encoder each,
+    /// which candle's pool does not offer.
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipes: std::sync::Arc<Pipelines>,
     layers: Vec<LayerRefs>,
     output_norm: Slice,
@@ -243,7 +316,7 @@ impl Scratch {
                 .new_buffer(n.max(1) * 4, MTLResourceOptions::StorageModeShared)
                 .map_err(|e| err(format!("decode graph: {e}")))
         };
-        let chunks = model.context_length().div_ceil(ATTN_CHUNK);
+        let chunks = ATTN_MAX_CHUNKS;
         let rep = c.heads / c.kv_heads;
         let zero_id = words(1)?;
         // SAFETY: a fresh shared-storage buffer of one u32, not yet seen by
@@ -297,6 +370,7 @@ impl DecodeGraph {
             && c.experts_used <= ROUTE_MAX_K
             && c.experts <= ROUTE_MAX_EXPERTS
             && c.hidden.is_multiple_of(4)
+            && c.hidden <= NORM_THREADS * COMBINE_PER_THREAD
             && qd.is_multiple_of(MV_ROWS_PER_SG)
             && kd.is_multiple_of(MV_ROWS_PER_SG);
         if !fits {
@@ -309,8 +383,12 @@ impl DecodeGraph {
             .collect::<Result<Vec<_>>>()?;
         let (cos, sin) = model.rope().tables();
         let scratch = Scratch::new(dev, model)?;
+        let raw: &ProtocolObject<dyn MTLDevice> = dev.device().as_ref();
+        let queue = raw
+            .newCommandQueue()
+            .ok_or_else(|| err("decode graph: no command queue"))?;
         Ok(Some(Self {
-            dev: dev.clone(),
+            queue,
             pipes: pipelines(dev)?,
             layers,
             output_norm: slice_of(model.output_norm())?,
@@ -368,21 +446,50 @@ impl DecodeGraph {
             // before the graph writes into the new buffers.
             device.synchronize()?;
         }
-        {
-            let enc = self.dev.command_encoder()?;
-            enc.set_label("flint_decode");
-            for (layer, kv) in self.layers.iter().zip(&cache.layers) {
-                let Some((kb, vb)) = kv.buffers() else {
-                    return Err(err("Flint KV cache has no buffers after a reserve"));
-                };
-                let (k_slice, v_slice) = (slice_of(kb)?, slice_of(vb)?);
-                let cap = kb.dims4()?.2;
-                self.encode_layer(&enc, layer, offset, kv.base(), cap, &k_slice, &v_slice)?;
-            }
-            self.norm(&enc, &s.x, None, &self.output_norm, &s.xn);
-            self.matvec(&enc, &self.output, &s.xn, &s.logits)?;
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| err("decode graph: no command buffer"))?;
+        let raw = cb
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .ok_or_else(|| err("decode graph: no compute encoder"))?;
+        let enc = Enc(raw);
+        // Each layer's FFN ends by normalising for the next layer (the last,
+        // for the output head), so only the first layer's norm stands alone.
+        if let Some(first) = self.layers.first() {
+            self.norm(&enc, &s.x, None, &first.attn_norm, &s.xn);
         }
-        device.synchronize()?;
+        for (i, (layer, kv)) in self.layers.iter().zip(&cache.layers).enumerate() {
+            let next_norm = self
+                .layers
+                .get(i + 1)
+                .map_or(&self.output_norm, |l| &l.attn_norm);
+            let Some((kb, vb)) = kv.buffers() else {
+                return Err(err("Flint KV cache has no buffers after a reserve"));
+            };
+            let (k_slice, v_slice) = (raw_slice(kb)?, raw_slice(vb)?);
+            let cap = kb.dims4()?.2;
+            let half = match kv.dtype() {
+                DType::F16 => true,
+                DType::F32 => false,
+                other => return Err(err(format!("decode graph: a {other:?} KV cache"))),
+            };
+            let cache = CacheRefs {
+                base: kv.base(),
+                cap,
+                half,
+                k: &k_slice,
+                v: &v_slice,
+            };
+            self.encode_layer(&enc, layer, offset, &cache, next_norm)?;
+        }
+        self.matvec(&enc, &self.output, &s.xn, &s.logits)?;
+        enc.0.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        if let Some(e) = cb.error() {
+            return Err(err(format!("decode graph: {e}")));
+        }
         for kv in &mut cache.layers {
             kv.advance(1)?;
         }
@@ -404,17 +511,21 @@ impl DecodeGraph {
     #[allow(clippy::too_many_arguments)]
     fn encode_layer(
         &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
+        enc: &Enc,
         l: &LayerRefs,
         pos: usize,
-        base: usize,
-        cap: usize,
-        kc: &Slice,
-        vc: &Slice,
+        cache: &CacheRefs<'_>,
+        next_norm: &Slice,
     ) -> Result<()> {
         let s = &self.scratch;
         let d = ATTN_HEAD_DIM;
-        self.norm(enc, &s.x, None, &l.attn_norm, &s.xn);
+        let CacheRefs {
+            base,
+            cap,
+            half,
+            k: kc,
+            v: vc,
+        } = *cache;
         self.qkv(enc, l, &s.xn, &s.qkv)?;
         let slot = pos - base;
         let qk = QkParams {
@@ -427,17 +538,21 @@ impl DecodeGraph {
             k_head_stride: u32_of(cap * d)?,
             v_head_stride: u32_of(cap * d)?,
         };
-        enc.set_compute_pipeline_state(&self.pipes.dec_qk_norm_rope);
-        enc.set_buffer(0, Some(&s.qkv), 0);
-        enc.set_buffer(1, Some(&l.q_norm.buf), l.q_norm.off);
-        enc.set_buffer(2, Some(&l.k_norm.buf), l.k_norm.off);
-        enc.set_buffer(3, Some(&self.cos.buf), self.cos.off);
-        enc.set_buffer(4, Some(&self.sin.buf), self.sin.off);
-        enc.set_buffer(5, Some(&s.q), 0);
-        enc.set_buffer(6, Some(&kc.buf), kc.off);
-        enc.set_buffer(7, Some(&vc.buf), vc.off);
-        enc.set_bytes(8, &qk);
-        enc.dispatch_thread_groups(grid(self.heads + 2 * self.kv_heads, 1), grid(d, 1));
+        enc.pipeline(if half {
+            &self.pipes.dec_qk_norm_rope_f16
+        } else {
+            &self.pipes.dec_qk_norm_rope
+        });
+        enc.buffer(0, &s.qkv, 0);
+        enc.buffer(1, &l.q_norm.buf, l.q_norm.off);
+        enc.buffer(2, &l.k_norm.buf, l.k_norm.off);
+        enc.buffer(3, &self.cos.buf, self.cos.off);
+        enc.buffer(4, &self.sin.buf, self.sin.off);
+        enc.buffer(5, &s.q, 0);
+        enc.buffer(6, &kc.buf, kc.off);
+        enc.buffer(7, &vc.buf, vc.off);
+        enc.bytes(8, &qk);
+        enc.dispatch(grid(self.heads + 2 * self.kv_heads, 1), grid(d, 1));
 
         // A sliding layer's query sees no key `window` or more behind it.
         let start = l.window.map_or(0, |w| (pos + 1).saturating_sub(w));
@@ -448,7 +563,7 @@ impl DecodeGraph {
         }
         let keys = pos + 1 - start;
         let rep = self.heads / self.kv_heads;
-        let chunks = keys.div_ceil(ATTN_CHUNK);
+        let (chunks, per_tg) = attn_split(keys);
         // The kernel takes the scale as f32, as every score is.
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let attn = AttnParams {
@@ -458,43 +573,44 @@ impl DecodeGraph {
             k_head_stride: u32_of(cap * d)?,
             v_head_stride: u32_of(cap * d)?,
             scale: (1.0 / (d as f64).sqrt()) as f32,
+            per_tg: u32_of(per_tg)?,
         };
-        let first_key = (start - base) * d * 4;
-        enc.set_compute_pipeline_state(&self.pipes.attn_partial);
-        enc.set_buffer(0, Some(&s.q), 0);
-        enc.set_buffer(1, Some(&kc.buf), kc.off + first_key);
-        enc.set_buffer(2, Some(&vc.buf), vc.off + first_key);
-        enc.set_buffer(3, Some(&s.part_o), 0);
-        enc.set_buffer(4, Some(&s.part_ml), 0);
-        enc.set_bytes(5, &attn);
-        enc.dispatch_thread_groups(grid(chunks, self.kv_heads), grid(ATTN_SG * SIMD_WIDTH, 1));
-        enc.set_compute_pipeline_state(&self.pipes.attn_combine);
-        enc.set_buffer(0, Some(&s.part_o), 0);
-        enc.set_buffer(1, Some(&s.part_ml), 0);
-        enc.set_buffer(2, Some(&l.sinks.buf), l.sinks.off);
-        enc.set_buffer(3, Some(&s.ctx), 0);
-        enc.set_bytes(4, &attn);
-        enc.dispatch_thread_groups(grid(self.heads, 1), grid(d, 1));
+        let first_key = (start - base) * d * if half { 2 } else { 4 };
+        enc.pipeline(if half {
+            &self.pipes.attn_partial_f16
+        } else {
+            &self.pipes.attn_partial
+        });
+        enc.buffer(0, &s.q, 0);
+        enc.buffer(1, &kc.buf, kc.off + first_key);
+        enc.buffer(2, &vc.buf, vc.off + first_key);
+        enc.buffer(3, &s.part_o, 0);
+        enc.buffer(4, &s.part_ml, 0);
+        enc.bytes(5, &attn);
+        enc.dispatch(grid(chunks, self.kv_heads), grid(ATTN_SG * SIMD_WIDTH, 1));
+        enc.pipeline(&self.pipes.attn_combine);
+        enc.buffer(0, &s.part_o, 0);
+        enc.buffer(1, &s.part_ml, 0);
+        enc.buffer(2, &l.sinks.buf, l.sinks.off);
+        enc.buffer(3, &s.ctx, 0);
+        enc.bytes(4, &attn);
+        enc.dispatch(grid(self.heads, 1), grid(COMBINE_GROUPS * d, 1));
 
         self.matvec(enc, &l.o, &s.ctx, &s.attn_out)?;
         self.norm(enc, &s.x, Some((&s.attn_out, &s.h1)), &l.ffn_norm, &s.xn);
 
-        self.encode_ffn(enc, &l.ffn)
+        self.encode_ffn(enc, &l.ffn, next_norm)
     }
 
     /// The FFN half of a layer: from the normalised stream back into the
     /// residual stream.
-    fn encode_ffn(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        ffn: &LayerFfn,
-    ) -> Result<()> {
+    fn encode_ffn(&self, enc: &Enc, ffn: &LayerFfn, next_norm: &Slice) -> Result<()> {
         let s = &self.scratch;
         match ffn {
             LayerFfn::Dense(f) => {
                 self.gate_up(enc, f, &s.zero_id, 1, &s.ffn_h)?;
                 self.matvec(enc, &f.down, &s.ffn_h, &s.ffn_out)?;
-                self.combine(enc, 0, Some(&s.ffn_out))?;
+                self.combine(enc, 0, Some(&s.ffn_out), next_norm)?;
             }
             LayerFfn::Moe(m) => {
                 let MoeRefs {
@@ -506,15 +622,19 @@ impl DecodeGraph {
                     scale,
                 } = &**m;
                 let kn = [u32_of(self.hidden)?, u32_of(experts.gate.experts)?];
-                enc.set_compute_pipeline_state(&self.pipes.dec_mv_f32);
-                enc.set_buffer(0, Some(&router.buf), router.off);
-                enc.set_buffer(1, Some(&s.xn), 0);
-                enc.set_buffer(2, Some(&s.router_logits), 0);
-                enc.set_bytes(3, &kn);
-                enc.dispatch_thread_groups(
+                enc.pipeline(&self.pipes.dec_mv_f32);
+                enc.buffer(0, &router.buf, router.off);
+                enc.buffer(1, &s.xn, 0);
+                enc.buffer(2, &s.router_logits, 0);
+                enc.bytes(3, &kn);
+                // The router runs beside the shared expert's gate/up, and the
+                // top-k beside its down projection: the two chains share
+                // only the normalised stream they both read.
+                enc.dispatch_overlap(
                     grid(experts.gate.experts.div_ceil(MV_SG_PER_TG), 1),
                     grid(MV_THREADS, 1),
                 );
+                self.gate_up(enc, shared, &s.zero_id, 1, &s.shared_h)?;
                 // The floor is the smallest f16 normal, exact in f32.
                 let rp = RouteParams {
                     experts: u32_of(experts.gate.experts)?,
@@ -524,17 +644,16 @@ impl DecodeGraph {
                     scale: *scale,
                     min_sum: crate::ffn::MIN_WEIGHT_SUM_F32,
                 };
-                enc.set_compute_pipeline_state(&self.pipes.moe_route);
-                enc.set_buffer(0, Some(&s.router_logits), 0);
-                enc.set_buffer(1, Some(&s.ids), 0);
-                enc.set_buffer(2, Some(&s.route), 0);
-                enc.set_bytes(3, &rp);
-                enc.dispatch_thread_groups(grid(1, 1), grid(ROUTE_THREADS, 1));
+                enc.pipeline(&self.pipes.moe_route);
+                enc.buffer(0, &s.router_logits, 0);
+                enc.buffer(1, &s.ids, 0);
+                enc.buffer(2, &s.route, 0);
+                enc.bytes(3, &rp);
+                enc.dispatch_overlap(grid(1, 1), grid(ROUTE_THREADS, 1));
+                self.matvec(enc, &shared.down, &s.shared_h, &s.ffn_out)?;
                 self.gate_up(enc, experts, &s.ids, *k, &s.ffn_h)?;
                 self.down(enc, experts, *k)?;
-                self.gate_up(enc, shared, &s.zero_id, 1, &s.shared_h)?;
-                self.matvec(enc, &shared.down, &s.shared_h, &s.ffn_out)?;
-                self.combine(enc, *k, Some(&s.ffn_out))?;
+                self.combine(enc, *k, Some(&s.ffn_out), next_norm)?;
             }
         }
         Ok(())
@@ -542,36 +661,23 @@ impl DecodeGraph {
 
     /// `y = rmsnorm(a (+ b)) * w`; with `add = Some((b, sum))` also stores
     /// `a + b` in `sum`.
-    fn norm(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        a: &Buffer,
-        add: Option<(&Buffer, &Buffer)>,
-        w: &Slice,
-        y: &Buffer,
-    ) {
+    fn norm(&self, enc: &Enc, a: &Buffer, add: Option<(&Buffer, &Buffer)>, w: &Slice, y: &Buffer) {
         let p = NormParams {
             n: u32::try_from(self.hidden).unwrap_or(u32::MAX),
             eps: self.eps,
             add: u32::from(add.is_some()),
         };
-        enc.set_compute_pipeline_state(&self.pipes.dec_rmsnorm);
-        enc.set_buffer(0, Some(a), 0);
-        enc.set_buffer(1, Some(add.map_or(a, |(b, _)| b)), 0);
-        enc.set_buffer(2, Some(&w.buf), w.off);
-        enc.set_buffer(3, Some(add.map_or(y, |(_, sum)| sum)), 0);
-        enc.set_buffer(4, Some(y), 0);
-        enc.set_bytes(5, &p);
-        enc.dispatch_thread_groups(grid(1, 1), grid(NORM_THREADS, 1));
+        enc.pipeline(&self.pipes.dec_rmsnorm);
+        enc.buffer(0, a, 0);
+        enc.buffer(1, add.map_or(a, |(b, _)| b), 0);
+        enc.buffer(2, &w.buf, w.off);
+        enc.buffer(3, add.map_or(y, |(_, sum)| sum), 0);
+        enc.buffer(4, y, 0);
+        enc.bytes(5, &p);
+        enc.dispatch(grid(1, 1), grid(NORM_THREADS, 1));
     }
 
-    fn qkv(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        l: &LayerRefs,
-        x: &Buffer,
-        y: &Buffer,
-    ) -> Result<()> {
+    fn qkv(&self, enc: &Enc, l: &LayerRefs, x: &Buffer, y: &Buffer) -> Result<()> {
         let p = Mv3Params {
             k: u32_of(l.q.cols)?,
             row_bytes: u32_of(l.q.row_bytes)?,
@@ -583,24 +689,18 @@ impl DecodeGraph {
             s2: l.v.scale,
         };
         let rows = l.q.rows + l.k.rows + l.v.rows;
-        enc.set_compute_pipeline_state(&self.pipes.dec_mv3);
-        enc.set_buffer(0, Some(&l.q.codes.buf), l.q.codes.off);
-        enc.set_buffer(1, Some(&l.k.codes.buf), l.k.codes.off);
-        enc.set_buffer(2, Some(&l.v.codes.buf), l.v.codes.off);
-        enc.set_buffer(3, Some(x), 0);
-        enc.set_buffer(4, Some(y), 0);
-        enc.set_bytes(5, &p);
-        enc.dispatch_thread_groups(grid(rows.div_ceil(MV_ROWS_PER_TG), 1), grid(MV_THREADS, 1));
+        enc.pipeline(&self.pipes.dec_mv3);
+        enc.buffer(0, &l.q.codes.buf, l.q.codes.off);
+        enc.buffer(1, &l.k.codes.buf, l.k.codes.off);
+        enc.buffer(2, &l.v.codes.buf, l.v.codes.off);
+        enc.buffer(3, x, 0);
+        enc.buffer(4, y, 0);
+        enc.bytes(5, &p);
+        enc.dispatch(grid(rows.div_ceil(MV_ROWS_PER_TG), 1), grid(MV_THREADS, 1));
         Ok(())
     }
 
-    fn matvec(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        w: &Nv,
-        x: &Buffer,
-        y: &Buffer,
-    ) -> Result<()> {
+    fn matvec(&self, enc: &Enc, w: &Nv, x: &Buffer, y: &Buffer) -> Result<()> {
         let p = MatParams {
             k: u32_of(w.cols)?,
             n: u32_of(w.rows)?,
@@ -608,12 +708,12 @@ impl DecodeGraph {
             row_bytes: u32_of(w.row_bytes)?,
             scale: w.scale,
         };
-        enc.set_compute_pipeline_state(&self.pipes.mv);
-        enc.set_buffer(0, Some(&w.codes.buf), w.codes.off);
-        enc.set_buffer(1, Some(x), 0);
-        enc.set_buffer(2, Some(y), 0);
-        enc.set_bytes(3, &p);
-        enc.dispatch_thread_groups(
+        enc.pipeline(&self.pipes.mv);
+        enc.buffer(0, &w.codes.buf, w.codes.off);
+        enc.buffer(1, x, 0);
+        enc.buffer(2, y, 0);
+        enc.bytes(3, &p);
+        enc.dispatch(
             grid(w.rows.div_ceil(MV_ROWS_PER_TG), 1),
             grid(MV_THREADS, 1),
         );
@@ -636,25 +736,18 @@ impl DecodeGraph {
 
     /// `silu(gate x) * up x` for each of `slots` experts named in `ids`,
     /// reading the normalised stream.
-    fn gate_up(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        f: &Swiglu,
-        ids: &Buffer,
-        slots: usize,
-        h: &Buffer,
-    ) -> Result<()> {
+    fn gate_up(&self, enc: &Enc, f: &Swiglu, ids: &Buffer, slots: usize, h: &Buffer) -> Result<()> {
         let p = Self::moe_params(f, slots)?;
-        enc.set_compute_pipeline_state(&self.pipes.moe_gate_up);
-        enc.set_buffer(0, Some(&f.gate.codes.buf), f.gate.codes.off);
-        enc.set_buffer(1, Some(&f.up.codes.buf), f.up.codes.off);
-        enc.set_buffer(2, Some(&self.scratch.xn), 0);
-        enc.set_buffer(3, Some(ids), 0);
-        enc.set_buffer(4, Some(&f.gate.scales), 0);
-        enc.set_buffer(5, Some(&f.up.scales), 0);
-        enc.set_buffer(6, Some(h), 0);
-        enc.set_bytes(7, &p);
-        enc.dispatch_thread_groups(
+        enc.pipeline(&self.pipes.moe_gate_up);
+        enc.buffer(0, &f.gate.codes.buf, f.gate.codes.off);
+        enc.buffer(1, &f.up.codes.buf, f.up.codes.off);
+        enc.buffer(2, &self.scratch.xn, 0);
+        enc.buffer(3, ids, 0);
+        enc.buffer(4, &f.gate.scales, 0);
+        enc.buffer(5, &f.up.scales, 0);
+        enc.buffer(6, h, 0);
+        enc.bytes(7, &p);
+        enc.dispatch(
             grid(f.gate.rows.div_ceil(MV_ROWS_PER_TG), slots),
             grid(MV_THREADS, 1),
         );
@@ -662,23 +755,18 @@ impl DecodeGraph {
     }
 
     /// The routed experts' down projections, each weighted by its route.
-    fn down(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        f: &Swiglu,
-        slots: usize,
-    ) -> Result<()> {
+    fn down(&self, enc: &Enc, f: &Swiglu, slots: usize) -> Result<()> {
         let s = &self.scratch;
         let p = Self::moe_params(f, slots)?;
-        enc.set_compute_pipeline_state(&self.pipes.moe_down);
-        enc.set_buffer(0, Some(&f.down.codes.buf), f.down.codes.off);
-        enc.set_buffer(1, Some(&s.ffn_h), 0);
-        enc.set_buffer(2, Some(&s.ids), 0);
-        enc.set_buffer(3, Some(&f.down.scales), 0);
-        enc.set_buffer(4, Some(&s.route), 0);
-        enc.set_buffer(5, Some(&s.ys), 0);
-        enc.set_bytes(6, &p);
-        enc.dispatch_thread_groups(
+        enc.pipeline(&self.pipes.moe_down);
+        enc.buffer(0, &f.down.codes.buf, f.down.codes.off);
+        enc.buffer(1, &s.ffn_h, 0);
+        enc.buffer(2, &s.ids, 0);
+        enc.buffer(3, &f.down.scales, 0);
+        enc.buffer(4, &s.route, 0);
+        enc.buffer(5, &s.ys, 0);
+        enc.bytes(6, &p);
+        enc.dispatch(
             grid(f.down.rows.div_ceil(MV_ROWS_PER_TG), slots),
             grid(MV_THREADS, 1),
         );
@@ -686,28 +774,24 @@ impl DecodeGraph {
     }
 
     /// `x = h1 + (the slots of ys + extra)`.
-    fn combine(
-        &self,
-        enc: &candle_metal_kernels::metal::ComputeCommandEncoder,
-        slots: usize,
-        extra: Option<&Buffer>,
-    ) -> Result<()> {
+    /// `x = h1 + (the slots of ys + extra)`, then `xn = rmsnorm(x) * w`.
+    fn combine(&self, enc: &Enc, slots: usize, extra: Option<&Buffer>, w: &Slice) -> Result<()> {
         let s = &self.scratch;
         let p = CombineParams {
             d: u32_of(self.hidden)?,
             slots: u32_of(slots)?,
             extra: u32::from(extra.is_some()),
+            eps: self.eps,
         };
-        enc.set_compute_pipeline_state(&self.pipes.dec_combine);
-        enc.set_buffer(0, Some(&s.h1), 0);
-        enc.set_buffer(1, Some(&s.ys), 0);
-        enc.set_buffer(2, Some(extra.unwrap_or(&s.ys)), 0);
-        enc.set_buffer(3, Some(&s.x), 0);
-        enc.set_bytes(4, &p);
-        enc.dispatch_thread_groups(
-            grid(self.hidden.div_ceil(COMBINE_THREADS), 1),
-            grid(COMBINE_THREADS, 1),
-        );
+        enc.pipeline(&self.pipes.dec_combine_norm);
+        enc.buffer(0, &s.h1, 0);
+        enc.buffer(1, &s.ys, 0);
+        enc.buffer(2, extra.unwrap_or(&s.ys), 0);
+        enc.buffer(3, &s.x, 0);
+        enc.buffer(4, &w.buf, w.off);
+        enc.buffer(5, &s.xn, 0);
+        enc.bytes(6, &p);
+        enc.dispatch(grid(1, 1), grid(NORM_THREADS, 1));
         Ok(())
     }
 }
@@ -752,4 +836,5 @@ struct CombineParams {
     d: u32,
     slots: u32,
     extra: u32,
+    eps: f32,
 }

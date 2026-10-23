@@ -112,7 +112,8 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
 /// never below [`crate::enginefit::NATIVE_MIN_CTX`].
 ///
 /// The cache is f32 and keeps every position, so the window is what decides
-/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B, 200 KB on Flint.
+/// the memory: 688 KB a token on Gemma 4 12B, 115 KB on E4B, 100 KB on Flint
+/// (whose cache is f16).
 /// On a 128 GB machine E4B's 131K and Flint's 262K open whole, while the
 /// 12B's 131K (90 GB) would be refused, so it gets the third instead, which
 /// leaves the weights and the rest of the system room. `ram` of 0 or
@@ -774,7 +775,7 @@ mod tests {
     /// the KV a third of RAM holds.
     #[test]
     fn the_default_context_reaches_the_files_window() {
-        assert_eq!(default_ctx(128 * GIB, 262_144, 200_704), 262_144);
-        assert_eq!(default_ctx(16 * GIB, 262_144, 200_704), 27_648);
+        assert_eq!(default_ctx(128 * GIB, 262_144, 100_352), 262_144);
+        assert_eq!(default_ctx(16 * GIB, 262_144, 100_352), 56_320);
     }
 }

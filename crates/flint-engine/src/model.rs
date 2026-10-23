@@ -338,7 +338,7 @@ impl Model {
             .collect()
     }
 
-    /// Bytes one position adds to the cache: K and V, f32, every layer
+    /// Bytes one position adds to the cache: K and V, f16, every layer
     /// ([`FlintConfig::kv_bytes_per_token`]).
     #[must_use]
     pub fn kv_bytes_per_token(&self) -> usize {
@@ -568,6 +568,11 @@ impl SessionModel for Model {
         Model::kv_windows(self)
     }
 
+    /// f16: half the bytes attention streams per key, as llama.cpp keeps it.
+    fn kv_dtype(&self) -> candle_core::DType {
+        candle_core::DType::F16
+    }
+
     fn device(&self) -> &Device {
         Model::device(self)
     }
@@ -582,6 +587,7 @@ mod tests {
     use super::*;
     use crate::config::test_config;
     use crate::testgguf::tiny_flint;
+    use candle_core::DType;
     use gemma_engine::session::Session;
 
     const VOCAB: usize = 256;
@@ -898,7 +904,7 @@ mod tests {
             eprintln!("no Metal device; skipped");
             return;
         };
-        for window in [4usize, 300] {
+        for (window, dtype) in [(4usize, DType::F16), (300, DType::F16), (4, DType::F32)] {
             let mut c = test_config();
             c.head_dim = 128;
             c.context_length = 512;
@@ -910,15 +916,18 @@ mod tests {
                 "the graph takes this model"
             );
             let prompt: Vec<u32> = (0..200u32).map(|i| (i * 37) % 256).collect();
-            let mut ops = KvCache::new(c.layers);
-            let mut graph = KvCache::new(c.layers);
+            let mut ops = KvCache::with_dtype(c.layers, dtype);
+            let mut graph = KvCache::with_dtype(c.layers, dtype);
             m.forward_with(&prompt, 0, &mut ops, false).unwrap();
             m.forward_with(&prompt, 0, &mut graph, false).unwrap();
             let mut tok = 5u32;
             for pos in 200..240 {
                 let want = m.forward_with(&[tok], pos, &mut ops, false).unwrap();
                 let got = m.forward_with(&[tok], pos, &mut graph, true).unwrap();
-                assert!(close(&got, &want, 1e-3), "window {window}, position {pos}");
+                assert!(
+                    close(&got, &want, 1e-3),
+                    "window {window}, {dtype:?}, position {pos}"
+                );
                 tok = want
                     .iter()
                     .enumerate()
