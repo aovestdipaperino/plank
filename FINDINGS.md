@@ -3706,10 +3706,10 @@ RMSNorm. Routing is a sigmoid, then the top 6 by probability, then those
 probabilities divided by their sum clamped to at least `6.103515625e-5`.
 The router is BF16 and the file has no expert bias.
 
-The tokenizer matches. All 14 corpus strings encode to llama.cpp's ids, and
-all five rendered prompts (9, 18, 198, 232 and 1,619 tokens) encode to its
-ids exactly. The one corpus string where the two differ is the deliberate
-case described next.
+The tokenizer matches. Of the 14 corpus strings, 13 encode to exactly
+llama.cpp's ids, and the 14th is the deliberate inert-text case described
+next. All five rendered prompts (9, 18, 198, 232 and 1,619 tokens) encode
+to its ids exactly.
 
 Plain text stays inert. llama.cpp (and Hugging Face) match GGUF type-4
 user-defined tokens such as `<think>`, `<tool_call>` and `<arg_key>` even in
@@ -3742,18 +3742,24 @@ decode run, the two disagree on the argmax at positions 23, 41 and 56 of
 `user_only` and differ by up to 0.209 on their top five probabilities.
 Teacher-forced against those per-position prefills, with near ties (a top-1
 lead under 0.05) skipped, 66 of 253 checked positions across the five short
-cases missed a tolerance of 0.01, with a worst difference of 0.380 at
-`tool_turn` position 21, where llama.cpp gives 0.635 and we give 0.260. We
-then rounded our own activations the same way (Q8_0 at every dense NVFP4
-input and at the MoE input, though not inside our fused expert kernel) and
-the KV through f16. That moved position 21 to 0.584 and `user_only`
-position 52 from 0.409 to 0.500 against llama.cpp's 0.580, which removed
-both confident argmax flips, while 67 positions still missed 0.01 and one
-new flip appeared at a near tie. That emulated rounding moves this model's
-probabilities by up to 0.32 at a single position, so llama.cpp can show that the forward pass is right in
-outline but cannot pin a single probability.
+cases missed a tolerance of 0.01. The worst difference was 0.380, at
+`tool_turn` position 21 on token 687, to which we give 0.736 and llama.cpp
+gives 0.356; llama.cpp's own top token there, 299, gets 0.635 from it and
+0.260 from us. We then rounded our own activations the same way (Q8_0 at
+every dense NVFP4 input and at the MoE input, though not inside our fused
+expert kernel) and the KV through f16. That raised our probability for
+token 299 at position 21 from 0.260 to 0.584, and for llama.cpp's top token
+at `user_only` position 52 from 0.409 to 0.500 against its 0.580, which
+removed both confident argmax flips, while 67 positions still missed 0.01
+and one new flip appeared at a near tie. That emulated rounding moves this
+model's probabilities by up to 0.32 at a single position, so llama.cpp can
+show that the forward pass is right in outline but cannot pin a single
+probability.
 
-So, by the user's decision, the precise oracle is an independent forward
+The spec had asked for 64 tokens of greedy agreement with llama.cpp. The
+user decided to drop that criterion for the teacher-forced check above, and
+then, once that check proved to sit below llama.cpp's own noise, decided to
+replace it with a precise oracle. That oracle is an independent forward
 pass in NumPy float64, written from llama.cpp's `flint.cpp` and
 `llama-graph.cpp` semantics rather than from our Rust, with weights decoded
 by the pinned commit's gguf-py. `flint_numpy_reference.json` holds its top
@@ -3762,7 +3768,11 @@ each of llama.cpp's first four greedy tokens fed back, ten positions in
 all. Our f32 Metal engine agrees with it on the argmax at all ten, and the
 largest difference on any of the top 20 probabilities is 1.8e-6, at a
 position whose top token has probability 0.60; the test's tolerance is
-1e-3. The oracle run takes about two minutes on the CPU.
+1e-3. The oracle run takes about two minutes on the CPU. Its prompts are 9
+and 18 tokens long, so with the four fed-back tokens it never goes past 22
+positions: it never reaches the 513 window or deep RoPE positions. Only
+llama.cpp's `code` (1,619 tokens) and `long` (20,861 tokens) cases cover
+those, and only to the coarser agreement described above.
 
 Speed was measured on this Apple M5 Max with 128 GiB, on AC power. Three
 runs of `bench_decode` decoded at 60.1 to 62.6 tok/s with a context of 32
@@ -3773,6 +3783,17 @@ to 1.04 s, about 491 to 536 tok/s. `llama-bench -p 512 -n 64 -r 3` at
 prefill 4.2 to 4.6 times, well inside the spec's requirement of staying
 within 2x. llama.cpp's NVFP4 matmuls running on the CPU at this commit most
 likely account for its low figures.
+
+Long contexts are untested, and as written they would not fit in memory.
+Nothing has run past the 20,861-token `long` case. The global layers' mask
+is built on the CPU as a `t × (offset + t)` f32 matrix, which by arithmetic
+(not measured) is about 200 MB for one 512-token prefill chunk at an offset
+of 100K. `attend` then materialises the scores, their concatenation with the
+sink column, the softmax and the narrowed copy of it, each a `heads × t ×
+keys` f32 tensor; at 262,144 keys a 512-token chunk needs about 17 GB per
+copy, again by arithmetic. Gemma's forward builds its mask and scores the
+same way, at the smaller contexts it runs. Before part C advertises long
+contexts, it must cap Flint's context and prefill chunk, or chunk `attend`.
 
 Two spec deviations remain. The KV cache is f32, reusing gemma-engine's
 cache, at 200,704 bytes per token instead of f16's 100,352. The shared
