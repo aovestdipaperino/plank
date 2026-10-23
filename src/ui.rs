@@ -648,6 +648,17 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
             ),
             sysprompt::GEMMA_IN_THINK_PROHIBITION
         ),
+        // Flint's template deletes `<think>` and `</think>` from tool and user
+        // text, so its wording names neither tag (nor DSML, which it never
+        // speaks).
+        PassError::InThink if syntax == sysprompt::ToolSyntax::Flint => format!(
+            concat!(
+                "Tool error: {}\n",
+                "The tool call was not run. End your thinking, ",
+                "then emit the same call again.\n",
+            ),
+            sysprompt::FLINT_IN_THINK_LINE
+        ),
         PassError::InThink => format!(
             concat!(
                 "Tool error: {}\n",
@@ -680,8 +691,6 @@ fn tool_error_payload(kind: PassError, err: &str, syntax: sysprompt::ToolSyntax)
                 "Tool error: invalid Gemma tool call: {err}\n{}",
                 sysprompt::gemma_syntax_reminder()
             ),
-            // Flint's `InThink` takes the default `IN_THINK_PROHIBITION` arm
-            // above: its thinking block closes with `</think>`.
             sysprompt::ToolSyntax::Flint => format!(
                 "Tool error: invalid Flint tool call: {err}\n{}",
                 sysprompt::flint_syntax_reminder()
@@ -35433,13 +35442,21 @@ mod tests {
         assert!(t.contains("<channel|>") && !t.contains("</think>"), "{t}");
     }
 
-    /// Flint closes its thinking block with `</think>`, so a call made inside
-    /// one gets the default prohibition, not Gemma's `<channel|>` text.
+    /// Flint's template deletes `<think>` and `</think>` from tool text, so
+    /// its in-think error names neither tag, nor DSML, and survives escaping.
     #[test]
-    fn tool_error_for_flint_keeps_the_default_in_think_text() {
+    fn tool_error_for_flint_names_no_think_tag_and_no_dsml() {
         let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Flint);
-        assert!(t.contains(sysprompt::IN_THINK_PROHIBITION), "{t}");
-        assert!(t.contains("</think>") && !t.contains("<channel|>"), "{t}");
+        assert_eq!(
+            t,
+            concat!(
+                "Tool error: Tool calls are only run after your thinking block ends:",
+                " finish thinking first, then emit the call.\n",
+                "The tool call was not run. End your thinking, then emit the same call again.\n",
+            )
+        );
+        assert!(!t.contains("think>") && !t.contains("<channel|>"), "{t}");
+        assert!(!t.contains("DSML"), "{t}");
         let p = tool_error_payload(PassError::Dsml, "junk", crate::sysprompt::ToolSyntax::Flint);
         assert!(
             p.starts_with("Tool error: invalid Flint tool call: junk\n"),
@@ -35450,6 +35467,21 @@ mod tests {
             "{p}"
         );
         assert!(!p.contains("DSML"), "{p}");
+    }
+
+    /// What the model actually reads: the payload after the template's own
+    /// escape is the payload unchanged, with no hole where a tag was.
+    #[cfg(feature = "flint")]
+    #[test]
+    fn flint_in_think_error_survives_the_template_escape() {
+        let t = tool_error_payload(PassError::InThink, "", crate::sysprompt::ToolSyntax::Flint);
+        let seen = flint_engine::template::escape(&t);
+        assert_eq!(seen, t);
+        assert!(!seen.contains("  ") && !seen.contains(" ,"), "{seen}");
+        assert!(
+            seen.contains("finish thinking first, then emit the call"),
+            "{seen}"
+        );
     }
 
     #[test]

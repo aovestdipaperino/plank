@@ -700,7 +700,6 @@ fn build_tools_prompt_parts_with_wasm(
             gpu_suspend,
         );
     }
-    //
     // Unreachable without the feature: `Ds4Model::open` refuses a Qwen model
     // before any prompt is built, so the dialect can never be selected. The
     // arm is gated rather than left to fall through to DSML so that, if that
@@ -1193,9 +1192,17 @@ pub const FLINT_TOOLS_OPEN: &str = "\n<!-- plank:flint-tools -->\n";
 /// Closes the fence [`FLINT_TOOLS_OPEN`] opens.
 pub const FLINT_TOOLS_CLOSE: &str = "\n<!-- /plank:flint-tools -->";
 
-/// [`IN_THINK_PROHIBITION`] as Flint's call guidance, taught under parity.
-const FLINT_IN_THINK_LINE: &str =
-    "Tool calls are only run outside the thinking block: close it with </think> first.";
+/// [`IN_THINK_PROHIBITION`] as Flint's call guidance, taught under parity and
+/// repeated by the in-think tool error.
+///
+/// Worded without the think tags on purpose: Flint's template (`flint_text`,
+/// `flint_engine::template::escape`) deletes every `<think>` and `</think>`
+/// from system, user and tool text, so a sentence that names the tag reaches
+/// the model with a hole where the tag was.
+pub const FLINT_IN_THINK_LINE: &str = concat!(
+    "Tool calls are only run after your thinking block ends: ",
+    "finish thinking first, then emit the call."
+);
 
 /// The anchored-edit example of [`TOOLS_PROMPT_EDIT_LINE`], as a Flint call.
 /// `path` stays first, as the editing rules above it ask.
@@ -4556,9 +4563,33 @@ mod tests {
             "<tool_call>edit<arg_key>path</arg_key><arg_value>/tmp/example.c</arg_value>"
         ));
         assert!(text.contains("<arg_key>suspend_model</arg_key><arg_value>true</arg_value>"));
-        assert!(text.contains(
-            "Tool calls are only run outside the thinking block: close it with </think> first."
-        ));
+        assert!(text.contains(FLINT_IN_THINK_LINE));
+    }
+
+    /// The template's `flint_text` escape deletes `<think>` and `</think>`
+    /// from the system section, so the guidance must name neither: what the
+    /// model reads is exactly what plank wrote, in the default prompt and in
+    /// a profile's `{{plank:tool-protocol}}` expansion alike.
+    #[cfg(feature = "flint")]
+    #[test]
+    fn the_flint_in_think_guidance_survives_the_template_escape() {
+        use flint_engine::template::escape;
+        assert_eq!(escape(FLINT_IN_THINK_LINE), FLINT_IN_THINK_LINE);
+        assert!(!FLINT_IN_THINK_LINE.contains("DSML"));
+        for gpu in [false, true] {
+            let text = flint_tools_prompt_for_tests(gpu);
+            let prose = &text[..text.find(FLINT_TOOLS_OPEN).unwrap()];
+            let seen = escape(prose);
+            assert_eq!(seen, prose, "the escape changed the Flint prose");
+            assert!(seen.contains(FLINT_IN_THINK_LINE), "{seen}");
+            assert!(!seen.contains("with  first"), "{seen}");
+        }
+        let profile = compose_flint_profile_prompt(
+            &format!("You are a profile.\n\n{TOOL_PROTOCOL_TOKEN}\n\nBe brief."),
+            true,
+        );
+        assert_eq!(escape(&profile), profile);
+        assert!(profile.contains(FLINT_IN_THINK_LINE), "{profile}");
     }
 
     #[test]

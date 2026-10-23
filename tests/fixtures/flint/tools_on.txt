@@ -79,7 +79,7 @@ A refused tool call means the user declined it. Do not re-issue the same call; c
 bash also accepts suspend_model="true": plank then unloads the model before running the command and reloads it afterwards, keeping this conversation. Use it only for a command that needs the GPU for itself, such as mex generating an illustration; it costs a model reload. Pass it as:
 <arg_key>suspend_model</arg_key><arg_value>true</arg_value>
 
-Tool calls are only run outside the thinking block: close it with </think> first.
+Tool calls are only run after your thinking block ends: finish thinking first, then emit the call.
 <!-- plank:flint-tools -->
 {"name": "google_search", "description": "Search Google in a visible browser and return compact Markdown links.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
 {"name": "visit_page", "description": "Open a URL in a visible browser and return rendered page Markdown.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}
