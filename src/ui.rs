@@ -4240,6 +4240,8 @@ impl Agent<'_> {
                     .collect();
                 format_tool_results(&results)
             } else {
+                self.tool_ctx.flint_hints =
+                    self.tool_syntax() == crate::sysprompt::ToolSyntax::Flint;
                 dispatch_all(calls, &mut self.tool_ctx)
             };
             append_advisories(nudges, out)
@@ -4353,6 +4355,7 @@ impl Agent<'_> {
     fn dispatch_tool_reactive(&mut self, call: &ToolCall) -> String {
         self.refresh_editor_refusal();
         self.tool_ctx.bash.last_foreground = None;
+        self.tool_ctx.flint_hints = self.tool_syntax() == crate::sysprompt::ToolSyntax::Flint;
         let first = dispatch(call, &mut self.tool_ctx).output;
         let Some(exit) = self.tool_ctx.bash.last_foreground.take() else {
             return first;
@@ -18010,10 +18013,8 @@ impl Agent<'_> {
             // denied for an aside, so it needs none of the dispatch machinery,
             // but it must still know the model's dialect: a Flint call read as
             // DSML opens like a Qwen one and shows as a malformed Qwen call.
-            let mut aside_renderer = StreamRenderer::with_syntax(
-                crate::worker::BtwSink(tx.clone()),
-                self.tool_syntax(),
-            );
+            let mut aside_renderer =
+                StreamRenderer::with_syntax(crate::worker::BtwSink(tx.clone()), self.tool_syntax());
             aside_renderer.set_freeze_on_error(true);
             aside_renderer.set_show_thinking(crate::settings::show_thinking_effective());
             if !matches!(self.think, crate::engine::ThinkMode::Off) {

@@ -88,6 +88,11 @@ pub type StatusSinkFn = Box<dyn Fn(&str) + Send>;
 pub struct ToolContext {
     /// Working directory relative paths are resolved against.
     pub cwd: PathBuf,
+    /// The model writes Flint tool calls: a running bash job's hint names
+    /// `bash_status`/`bash_stop` as tools to call (Flint ran `bash_status`
+    /// as a shell command from the C wording, which the other dialects keep
+    /// byte for byte).
+    pub flint_hints: bool,
     /// Continuation state for the `more` tool, if a read was truncated.
     pub more: Option<MoreState>,
     /// The last spilled tool result, for the `more` tool to continue reading
@@ -366,6 +371,7 @@ impl ToolContext {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
+            flint_hints: false,
             more: None,
             spill: None,
             session_id: String::new(),
@@ -573,6 +579,93 @@ pub(crate) fn precheck_pre_tool_use(
         .map(|msg| format!("Tool error: blocked by PreToolUse hook: {msg}\n"))
 }
 
+/// `output` with a running bash job's hint ("Use `bash_status` job=N to get
+/// info before refresh time; use `bash_stop` job=N to stop execution", the
+/// C's wording) said as tool calls: Flint read the C's as a shell command.
+fn flint_job_hint(output: &str) -> String {
+    const HEAD: &str = "Use bash_status job=";
+    let Some(at) = output.find(HEAD) else {
+        return output.to_string();
+    };
+    let digits: String = output[at + HEAD.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let old = format!(
+        "Use bash_status job={digits} to get info before refresh time; \
+         use bash_stop job={digits} to stop execution"
+    );
+    let new = format!(
+        "The job is still running: call the bash_status tool with job={digits} \
+         for its output so far, or the bash_stop tool with job={digits} to stop it"
+    );
+    output.replacen(&old, &new, 1)
+}
+
+/// Arguments a builtin reads although its schema does not declare them:
+/// `suspend_model` is taught by the system prompt instead
+/// (`sysprompt::GPU_SUSPEND_NOTE`), and the domain filters are web-search
+/// options the trained schema predates.
+const UNDECLARED_BUT_READ: &[(&str, &str)] = &[
+    ("bash", "suspend_model"),
+    ("google_search", "allowed_domains"),
+    ("google_search", "blocked_domains"),
+];
+
+/// Each builtin tool's declared parameter names, from the same table the
+/// provider engines are given ([`crate::sysprompt::provider_tool_registry`]).
+fn builtin_params() -> &'static std::collections::HashMap<String, Vec<String>> {
+    static PARAMS: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::OnceLock::new();
+    PARAMS.get_or_init(|| {
+        crate::sysprompt::provider_tool_registry(&[])
+            .into_iter()
+            .map(|spec| {
+                let names = spec.parameters["properties"]
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                (spec.name, names)
+            })
+            .collect()
+    })
+}
+
+/// A note naming the arguments `call` passed that its builtin tool does not
+/// take, or `None` when there are none (or the tool is not a builtin). For
+/// bash it also says where the command ran, since a guessed `workdir` or
+/// `cwd` is the usual case.
+fn unknown_args_note(call: &ToolCall, cwd: &Path) -> Option<String> {
+    let declared = builtin_params().get(&call.name)?;
+    let unknown: Vec<&str> = call
+        .args
+        .iter()
+        .map(|a| a.name.as_str())
+        .filter(|n| {
+            !declared.iter().any(|d| d == n)
+                && !UNDECLARED_BUT_READ.contains(&(call.name.as_str(), *n))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let names = unknown
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let takes = declared.join(", ");
+    let mut note = format!(
+        "Note: {} ignored {names}: it takes only {takes}.",
+        call.name
+    );
+    if call.name == "bash" {
+        let _ = write!(note, " Commands run in {}.", cwd.display());
+    }
+    note.push('\n');
+    Some(note)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
@@ -715,6 +808,20 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         }
         other => format!("Tool error: unknown tool: {other}\n"),
     };
+    // An argument the tool does not declare is otherwise dropped silently,
+    // and a model that guessed one (`workdir` on bash) cannot tell it had no
+    // effect: say so after the output.
+    let mut output = if ctx.flint_hints {
+        flint_job_hint(&output)
+    } else {
+        output
+    };
+    if let Some(note) = unknown_args_note(call, &ctx.cwd) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&note);
+    }
     let output = if matches!(call.name.as_str(), "read" | "more") {
         already_shown(&output, &ctx.current_transcript).unwrap_or(output)
     } else {
@@ -1404,6 +1511,68 @@ pub(crate) fn home_writable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With Flint hints on, a running job's C-worded hint becomes explicit
+    /// tool calls; anything else passes through unchanged.
+    #[test]
+    fn the_flint_job_hint_names_the_tools() {
+        let c = "bash job=5 pid=1 status=running\n\nUse bash_status job=5 to get info before refresh time; use bash_stop job=5 to stop execution\n";
+        let f = flint_job_hint(c);
+        assert!(f.contains("call the bash_status tool with job=5"), "{f}");
+        assert!(f.contains("the bash_stop tool with job=5"), "{f}");
+        assert!(!f.contains("Use bash_status"), "{f}");
+        assert_eq!(flint_job_hint("plain output\n"), "plain output\n");
+    }
+
+    /// A guessed `workdir` on bash is named, with where the command ran.
+    #[test]
+    fn an_undeclared_argument_gets_a_note() {
+        let call = test_call("bash", &[("command", "cargo build"), ("workdir", "/x")]);
+        let note = unknown_args_note(&call, Path::new("/repo")).expect("a note");
+        assert!(note.contains("`workdir`"), "{note}");
+        for takes in ["command", "timeout_sec", "refresh_sec"] {
+            assert!(note.contains(takes), "{note}");
+        }
+        assert!(note.contains("Commands run in /repo."), "{note}");
+        let read = test_call("read", &[("path", "a.rs"), ("offset", "496")]);
+        let note = unknown_args_note(&read, Path::new("/repo")).expect("a note");
+        assert!(note.starts_with("Note: read ignored `offset`"), "{note}");
+        assert!(!note.contains("Commands run in"), "{note}");
+    }
+
+    /// Declared arguments, the read-but-undeclared ones, and non-builtin
+    /// tools get no note.
+    #[test]
+    fn declared_and_non_builtin_arguments_get_none() {
+        let cwd = Path::new("/repo");
+        for call in [
+            test_call(
+                "bash",
+                &[
+                    ("command", "ls"),
+                    ("timeout_sec", "5"),
+                    ("refresh_sec", "1"),
+                ],
+            ),
+            test_call("bash", &[("command", "ls"), ("suspend_model", "true")]),
+            test_call(
+                "read",
+                &[
+                    ("path", "a"),
+                    ("start_line", "3"),
+                    ("whole", "true"),
+                    ("raw", "true"),
+                ],
+            ),
+            test_call(
+                "google_search",
+                &[("query", "q"), ("allowed_domains", "a.com")],
+            ),
+            test_call("mcp__srv__tool", &[("anything", "1")]),
+        ] {
+            assert_eq!(unknown_args_note(&call, cwd), None, "{}", call.name);
+        }
+    }
 
     /// The `compact` tool does nothing but ask: compaction rewrites the
     /// transcript the turn is generating from, so it has to happen between
