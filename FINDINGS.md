@@ -3681,12 +3681,13 @@ The Rust decoder agrees with upstream's own Python one. Row 0 of
 by `block::dequant_row`, matched bit for bit on all 2048 values, before the
 tensor scale.
 
-## Flint against llama.cpp on the real file: the reference disagrees with itself
+## Flint against llama.cpp on the real file: an f64 oracle settles parity
 
 `crates/flint-engine/tests/reference_model.rs` checks the tokenizer and the
-forward pass against llama.cpp `970b51c` on `flint-nvfp4.gguf`, from the
-fixtures `tools/flint_fixtures.py` recorded. It is ignored without
-`PLANK_FLINT_GGUF`.
+forward pass on `flint-nvfp4.gguf`, against llama.cpp `970b51c` (fixtures
+from `tools/flint_fixtures.py`) and against an independent float64 forward
+pass in NumPy (`tools/flint_numpy_ref.py`). Every test there is ignored
+without `PLANK_FLINT_GGUF`.
 
 The template has one trap. Under transformers' jinja settings
 (`trim_blocks`, `lstrip_blocks` and its own `tojson`), the tool JSON lines
@@ -3708,7 +3709,7 @@ The router is BF16 and the file has no expert bias.
 The tokenizer matches. All 14 corpus strings encode to llama.cpp's ids, and
 all five rendered prompts (9, 18, 198, 232 and 1,619 tokens) encode to its
 ids exactly. The one corpus string where the two differ is the deliberate
-case described below.
+case described next.
 
 Plain text stays inert. llama.cpp (and Hugging Face) match GGUF type-4
 user-defined tokens such as `<think>`, `<tool_call>` and `<arg_key>` even in
@@ -3720,50 +3721,58 @@ containing `<tool_call>` stays characters. On the corpus string
 llama.cpp emits 150006, 150011 and 150012; the parity test asserts that
 ours spells the same bytes with no control id.
 
-The logits match on the first token and the long contexts, but the greedy
-runs part on the short ones. On all six cases (prompts of 9, 18, 198, 232,
-1,619 and 20,861 tokens) our argmax is llama.cpp's, and the largest
-difference on its top five probabilities is 0.000015. That check is weak,
-because every case opens on `<think>` with a probability of 1.0 or 0.9998.
-The greedy runs are the real test. `tools` (42 of 42), `code` (64 of 64,
-past the 513 window) and `long` (16 of 16, at 20,861 tokens) agree in full.
-`user_only` parts at token 52 of 64, `system_user` at 24 of 27, and
-`tool_turn` at 14 of 64, so the test fails the spec's 64-token prefix on
-those three. Each split is a near tie in our distribution: 0.502 against
-0.409, 0.332 against 0.326, and 0.499 against 0.497.
+Against llama.cpp, the first token agrees on all six cases (prompts of 9,
+18, 198, 232, 1,619 and 20,861 tokens): the same argmax, and no more than
+0.000015 apart on its top five probabilities. That check is weak, since
+every case opens on `<think>` with a probability of 1.0 or 0.9998. The free
+greedy run of 16 tokens after the 20,861-token prompt agrees in full, as do
+the 42 tokens of `tools` and the 64 of `code`, which runs past the 513
+window. The other three short cases part at near ties in our distribution,
+at tokens 52, 24 and 14.
 
-The likely reason is the reference itself. At `970b51c`,
-`ggml_metal_supports_mul_mat_op` returns false for `GGML_TYPE_NVFP4`, so
-llama.cpp runs every NVFP4 matmul on the CPU. There the `vec_dot_type` for
-NVFP4 is `Q8_0`, so the activations are quantized to 8 bits per 32 values
-before each projection, and the server's KV cache is f16 by default. This
-crate keeps activations and the KV cache in f32. llama.cpp's results also
-depend on the batch shape. We teacher-forced its own greedy tokens through
-`llama-server`, once as a fresh prefill per position and once as the
-per-step distributions of a single decode run. On `user_only` the two
-disagree on the argmax at positions 23, 41 and 56, and their top-five
-probabilities differ by up to 0.209 (median 0.0003, 20 of 65 positions over
-0.005). Ours against llama.cpp's decode run shows the same spread: up to
-0.200, median 0.0005, 22 of 64 positions over 0.005. At the worst position
-we give 0.817 where llama.cpp's prefill gives 0.826 and its decode gives
-0.617. Since our gap to llama.cpp is no larger than llama.cpp's gap to
-itself, we read the divergences as reference noise and not a forward-pass
-bug, and nothing in the forward pass was changed. The tolerance in the test
-stays at the spec's 0.005 and 64 tokens.
+llama.cpp turned out to be too noisy to judge single positions. At
+`970b51c`, `ggml_metal_supports_mul_mat_op` returns false for
+`GGML_TYPE_NVFP4`, so every NVFP4 matmul runs on the CPU, where the
+`vec_dot_type` for NVFP4 is `Q8_0`: activations are rounded to 8 bits per 32
+values before each projection. The server's KV cache is also f16 by
+default, where this crate keeps both in f32. Its results depend on the
+batch shape too. Feeding its own greedy tokens back as a fresh prefill per
+position, and comparing with the per-step distributions of its single
+decode run, the two disagree on the argmax at positions 23, 41 and 56 of
+`user_only` and differ by up to 0.209 on their top five probabilities.
+Teacher-forced against those per-position prefills, with near ties (a top-1
+lead under 0.05) skipped, 66 of 253 checked positions across the five short
+cases missed a tolerance of 0.01, with a worst difference of 0.380 at
+`tool_turn` position 21, where llama.cpp gives 0.635 and we give 0.260. We
+then rounded our own activations the same way (Q8_0 at every dense NVFP4
+input and at the MoE input, though not inside our fused expert kernel) and
+the KV through f16. That moved position 21 to 0.584 and `user_only`
+position 52 from 0.409 to 0.500 against llama.cpp's 0.580, which removed
+both confident argmax flips, while 67 positions still missed 0.01 and one
+new flip appeared at a near tie. That emulated rounding moves this model's
+probabilities by up to 0.32 at a single position, so llama.cpp can show that the forward pass is right in
+outline but cannot pin a single probability.
 
-Speed could not be measured cleanly. The runs were made on battery with
-the lid closed, and both engines swung by an order of magnitude between
-repeats. Three runs of `bench_decode` gave decode rates of 64.1, 7.8 and
-67.2 tok/s at a depth of 32 tokens, and 9.6, 47.1 and 7.2 tok/s at a depth
-of 512; prefill of 512 tokens took between 0.90 s and 11.66 s. The slow
-runs did not follow the depth, so we do not read the spread as a property
-of the engine. `llama-bench -p 512 -n 64` on the same file reported pp512
-46.09 ± 56.02 and tg64 1.32 ± 1.81 tok/s, standard deviations larger than
-their means. The fastest llama.cpp decode we saw was 10.4 tok/s (96 ms a
-token, `system_user` through `llama-server`), which fits its NVFP4 matmuls
-running on the CPU. On every comparison we have, our decode is at least as
-fast as llama.cpp's, so the spec's "within 2x" holds. The ratio itself
-should be measured again on AC power before anyone quotes it.
+So, by the user's decision, the precise oracle is an independent forward
+pass in NumPy float64, written from llama.cpp's `flint.cpp` and
+`llama-graph.cpp` semantics rather than from our Rust, with weights decoded
+by the pinned commit's gguf-py. `flint_numpy_reference.json` holds its top
+20 probabilities after the `user_only` and `system_user` prompts and after
+each of llama.cpp's first four greedy tokens fed back, ten positions in
+all. Our f32 Metal engine agrees with it on the argmax at all ten, and the
+largest difference on any of the top 20 probabilities is 1.8e-6, at a
+position whose top token has probability 0.60; the test's tolerance is
+1e-3. The oracle run takes about two minutes on the CPU.
+
+Speed was measured on this Apple M5 Max with 128 GiB, on AC power. Three
+runs of `bench_decode` decoded at 60.1 to 62.6 tok/s with a context of 32
+tokens and at 52.5 to 54.2 tok/s at 512, and prefilled 512 tokens in 0.95
+to 1.04 s, about 491 to 536 tok/s. `llama-bench -p 512 -n 64 -r 3` at
+`970b51c` (backend MTL,BLAS) reported pp512 116.42 ± 0.92 and tg64
+9.78 ± 0.23 tok/s. Decode is therefore about six times llama.cpp's and
+prefill 4.2 to 4.6 times, well inside the spec's requirement of staying
+within 2x. llama.cpp's NVFP4 matmuls running on the CPU at this commit most
+likely account for its low figures.
 
 Two spec deviations remain. The KV cache is f32, reusing gemma-engine's
 cache, at 200,704 bytes per token instead of f16's 100,352. The shared

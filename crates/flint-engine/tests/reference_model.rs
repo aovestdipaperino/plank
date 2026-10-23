@@ -16,10 +16,15 @@ use flint_engine::model::Model;
 use flint_engine::tokenizer::FlintTokenizer;
 use serde_json::Value;
 
-/// Probability tolerance on each of llama.cpp's top-5 tokens (spec).
+/// Probability tolerance on each of llama.cpp's top-5 first tokens (spec).
 const PROB_TOLERANCE: f64 = 0.005;
-/// Greedy tokens that must agree on the short cases (spec), or up to EOG.
-const GREEDY_PREFIX: usize = 64;
+/// Each of the f64 `NumPy` oracle's top-20 probabilities must be within this
+/// of ours, at every position. The user's decision: llama.cpp rounds
+/// activations to `Q8_0` (its NVFP4 matmuls run on the CPU) and keeps an f16
+/// KV, so it moves single probabilities by tenths and cannot be a precise
+/// per-position oracle (FINDINGS, "Flint against llama.cpp on the real
+/// file"); `tools/flint_numpy_ref.py` can.
+const NUMPY_TOLERANCE: f64 = 1e-3;
 
 fn fixture(name: &str) -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -112,21 +117,31 @@ fn argmax(v: &[f32]) -> u32 {
     u32::try_from(i).unwrap()
 }
 
+fn pair(v: &Value) -> (u32, f64) {
+    (
+        u32::try_from(v[0].as_u64().unwrap()).unwrap(),
+        v[1].as_f64().unwrap(),
+    )
+}
+
+/// llama.cpp's first token on all six cases, and its free greedy run on
+/// `long`. The per-position `steps` in the fixture are recorded evidence of
+/// its noise; no test asserts on them.
 #[test]
 #[ignore = "needs the Flint GGUF: PLANK_FLINT_GGUF=path"]
-fn next_token_probabilities_and_greedy_runs_match_llama_cpp() {
+fn first_tokens_and_the_long_greedy_run_match_llama_cpp() {
     let m = model();
     let tok = tokenizer();
-    let f = fixture("flint_reference.json");
+    let fx = fixture("flint_reference.json");
     let mut failures = Vec::new();
-    for case in f["cases"].as_array().unwrap() {
+    for case in fx["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let tokens = ids(&case["tokens"]);
-        let mut s = Session::new(m.clone(), m.context_length());
-        let logits = s.prefill(&tokens, &|| false).unwrap().unwrap();
-        let p = softmax(&logits);
+        let mut session = Session::new(m.clone(), m.context_length());
+        let logits = session.prefill(&tokens, &|| false).unwrap().unwrap();
+        let probs = softmax(&logits);
         let top = case["top"].as_array().unwrap();
-        let want_top = u32::try_from(top[0][0].as_u64().unwrap()).unwrap();
+        let (want_top, _) = pair(&top[0]);
         if argmax(&logits) != want_top {
             failures.push(format!(
                 "{name}: argmax {} != llama.cpp {want_top}",
@@ -134,41 +149,84 @@ fn next_token_probabilities_and_greedy_runs_match_llama_cpp() {
             ));
         }
         let mut max_diff = 0f64;
-        for pair in top.iter().take(5) {
-            let id = usize::try_from(pair[0].as_u64().unwrap()).unwrap();
-            let want = pair[1].as_f64().unwrap();
-            max_diff = max_diff.max((p[id] - want).abs());
-            if (p[id] - want).abs() > PROB_TOLERANCE {
-                failures.push(format!("{name}: p[{id}] {:.5} vs {want:.5}", p[id]));
+        for w in top.iter().take(5) {
+            let (id, want) = pair(w);
+            let got = probs[id as usize];
+            max_diff = max_diff.max((got - want).abs());
+            if (got - want).abs() > PROB_TOLERANCE {
+                failures.push(format!("{name}: p[{id}] {got:.5} vs {want:.5}"));
             }
         }
-        let want = ids(&case["greedy"]);
-        let limit = if name == "long" {
-            want.len()
-        } else {
-            want.len().min(GREEDY_PREFIX)
-        };
-        let mut got = vec![argmax(&logits)];
-        while got.len() < limit && !tok.is_eog(*got.last().unwrap()) {
-            got.push(argmax(&s.step(*got.last().unwrap()).unwrap()));
-        }
-        let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
-        if let Some(i) = got.iter().zip(&want).position(|(a, b)| a != b) {
-            failures.push(format!(
-                "{name}: greedy diverges at {i}: {:?} vs {:?}",
-                &got[i..],
-                &want[i..]
-            ));
-        }
         eprintln!(
-            "{name}: {} prompt tokens, argmax {} (llama.cpp {want_top}) p={:.4}, \
-             max top-5 |dp| {max_diff:.6}, greedy {agree}/{} agree ({} generated)",
+            "{name}: {} prompt tokens, argmax {} (llama.cpp {want_top}), max top-5 |dp| {max_diff:.6}",
             tokens.len(),
-            argmax(&logits),
-            p[want_top as usize],
-            want.len(),
-            got.len()
+            argmax(&logits)
         );
+        if name == "long" {
+            let greedy = ids(&case["greedy"]);
+            let mut got = vec![argmax(&logits)];
+            while got.len() < greedy.len() && !tok.is_eog(*got.last().unwrap()) {
+                got.push(argmax(&session.step(*got.last().unwrap()).unwrap()));
+            }
+            let agree = got.iter().zip(&greedy).take_while(|(a, b)| a == b).count();
+            if agree < greedy.len() {
+                failures.push(format!(
+                    "{name}: greedy diverges at {agree}: {:?} vs {:?}",
+                    &got[agree.min(got.len())..],
+                    &greedy[agree..]
+                ));
+            }
+            eprintln!("{name}: free greedy {agree}/{} agree", greedy.len());
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Prefill, then step through the oracle's forced tokens, checking the
+/// argmax and every top-20 probability at each of the positions.
+#[test]
+#[ignore = "needs the Flint GGUF: PLANK_FLINT_GGUF=path"]
+fn probabilities_match_the_f64_numpy_oracle() {
+    let m = model();
+    let fx = fixture("flint_numpy_reference.json");
+    let mut failures = Vec::new();
+    for case in fx["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let tokens = ids(&case["tokens"]);
+        let forced = ids(&case["forced"]);
+        let tops = case["top"].as_array().unwrap();
+        assert_eq!(tops.len(), forced.len() + 1, "{name}");
+        let mut session = Session::new(m.clone(), m.context_length());
+        let mut logits = session.prefill(&tokens, &|| false).unwrap().unwrap();
+        for (i, want) in tops.iter().enumerate() {
+            let want = want.as_array().unwrap();
+            let probs = softmax(&logits);
+            let (want_top, want_p) = pair(&want[0]);
+            let ok_argmax = argmax(&logits) == want_top;
+            if !ok_argmax {
+                failures.push(format!(
+                    "{name} position {i}: argmax {} != oracle {want_top}",
+                    argmax(&logits)
+                ));
+            }
+            let mut max_diff = 0f64;
+            for w in want {
+                let (id, wp) = pair(w);
+                let got = probs[id as usize];
+                max_diff = max_diff.max((got - wp).abs());
+                if (got - wp).abs() > NUMPY_TOLERANCE {
+                    failures.push(format!("{name} position {i}: p[{id}] {got:.6} vs {wp:.6}"));
+                }
+            }
+            eprintln!(
+                "{name} position {i}: argmax {} (oracle {want_top}, p {want_p:.4}) {}, max top-20 |dp| {max_diff:.2e}",
+                argmax(&logits),
+                if ok_argmax { "agrees" } else { "DIFFERS" }
+            );
+            if let Some(&t) = forced.get(i) {
+                logits = session.step(t).unwrap();
+            }
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

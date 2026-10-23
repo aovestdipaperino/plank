@@ -25,6 +25,15 @@ Full setup, outside the repository:
     python3 -m venv $HOME/.cache/plank/flint-fixtures-venv
     $HOME/.cache/plank/flint-fixtures-venv/bin/pip install jinja2==3.1.6
 
+Each reference case in flint_reference.json holds `tokens` (the prompt),
+`top` (llama.cpp's top 10 `[id, p]` after a fresh prefill of `tokens`) and
+`greedy` (its temperature-0 continuation). Every case but `long` also holds
+`steps`: `steps[i]` is the top 10 `[id, p]` after a fresh prefill of
+`tokens + greedy[:i]`, for each i in `0..len(greedy)`, requested exactly as
+`top` is (so `steps[0]` equals `top`). They are recorded evidence of
+llama.cpp's per-position noise (FINDINGS); no test asserts on them, and the
+precise per-position check is against tools/flint_numpy_ref.py instead.
+
 The fixtures are frozen. The `code` and `long` cases are built from repository
 files (crates/flint-engine/src/gguf.rs and the docs), so regenerating after
 those files change produces different prompts.
@@ -213,15 +222,21 @@ def wait_ready():
     raise RuntimeError("llama-server did not become ready")
 
 
-def reference_case(name, prompt, tokens, n_predict):
-    top = post("/completion", {"prompt": tokens, "n_predict": 1, "temperature": 0,
-                               "n_probs": 10, "cache_prompt": False})
-    probs = [[p["id"], math.exp(p["logprob"])]
-             for p in top["completion_probabilities"][0]["top_logprobs"]]
+def top_probs(tokens):
+    r = post("/completion", {"prompt": tokens, "n_predict": 1, "temperature": 0,
+                             "n_probs": 10, "cache_prompt": False})
+    return [[p["id"], math.exp(p["logprob"])]
+            for p in r["completion_probabilities"][0]["top_logprobs"]]
+
+
+def reference_case(name, prompt, tokens, n_predict, steps=True):
+    probs = top_probs(tokens)
     greedy = post("/completion", {"prompt": tokens, "n_predict": n_predict, "temperature": 0,
-                                  "cache_prompt": False, "return_tokens": True})
-    return {"name": name, "prompt": prompt, "tokens": tokens, "top": probs,
-            "greedy": greedy["tokens"]}
+                                  "cache_prompt": False, "return_tokens": True})["tokens"]
+    case = {"name": name, "prompt": prompt, "tokens": tokens, "top": probs, "greedy": greedy}
+    if steps:
+        case["steps"] = [top_probs(tokens + greedy[:i]) for i in range(len(greedy))]
+    return case
 
 
 def long_prompt(t, llama, gguf):
@@ -270,7 +285,7 @@ def main():
         for name in REFERENCE_CASES + ["code"]:
             prompt = by_name[name]["rendered"]
             refs.append(reference_case(name, prompt, tokenize(llama, gguf, prompt, True), 64))
-        refs.append(reference_case("long", None, long_prompt(t, llama, gguf), 16))
+        refs.append(reference_case("long", None, long_prompt(t, llama, gguf), 16, steps=False))
     finally:
         server.terminate()
         server.wait()
@@ -279,8 +294,9 @@ def main():
         for chunk in iter(lambda: f.read(1 << 24), b""):
             sha.update(chunk)
     ref = {"source": source + f"; server: llama-server -m <gguf> -c 32768 -ngl 99 -np 1, "
-                              "POST /completion temperature 0, n_probs 10 (top) and "
-                              "return_tokens (greedy), cache_prompt false",
+                              "POST /completion temperature 0, n_probs 10 (top, and steps from a fresh "
+                              "prefill of tokens + greedy[:i]) and return_tokens (greedy), "
+                              "cache_prompt false",
            "file_sha256": sha.hexdigest(), "cases": refs}
     (out / "flint_reference.json").write_text(json.dumps(ref, ensure_ascii=False) + "\n")
 
