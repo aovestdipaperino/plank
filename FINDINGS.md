@@ -3982,3 +3982,16 @@ never told the model what was wrong, so it retried the same shape and fell
 back to `write`. A key repeated with the same value is now dropped
 (`trace-stream/src/flint.rs`); one repeated with a different value is still
 an error, naming the argument.
+
+## Flint guesses tool arguments and runs bash_status as a command
+
+In real sessions (2026-10-23) Flint passed arguments no tool declares:
+`workdir` on `bash` (the command then ran in the session folder, and two
+failed builds went by before it switched to `--manifest-path`) and `offset`
+on `read`. plank dropped them silently; `dispatch` now appends a note naming
+them and the arguments the tool does take (`unknown_args_note`). Told by a
+running job's hint to "Use bash_status job=5", it called `bash` with the
+command `bash_status`; that wording is the C's and stays for the other
+dialects, but for Flint (`ToolContext::flint_hints`) the hint now names the
+`bash_status` and `bash_stop` tools. Its habit of drafting whole files while
+thinking gets a prompt line of its own (`FLINT_NO_DRAFT_LINE`).
