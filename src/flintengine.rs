@@ -241,6 +241,16 @@ impl crate::nativeengine::NativeFamily for FlintFamily {
         self.tok.encode_pieces(&template::generation_prefix())
     }
 
+    /// `<think></think>`: Flint's template has no thinking switch, so a
+    /// closed-think recovery pass starts after an empty reasoning block.
+    fn closed_think_reply(&self) -> Option<(String, Vec<u32>)> {
+        let text = format!("{}{}", template::THINK_OPEN, template::THINK_CLOSE);
+        let ids = self
+            .tok
+            .encode_pieces(&[template::Piece::Trusted(text.clone())]);
+        Some((text, ids))
+    }
+
     /// The GGUF's `eog_token_ids`: `<|end_of_text|>`, `<|user|>`,
     /// `<|observation|>` and `<|developer|>`.
     fn is_stop(&self, id: u32) -> bool {
@@ -573,12 +583,17 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// An ordinary pass: the session's own reasoning level.
     fn opts(n: i32) -> GenerationOptions {
+        opts_with(n, ThinkMode::default())
+    }
+
+    fn opts_with(n: i32, think_mode: ThinkMode) -> GenerationOptions {
         GenerationOptions {
             n_predict: n,
             ctx_size: 128,
             temperature: 0.0,
-            think_mode: ThinkMode::Off,
+            think_mode,
             ..GenerationOptions::default()
         }
     }
@@ -587,19 +602,17 @@ mod tests {
 
     /// Generates greedily; returns the streamed text and the token count.
     fn run(e: &mut FlintEngine, flat: &str, n: i32) -> (String, i32) {
+        run_with(e, flat, &opts(n))
+    }
+
+    fn run_with(e: &mut FlintEngine, flat: &str, opts: &GenerationOptions) -> (String, i32) {
         let mut text = String::new();
         let stats = e
-            .generate(
-                Prompt::Flat(flat),
-                &opts(n),
-                &|| false,
-                &|| true,
-                &mut |ev| {
-                    if let EngineEvent::Text(t) = ev {
-                        text.push_str(&t);
-                    }
-                },
-            )
+            .generate(Prompt::Flat(flat), opts, &|| false, &|| true, &mut |ev| {
+                if let EngineEvent::Text(t) = ev {
+                    text.push_str(&t);
+                }
+            })
             .unwrap();
         (text, stats.generated)
     }
@@ -631,6 +644,46 @@ mod tests {
         let probe = e.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
         assert_eq!(usize::try_from(probe.common).unwrap(), session.len());
         assert_eq!(probe.live, probe.common);
+    }
+
+    /// A pass whose mode is `Off` while the session thinks (the agent's
+    /// closed-think recovery) opens after an empty reasoning block: the block
+    /// streams first, is recorded as the reply's opening, and the next turn,
+    /// rendered from that reply, reuses every token.
+    #[test]
+    fn a_recovery_pass_opens_after_a_closed_think_block() {
+        let mut e = engine();
+        let (reply, generated) = run_with(&mut e, TURN, &opts_with(32, ThinkMode::Off));
+        assert!(reply.starts_with("<think></think>"), "{reply:?}");
+        let session = e.session.tokens().to_vec();
+        assert_eq!(to_u32(e.transcript.tokens()), session);
+        assert_eq!(e.transcript.spans().last().unwrap().text, reply);
+        // The prefix, then the closed block, then the sampled ids.
+        let open = session.len() - usize::try_from(generated).unwrap() - 2;
+        assert_eq!(
+            &session[open - 1..open + 2],
+            &[
+                marker("<|assistant|>"),
+                marker("<think>"),
+                marker("</think>")
+            ]
+        );
+        let t2 = format!("{TURN}[assistant]\n{reply}\n[user]\nmore\n");
+        let probe = e.kv_reuse_probe(&t2, ThinkMode::Off).unwrap();
+        assert_eq!(usize::try_from(probe.common).unwrap(), session.len());
+    }
+
+    /// An ordinary pass, and an `Off` pass in a session that has thinking
+    /// off altogether, get no closed block.
+    #[test]
+    fn only_a_recovery_pass_gets_the_closed_block() {
+        let mut e = engine();
+        let (reply, _) = run(&mut e, TURN, 32);
+        assert!(!reply.starts_with("<think></think>"), "{reply:?}");
+        let mut e = engine();
+        e.set_think_mode(ThinkMode::Off);
+        let (reply, _) = run_with(&mut e, TURN, &opts_with(32, ThinkMode::Off));
+        assert!(!reply.starts_with("<think></think>"), "{reply:?}");
     }
 
     #[test]

@@ -1223,3 +1223,24 @@ in the transcript — so blocking it with an *error* still invites a retry. A
 further refinement would feed the cached body back ("already loaded") instead
 of an error, removing the incentive to re-emit at all. The relapse rung ends
 the turn either way, so this stays a refinement, not a fix.
+
+## The closed-think recovery was a no-op on the native engines
+
+On the harness2 Rust tasks (2026-10-24/25, 120 Flint runs) most failures had
+one shape: a few reads, a pass that reasoned to the think budget
+(`guard: budget`), a second pass that did the same, and
+`MAIN_REPEAT_TRIP_CAP` ending the turn with no edit. `THINK_BUDGET_ERROR`
+already asks for "the next edit" and promises "your next reply has no
+reasoning step", and `Agent::pass_opts` arms that by running the next pass
+with `ThinkMode::Off`. But `NativeEngine::generate` never read
+`opts.think_mode`, and Flint's template has no thinking switch, so the
+recovery pass opened `<think>` as always and spent the budget again. The
+promise was true on DeepSeek, where `Off` prefixes `</think>`, and empty on
+Flint (and Gemma).
+
+Fixed for Flint: `NativeFamily::closed_think_reply`, which Flint implements
+as an empty `<think></think>`, placed after the generation prefix only on a
+pass whose mode is `Off` while the session's is not, streamed first and
+recorded as the reply's opening so KV reuse holds. A session-wide `Off` stays
+a no-op, as `docs/FLINT.md` explains. Whether the model behaves well after
+the prefilled block is measured by the harness2 evals, not argued.

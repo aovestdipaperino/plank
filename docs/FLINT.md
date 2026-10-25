@@ -104,13 +104,23 @@ they arrive unchanged.
 The model opens every reply with `<think>` on its own; the generation prefix
 is just `<|assistant|>`. `<think>` and `</think>` are single tokens whose
 pieces spell the tags, so the stream needs no translation, unlike Gemma's
-channel markers. plank's think modes do not change Flint's rendering:
-`ThinkMode::Off` is a no-op. The obvious way to switch thinking off would be
-to prefill an empty `<think></think>`, but nothing in the trained template
-does that, and we have no evidence of how the model behaves after one, so
-plank does not invent it. Past turns keep their thinking in the recorded
-assistant span, as on Gemma and DeepSeek, because KV reuse needs recorded
-tokens reused unchanged.
+channel markers. plank's think modes do not change Flint's rendering, and a
+session-wide `ThinkMode::Off` is a no-op: nothing in the trained template
+switches thinking off, so plank does not invent a switch for every turn.
+
+The one exception is the agent's closed-think recovery. After a reasoning
+guard stops a pass, the next pass runs with `ThinkMode::Off` while the
+session still thinks, and its tool error promises "your next reply has no
+reasoning step". Before, that promise was empty on Flint: the recovery pass
+thought to the budget again, and the second stop in a row ended the turn
+(`MAIN_REPEAT_TRIP_CAP`), which was most of Flint's failed runs on the
+harness2 Rust tasks. `FlintFamily::closed_think_reply` now opens such a
+pass after an empty `<think></think>`; `NativeEngine::generate` streams the
+block first and records it as the reply's opening, so the next turn, which
+renders the reply verbatim, reuses every token. Gemma keeps the default
+(`None`). Past turns keep their thinking in the recorded assistant span, as
+on Gemma and DeepSeek, because KV reuse needs recorded tokens reused
+unchanged.
 
 ### Stop tokens
 

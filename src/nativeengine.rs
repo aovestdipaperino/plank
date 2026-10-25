@@ -86,6 +86,17 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
     /// The ids the reply starts with after `last`.
     fn generation_prefix(&self, last: Option<Kind>, think: bool) -> Vec<u32>;
 
+    /// The text and ids of an already-closed reasoning block, for a family
+    /// that cannot switch thinking off in its template: `generate` places
+    /// them after the generation prefix on a pass whose mode is
+    /// [`ThinkMode::Off`] while the session's is not (the agent's
+    /// closed-think recovery after a reasoning-guard stop), and records them
+    /// as the reply's opening. `None`, the default, leaves such a pass as it
+    /// is.
+    fn closed_think_reply(&self) -> Option<(String, Vec<u32>)> {
+        None
+    }
+
     /// Whether sampling `id` ends the reply. A stop token is neither recorded
     /// nor evaluated: the next section's rendering supplies it.
     fn is_stop(&self, id: u32) -> bool;
@@ -471,6 +482,16 @@ impl<F: NativeFamily> NativeEngine<F> {
     /// Records a sampled reply: the generation prefix it followed and its ids,
     /// as a new assistant span — or as more of the last one when that is
     /// already an assistant reply (a resumed `/btw` pass).
+    /// The closed reasoning block a pass under `opts` opens with: only a
+    /// recovery pass (`Off` while the session thinks) on a family that has
+    /// one, so its reply is the answer.
+    fn closed_think_for(&self, opts: &GenerationOptions) -> Option<(String, Vec<u32>)> {
+        let recovery = matches!(opts.think_mode, ThinkMode::Off)
+            && !matches!(self.think, ThinkMode::Off)
+            && !opts.continue_reply;
+        recovery.then(|| self.family.closed_think_reply()).flatten()
+    }
+
     fn record_reply(&mut self, text: String, prefix: &[u32], reply: &[u32]) {
         if reply.is_empty() {
             return;
@@ -499,8 +520,12 @@ impl<F: NativeFamily> Engine for NativeEngine<F> {
         self.warm_pending = false;
         self.reconcile(prompt.flat());
         let prefix = self.render().generation_prefix(&self.kinds);
+        let closed = self.closed_think_for(opts);
         let mut full = to_u32(self.transcript.tokens());
         full.extend_from_slice(&prefix);
+        if let Some((_, ids)) = &closed {
+            full.extend_from_slice(ids);
+        }
         self.check_fits(full.len())?;
 
         // The last prompt token is always evaluated: its logits pick the
@@ -534,8 +559,11 @@ impl<F: NativeFamily> Engine for NativeEngine<F> {
         });
         let mut tr = F::Translator::default();
         let mut utf8 = Utf8Stream::default();
-        let mut reply: Vec<u32> = Vec::new();
-        let mut reply_text = String::new();
+        // A closed reasoning block is the reply's opening: streamed, recorded.
+        let (mut reply_text, mut reply) = closed.unwrap_or_default();
+        if !reply_text.is_empty() {
+            on_event(EngineEvent::Text(reply_text.clone()));
+        }
         let mut interrupted = false;
         let mut generated: i32 = 0;
         let start = std::time::Instant::now();
