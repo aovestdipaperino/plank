@@ -2352,6 +2352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_readable_but_unwritable_file_still_leaves_the_sidecar_untouched() {
         // The sibling test above makes the memory path a *directory*, which
         // now fails at the read, so it no longer reaches the write at all.
@@ -2434,6 +2435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failed_atomic_write_leaves_the_original_byte_identical_and_no_debris() {
         // The automatic pass rewrites the user's notes with no backup, so a
         // write that cannot complete must leave the old file exactly as it

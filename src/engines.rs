@@ -1197,6 +1197,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlink_to_a_managed_main_selects_that_engine() {
         let r = root("sel-symlink");
         let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();
@@ -1252,6 +1253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_delta_on_a_symlinked_base_still_inherits() {
         let r = root("inherit-symlink");
         let c = parse(COMPILED_IN, Layer::Published, &mut Vec::new()).unwrap();

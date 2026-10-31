@@ -732,6 +732,7 @@ mod tests {
     /// The file line reports what is wrong: absent, a dangling symlink, a
     /// directory, or present with its size.
     #[test]
+    #[cfg(unix)]
     fn the_file_detail_line_names_what_is_wrong() {
         // Never passed is not the same as missing, and says nothing.
         assert_eq!(file_detail("vision encoder", None), None);

@@ -432,8 +432,10 @@ mod tests {
     /// directory outside the system temp dir (e.g. under `$HOME`, which
     /// nothing else here cleans up between runs) cannot leak it when an
     /// assertion in between panics.
+    #[cfg(unix)]
     struct RemoveOnDrop(std::path::PathBuf);
 
+    #[cfg(unix)]
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);

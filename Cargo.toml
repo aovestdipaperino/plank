@@ -106,7 +106,6 @@ plank-lib = { path = "crates/plank-lib" }
 # cfg. Its Gemma half rides plank's own `gemma` feature.
 local-inference-engine = { path = "crates/local-inference-engine", default-features = false }
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
-turbo-debug-client = "0.2.1"
 libc = "0.2"
 gemma-engine = { path = "crates/gemma-engine", optional = true }
 flint-engine = { path = "crates/flint-engine", optional = true }
@@ -249,3 +248,23 @@ workspace = true
 # no external binary). `default-features = false` drops the crate's Linux-only
 # zbus/dbus tree; the macOS `image_path` (content image) needs no feature.
 notify-rust = { version = "4.18.0", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# The `--debug` token mirror's console client. 0.2.1 probes the console with
+# `flock` and `std::os::unix`, so it does not build on Windows; there
+# `src/debugmirror.rs` uses a stand-in that reports no console. Move it back
+# to `[dependencies]` once the client uses `File::try_lock_shared`.
+turbo-debug-client = "0.2.1"
+
+[target.'cfg(windows)'.dependencies]
+# Win32 calls behind `src/platform.rs` (RAM, page size, free disk, process
+# liveness). Already in the lockfile through tokio/mio and friends, so this
+# adds no new code to the tree.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
