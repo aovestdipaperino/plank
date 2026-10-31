@@ -1589,8 +1589,10 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
-            // Metal is the platform default where the engine is built.
-            Some(Backend::Metal) | None => Ds4Backend::Metal,
+            Some(Backend::Metal) => Ds4Backend::Metal,
+            // The backend the core was compiled for: Metal on macOS, the CPU
+            // or CUDA on Linux.
+            None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
         };
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
@@ -2017,7 +2019,8 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
-            Some(Backend::Metal) | None => Ds4Backend::Metal,
+            Some(Backend::Metal) => Ds4Backend::Metal,
+            None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
         };
         eprintln!("plank: loading shared model {}...", model_path.display());
         let replacer = plank::stderrline::StderrLineReplacer::start();

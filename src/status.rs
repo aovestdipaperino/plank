@@ -2585,7 +2585,7 @@ pub fn no_model_lines() -> Vec<String> {
     vec![
         "No model loaded: this build has no local engine, so replies come from the echo stub."
             .to_owned(),
-        "  local  : git submodule update --init refs/ds4 && cargo build   (macOS + Metal, 96 GB RAM)"
+        "  local  : git submodule update --init refs/ds4 && cargo build   (macOS: Metal; Linux: CPU, or PLANK_DS4_BACKEND=cuda; 96 GB RAM)"
             .to_owned(),
         "           then plank --model <engine|model.gguf>, or plank alone to fetch the default engine (~87 GB)"
             .to_owned(),
