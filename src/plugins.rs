@@ -1716,6 +1716,7 @@ mod tests {
     /// tree or targets a directory, so this test plants an escaping target to
     /// keep pinning the case it always meant to pin.
     #[test]
+    #[cfg(unix)]
     fn an_escaping_symlink_in_the_extracted_tree_is_refused() {
         let root = std::env::temp_dir().join(format!("plank-url-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1743,6 +1744,7 @@ mod tests {
     /// ordinary "same file under two names" idiom a real plugin uses, and the
     /// case the old blanket refusal wrongly rejected.
     #[test]
+    #[cfg(unix)]
     fn a_contained_symlink_in_the_extracted_tree_is_accepted() {
         let root = std::env::temp_dir().join(format!("plank-url-contained-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1840,6 +1842,7 @@ mod tests {
     /// all, so a `key -> ~/.ssh/id_rsa` entry installed the private key's
     /// *contents* as a plain file, readable by anything that reads plugins.
     #[test]
+    #[cfg(unix)]
     fn install_refuses_a_source_directory_with_an_escaping_symlink() {
         let root =
             std::env::temp_dir().join(format!("plank-install-escape-{}", std::process::id()));
@@ -1898,6 +1901,7 @@ mod tests {
     /// names" idiom a real plugin uses, same as the archive and Claude-plugin
     /// paths.
     #[test]
+    #[cfg(unix)]
     fn install_accepts_a_source_directory_with_a_contained_symlink() {
         let root =
             std::env::temp_dir().join(format!("plank-install-contained-{}", std::process::id()));

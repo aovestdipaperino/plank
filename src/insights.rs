@@ -550,14 +550,10 @@ pub fn local_utc_offset() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let Ok(t) = libc::time_t::try_from(now) else {
-        return 0;
-    };
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return 0;
-    }
-    tm.tm_gmtoff
+    i64::try_from(now)
+        .ok()
+        .and_then(crate::platform::local_time)
+        .map_or(0, |t| t.utc_offset)
 }
 
 /// Root of the report's working files, `~/.plank/usage-data`.

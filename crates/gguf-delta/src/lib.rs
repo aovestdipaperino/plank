@@ -25,8 +25,11 @@ pub mod testing;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use winpos::FileExt;
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -1152,5 +1155,53 @@ mod tests {
         assert!(is_delta_path(Path::new("x.GGD")));
         assert!(!is_delta_path(Path::new("x.gguf")));
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+/// `read_exact_at` / `write_all_at` for Windows, where std only has the
+/// cursor-moving `seek_read` / `seek_write`. Every positional access in this
+/// crate goes through these, never mixed with cursor-relative reads on the
+/// same handle, so the moved cursor is never observed.
+#[cfg(windows)]
+mod winpos {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::fs::FileExt as _;
+
+    pub(crate) trait FileExt {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    }
+
+    impl FileExt for File {
+        fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => {
+                        buf = &mut buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+            while !buf.is_empty() {
+                match self.seek_write(buf, offset) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => {
+                        buf = &buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
     }
 }
