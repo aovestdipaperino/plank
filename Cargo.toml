@@ -34,7 +34,7 @@ exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", 
 
 [features]
 default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins", "gemma", "flint"]
-# Image pasting (Cmd-V clipboard images, image file paths). This was off while
+# Image pasting (pasted clipboard images, image file paths). This was off while
 # the model had no way to act on an image-file reference — the attachment named
 # a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
 # (`transcribe_image` reads the cached file), so the gate has outlived its
@@ -258,11 +258,12 @@ turbo-debug-client = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 # Win32 calls behind `src/platform.rs` (RAM, page size, free disk, process
-# liveness). Already in the lockfile through tokio/mio and friends, so this
-# adds no new code to the tree.
+# liveness, the clipboard-image probe). Already in the lockfile through
+# tokio/mio and friends, so this adds no new code to the tree.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_SystemInformation",

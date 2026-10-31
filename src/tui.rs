@@ -2056,23 +2056,12 @@ pub(crate) fn base64(data: &[u8]) -> String {
     out
 }
 
-/// Copies `text` to the system clipboard: `pbcopy` for the local macOS
-/// clipboard, plus an OSC 52 escape so it also works over SSH in terminals
-/// that support it. Best-effort on both paths.
+/// Copies `text` to the system clipboard: the local clipboard tool
+/// (`crate::platform::desktop::copy_text`), plus an OSC 52 escape so it also
+/// works over SSH in terminals that support it. Best-effort on both paths.
 pub fn copy_to_clipboard(text: &str) {
     use std::io::Write as _;
-    if let Ok(mut child) = std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        drop(child.stdin.take());
-        let _ = child.wait();
-    }
+    crate::platform::desktop::copy_text(text);
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b]52;c;{}\x1b\\", base64(text.as_bytes()));
     let _ = out.flush();
@@ -2080,25 +2069,18 @@ pub fn copy_to_clipboard(text: &str) {
 
 /// Reads the system clipboard as text, for an explicit Ctrl-V.
 ///
-/// `pbpaste` only, with no OSC 52 counterpart: reading the clipboard back over
-/// an escape sequence needs a terminal reply, which would mean draining the
-/// event stream mid-keypress. Over SSH the terminal's own paste (which arrives
-/// as a bracketed [`ratatui::crossterm::event::Event::Paste`]) is the working
-/// path, and it is already handled.
+/// The local clipboard tool only, with no OSC 52 counterpart: reading the
+/// clipboard back over an escape sequence needs a terminal reply, which would
+/// mean draining the event stream mid-keypress. Over SSH the terminal's own
+/// paste (which arrives as a bracketed
+/// [`ratatui::crossterm::event::Event::Paste`]) is the working path, and it is
+/// already handled.
 ///
 /// Returns `None` when the clipboard is empty or holds no text — an image, for
 /// instance, which the paste handler routes to `crate::imagepaste` instead.
 #[must_use]
 pub fn paste_from_clipboard() -> Option<String> {
-    let out = std::process::Command::new("pbpaste")
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    (!text.is_empty()).then_some(text)
+    crate::platform::desktop::paste_text()
 }
 
 /// Scroll state of the output log viewport.

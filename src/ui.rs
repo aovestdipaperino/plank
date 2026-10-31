@@ -13512,8 +13512,9 @@ impl Agent<'_> {
         }
         // Capture the mouse so wheel events scroll the output buffer instead
         // of being translated by the terminal into arrow keys (history moves),
-        // and drags select text for copying. Bracketed paste makes Cmd-V
-        // arrive as a single Paste event instead of a burst of key presses.
+        // and drags select text for copying. Bracketed paste makes the
+        // terminal's paste key arrive as a single Paste event instead of a
+        // burst of key presses.
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             EnableMouseCapture,
@@ -13817,7 +13818,8 @@ impl Agent<'_> {
         // read. Always empty while IMAGES_ENABLED is off.
         let mut attachments: Vec<crate::imagepaste::PastedImage> = Vec::new();
         // Clipboard-image hint, re-probed every few seconds (the probe shells
-        // out to osascript, so it must not run on every 200ms poll tick).
+        // out to osascript or xclip, so it must not run on every 200ms poll
+        // tick).
         let mut clip_has_image = IMAGES_ENABLED && crate::imagepaste::clipboard_has_image();
         let mut clip_checked = Instant::now();
         // Only rasterize the frame when the CRT-off power-down will actually run;
@@ -13912,7 +13914,9 @@ impl Agent<'_> {
             self.refresh_jobs_report(&mut report);
             let mut status = self.idle_status_text(cols);
             if clip_has_image {
-                status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
+                status.push_str(" | 📷 image in clipboard (");
+                status.push_str(crate::platform::desktop::PASTE_KEY);
+                status.push_str(" attaches)");
             }
             let task_view =
                 tui::TaskView::with_goal(&self.session.tasks, self.session.goal.as_ref());
@@ -14513,8 +14517,8 @@ impl Agent<'_> {
             if let Event::Paste(pasted) = &ev {
                 input.hist_idx = None;
                 // An empty bracketed paste means the clipboard holds an image
-                // (macOS pastes no text for image content); pasted text that is
-                // an image file path attaches that file.
+                // (terminals paste no text for image content); pasted text
+                // that is an image file path attaches that file.
                 if IMAGES_ENABLED {
                     if pasted.trim().is_empty() {
                         match crate::imagepaste::from_clipboard() {
