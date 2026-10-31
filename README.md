@@ -20,7 +20,7 @@ Plank is an interactive coding agent with a Ratatui TUI, a plain terminal REPL, 
 
 ## Installing
 
-Homebrew is the only distribution channel (plank is not on crates.io):
+On macOS, install with Homebrew (plank is not on crates.io):
 
 ```sh
 brew tap aovestdipaperino/tap
@@ -33,6 +33,17 @@ Or in one step without a prior tap: `brew install aovestdipaperino/tap/plank-age
 > **Note — formula naming.** The Homebrew formulas are `plank-agent` / `plank-agent-beta`, not `plank`, because a `plank` formula already exists in Homebrew and the bare name collides. The installed binary is still just `plank` — you run `plank`, only the `brew install` name carries the `-agent` suffix.
 
 Releases follow a two-channel scheme where the patch number *is* the channel: every `vX.Y.0` is a stable release, and any patch above 0 is a beta (the app's version banner shows ` BETA` accordingly). A series opens with its stable `.0` and accumulates beta work as patch bumps (`v2.5.1`, `v2.5.2`, …); promoting a beta to stable opens the next minor as an identical `v2.6.0` (stable) / `v2.6.1` (beta) pair. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank-agent && brew install plank-agent-beta` (or the reverse). See [VERSIONING.md](VERSIONING.md) for the channel model and the promote-to-stable process.
+
+Every [release](https://github.com/aovestdipaperino/plank/releases) also carries prebuilt archives holding just the `plank` binary, with a `plank-<tag>-SHA256SUMS` to check them against:
+
+| Archive | Platform |
+|---|---|
+| `plank-<tag>-aarch64-macos.tar.gz` | macOS, Apple Silicon |
+| `plank-<tag>-x86_64-linux.tar.gz` | Linux, x86_64 (glibc) |
+| `plank-<tag>-aarch64-linux.tar.gz` | Linux, aarch64 (glibc) |
+| `plank-<tag>-x86_64-windows.zip` | Windows, x86_64 (`plank.exe`) |
+
+The Linux and Windows builds are experimental ([#89](https://github.com/aovestdipaperino/plank/issues/89)): they have no ds4 engine, so DeepSeek and Qwen are unavailable, while Gemma 4 and Flint run on the CPU and `--provider` / `--remote` work as on a Mac. See [Building](#building) for what else is missing there.
 
 ## Building
 
