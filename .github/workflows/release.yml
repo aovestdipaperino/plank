@@ -7,8 +7,11 @@ name: Release
 # (promote.yml) tags the next minor's `.0` as the new stable and opens `.1`
 # as the new beta.
 #
-# Homebrew (aovestdipaperino/homebrew-tap) is the ONLY distribution
-# channel — plank is macOS-only and is not published to crates.io.
+# Homebrew (aovestdipaperino/homebrew-tap) is the macOS distribution
+# channel. Every release also carries plain archives for macOS, Linux
+# (x86_64, aarch64) and Windows (x86_64), with a SHA256SUMS over them; the
+# Linux and Windows builds have no ds4 engine (Gemma and Flint on the CPU,
+# see #89). plank is not published to crates.io.
 
 on:
   release:
@@ -67,6 +70,25 @@ jobs:
             target: aarch64-apple-darwin
             bottle_tag: arm64_sequoia
             cpu_flag: "-mcpu=apple-m1"
+          # Linux and Windows: default features, no ds4 engine (its build is
+          # macOS/Metal only here), so Gemma and Flint run on the CPU. CUDA
+          # variants can follow separately, where licensing allows. Each runner
+          # is native to its target so the smoke test below can run the binary.
+          - name: x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            no_ds4: "1"
+          - name: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            no_ds4: "1"
+          - name: x86_64-windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            no_ds4: "1"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,18 +101,51 @@ jobs:
       - name: Build release binary
         env:
           NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
+          PLANK_NO_DS4: ${{ matrix.no_ds4 }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Each OS gets its usual archive format: a .zip holding plank.exe on
+      # Windows, a .tar.gz holding plank everywhere else.
       - name: Package binary archive
+        id: package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf "../../../plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" plank
+          cd "target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ARCHIVE="plank-${GITHUB_REF_NAME}-${{ matrix.name }}.zip"
+            7z a -tzip "../../../$ARCHIVE" plank.exe
+          else
+            ARCHIVE="plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz"
+            tar czf "../../../$ARCHIVE" plank
+          fi
           cd ../../..
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      # Run the binary out of the archive, not out of target/, so a packaging
+      # mistake fails the release instead of shipping.
+      - name: Smoke test the archive
+        run: |
+          mkdir smoke
+          ARCHIVE="${{ steps.package.outputs.archive }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z x -osmoke "$ARCHIVE" >/dev/null
+            ./smoke/plank.exe --version
+          else
+            tar xzf "$ARCHIVE" -C smoke
+            ./smoke/plank --version
+          fi
 
       - name: Upload binary archive to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.archive }}" --clobber
+
+      # Handed to the checksums job, which writes one SHA256SUMS over every
+      # platform's archive.
+      - name: Keep binary archive for checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.name }}
+          path: ${{ steps.package.outputs.archive }}
 
       # The WASM plugins shipped nowhere: `guests/` was built only on a
       # developer's disk, so `/plugins install` had nothing to point at and the
@@ -98,16 +153,20 @@ jobs:
       # These are the two artifacts that make it reachable.
       #
       # Architecture-independent (wasm32 is wasm32), but built in the matrix job
-      # because that is where a toolchain and a checkout already exist; the
-      # single matrix entry means they are produced exactly once. `--clobber`
+      # because that is where a toolchain and a checkout already exist. Only
+      # the macOS entry builds them, so they are produced exactly once and
+      # their SHA256SUMS records the same toolchain as before. `--clobber`
       # keeps a re-run idempotent.
       - name: Add wasm32 target for the guests
+        if: runner.os == 'macOS'
         run: rustup target add wasm32-unknown-unknown wasm32-wasip1
 
       - name: Package plugin archives
+        if: runner.os == 'macOS'
         run: sh guests/package.sh
 
       - name: Upload plugin archives to release
+        if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -124,6 +183,7 @@ jobs:
       # tags a fresh `.0` release (rebuilt by this workflow), so stable never
       # reuses beta bottles.
       - name: Package Homebrew bottle
+        if: runner.os == 'macOS'
         run: |
           VERSION="${{ needs.channel.outputs.version }}"
           BOTTLE_TAG="${{ matrix.bottle_tag }}"
@@ -138,14 +198,42 @@ jobs:
           tar czf "$NAME-$VERSION.$BOTTLE_TAG.bottle.tar.gz" "$NAME/"
 
       - name: Upload bottle artifacts
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: bottle-${{ matrix.bottle_tag }}
           path: "*.bottle.tar.gz"
 
+  # One checksum file over every platform's binary archive. Named after the
+  # tag so it cannot collide with the guests' SHA256SUMS on the same release.
+  checksums:
+    name: Binary checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: archives
+          merge-multiple: true
+
+      - name: Upload SHA256SUMS to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUMS="plank-${GITHUB_REF_NAME}-SHA256SUMS"
+          (cd archives && sha256sum plank-* > "../$SUMS")
+          cat "$SUMS"
+          gh release upload "$GITHUB_REF_NAME" "$SUMS" --clobber --repo "$GITHUB_REPOSITORY"
+
   update-homebrew:
     name: Update Homebrew tap
     needs: [channel, build]
+    # `build` fails if any platform does, but only the macOS entry feeds the
+    # tap: run whenever its bottle exists, so a Linux or Windows failure never
+    # holds back Homebrew. A missing bottle still fails the hash step below.
+    if: ${{ !cancelled() && needs.channel.result == 'success' }}
     runs-on: ubuntu-latest
     # Promotion publishes a stable/beta release pair back-to-back; serialize
     # the tap pushes so the second doesn't hit a non-fast-forward.
