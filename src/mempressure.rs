@@ -248,9 +248,11 @@ impl PressureLevel {
 /// Publishes the kernel's current memory-pressure level.
 ///
 /// On macOS a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` source writes the atomic
-/// from its own queue; everywhere else the atomic simply stays at `Normal`, so
-/// every consumer compiles and behaves as though the machine were never under
-/// pressure.
+/// from its own queue. On Linux and Windows one shared thread polls the RAM
+/// still available ([`poll`]) and writes the level each time it changes.
+/// Where neither applies (and in unit tests off macOS, which must not depend
+/// on the host's real memory) the atomic stays at `Normal`, so every consumer
+/// behaves as though the machine were never under pressure.
 #[derive(Debug, Clone)]
 pub struct PressureSensor {
     level: Arc<AtomicU8>,
@@ -264,6 +266,8 @@ impl PressureSensor {
         let level = Arc::new(AtomicU8::new(PressureLevel::Normal.as_u8()));
         #[cfg(target_os = "macos")]
         macos::install(&level);
+        #[cfg(all(any(target_os = "linux", windows), not(test)))]
+        poll::subscribe(&level);
         Self { level }
     }
 
@@ -278,6 +282,105 @@ impl PressureSensor {
     #[doc(hidden)]
     pub fn set_for_test(&self, level: PressureLevel) {
         self.level.store(level.as_u8(), Ordering::SeqCst);
+    }
+}
+
+/// The polled sensor for systems with no pressure notification of their own.
+///
+/// macOS's levels come from the kernel's own reclaim state. Here they are
+/// derived from the share of RAM still available, which on Linux already
+/// counts reclaimable page cache, so the mapped GGUF weights do not read as
+/// pressure.
+pub mod poll {
+    use super::PressureLevel;
+
+    /// Available RAM, in percent of physical RAM, at or below which the level
+    /// is `Warn`.
+    pub const WARN_PERCENT: u64 = 10;
+
+    /// Available RAM, in percent of physical RAM, at or below which the level
+    /// is `Critical`.
+    pub const CRITICAL_PERCENT: u64 = 5;
+
+    /// The level for `available` bytes free out of `total`.
+    #[must_use]
+    pub fn level_for(available: u64, total: u64) -> PressureLevel {
+        if total == 0 {
+            return PressureLevel::Normal;
+        }
+        let percent = u128::from(available) * 100 / u128::from(total);
+        if percent <= u128::from(CRITICAL_PERCENT) {
+            PressureLevel::Critical
+        } else if percent <= u128::from(WARN_PERCENT) {
+            PressureLevel::Warn
+        } else {
+            PressureLevel::Normal
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", windows), not(test)))]
+    pub(super) use live::subscribe;
+
+    #[cfg(all(any(target_os = "linux", windows), not(test)))]
+    mod live {
+        use super::super::{Arc, AtomicU8, Ordering, PressureLevel};
+        use std::sync::{Mutex, Weak};
+        use std::time::Duration;
+
+        /// How often the thread reads available RAM.
+        const PERIOD: Duration = Duration::from_secs(2);
+
+        /// Every live sensor's level, and the level last polled.
+        static SUBSCRIBERS: Mutex<(Vec<Weak<AtomicU8>>, Option<PressureLevel>)> =
+            Mutex::new((Vec::new(), None));
+
+        fn read() -> Option<PressureLevel> {
+            let total = crate::platform::physical_memory()?;
+            let available = crate::platform::available_memory()?;
+            Some(super::level_for(available, total))
+        }
+
+        /// Adds `level` to the sensors the polling thread writes, starting the
+        /// thread on first use. Edge-triggered like the macOS source: a sensor
+        /// is written when the polled level changes, not on every poll.
+        pub(in super::super) fn subscribe(level: &Arc<AtomicU8>) {
+            static STARTED: std::sync::Once = std::sync::Once::new();
+            let Ok(mut subs) = SUBSCRIBERS.lock() else {
+                return;
+            };
+            if let Some(now) = subs.1 {
+                level.store(now.as_u8(), Ordering::SeqCst);
+            }
+            subs.0.push(Arc::downgrade(level));
+            STARTED.call_once(|| {
+                if read().is_none() {
+                    crate::engine::kv_debug(|| {
+                        "mempressure: available RAM is unreadable; memory-pressure yielding is disabled for this run".to_owned()
+                    });
+                    return;
+                }
+                std::thread::spawn(run);
+            });
+        }
+
+        fn run() {
+            loop {
+                if let Some(now) = read()
+                    && let Ok(mut subs) = SUBSCRIBERS.lock()
+                    && subs.1 != Some(now)
+                {
+                    subs.1 = Some(now);
+                    subs.0.retain(|w| match w.upgrade() {
+                        Some(level) => {
+                            level.store(now.as_u8(), Ordering::SeqCst);
+                            true
+                        }
+                        None => false,
+                    });
+                }
+                std::thread::sleep(PERIOD);
+            }
+        }
     }
 }
 
@@ -394,6 +497,18 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polled_levels_follow_the_available_share() {
+        let gib = 1u64 << 30;
+        assert_eq!(poll::level_for(50 * gib, 100 * gib), PressureLevel::Normal);
+        assert_eq!(poll::level_for(11 * gib, 100 * gib), PressureLevel::Normal);
+        assert_eq!(poll::level_for(10 * gib, 100 * gib), PressureLevel::Warn);
+        assert_eq!(poll::level_for(6 * gib, 100 * gib), PressureLevel::Warn);
+        assert_eq!(poll::level_for(5 * gib, 100 * gib), PressureLevel::Critical);
+        assert_eq!(poll::level_for(0, 100 * gib), PressureLevel::Critical);
+        assert_eq!(poll::level_for(0, 0), PressureLevel::Normal);
+    }
 
     #[test]
     fn critical_yields_immediately() {
