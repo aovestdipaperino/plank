@@ -448,7 +448,7 @@ impl BashJob {
             && self.exit_status != 0
             && self
                 .read_tail_lines(BASH_FINAL_TAIL_LINES)
-                .contains("Operation not permitted")
+                .contains(crate::sandbox::Sandbox::denial_text())
         {
             let _ = writeln!(
                 out,
@@ -552,13 +552,14 @@ impl BashJobs {
         }
         let id = self.next_id;
         let (path, file) = make_output_file(u64::try_from(id).unwrap_or(0))?;
-        // When a sandbox policy applies, wrap the shell in sandbox-exec with
-        // a generated Seatbelt profile (read everywhere, write only under
-        // cwd/temp/configured roots). See src/sandbox.rs.
+        // When a sandbox policy applies, the shell runs confined (read
+        // everywhere, write only under cwd/temp/configured roots): Seatbelt
+        // on macOS, Landlock on Linux. See src/sandbox.rs.
         let mut command = if let Some(sb) = sandbox {
-            let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(sb.profile(ctx_cwd)).arg("/bin/sh");
-            c
+            sb.shell_command(ctx_cwd).map_err(|e| {
+                std::fs::remove_file(&path).ok();
+                format!("failed to build the sandbox: {e}")
+            })?
         } else {
             crate::platform::shell_command()
         };
@@ -1283,7 +1284,7 @@ pub fn run_immediate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::tools::home_writable;
     use crate::tools::{test_call, test_ctx};
 
@@ -1742,18 +1743,19 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// End-to-end Seatbelt check: with the sandbox on, a write inside cwd
-    /// succeeds while a write outside it is denied with EPERM and the
-    /// observation carries the `[sandbox blocked: ...]` hint. Requires
-    /// /usr/bin/sandbox-exec, so macOS only.
-    #[cfg(target_os = "macos")]
+    /// End-to-end sandbox check: with the sandbox on, a write inside cwd
+    /// succeeds while a write outside it is denied (EPERM under Seatbelt,
+    /// EACCES under Landlock) and the observation carries the
+    /// `[sandbox blocked: ...]` hint. Needs /usr/bin/sandbox-exec on macOS or
+    /// a kernel with Landlock on Linux.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn bash_sandbox_blocks_writes_outside_cwd() {
         let _interrupt_guard = crate::interrupt::test_guard();
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` itself can't apply a profile from inside a nested
         // sandbox — so skip both when `$HOME` isn't writable.
-        if !home_writable() {
+        if !home_writable() || !crate::sandbox::enforcement().confines_bash() {
             return;
         }
         let (mut ctx, dir) = test_ctx();

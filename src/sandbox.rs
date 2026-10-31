@@ -1,17 +1,21 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! macOS Seatbelt sandbox for model-initiated shell commands (issue #17).
+//! Write sandbox for model-initiated shell commands and file tools (issue #17).
 //!
-//! On by default on macOS: a model-chosen command should not be able to write
-//! outside the project it was pointed at. `--no-sandbox` (or `"enabled": false`)
-//! turns it off.
+//! On by default: a model-chosen command should not be able to write outside
+//! the project it was pointed at. `--no-sandbox` (or `"enabled": false`) turns
+//! it off.
 //!
-//! When enabled, `bash` tool commands run under `/usr/bin/sandbox-exec` with
-//! a generated profile: read everywhere, write only under the working
-//! directory, temp dirs, and any configured extra roots. User-typed `!` and
-//! `!!` commands are never sandboxed — the user typing the command is the
-//! authorization.
+//! When enabled, `bash` tool commands run confined to the same write roots the
+//! file tools are held to: read everywhere, write only under the working
+//! directory, temp dirs, and any configured extra roots. What enforces that on
+//! `bash` depends on the OS ([`enforcement`]): `/usr/bin/sandbox-exec` with a
+//! generated Seatbelt profile on macOS, a Landlock ruleset on Linux
+//! (`landlock.rs`), and nothing yet on Windows, where only the file tools'
+//! check ([`Sandbox::contains_write_target`]) applies and the startup notice
+//! ([`Sandbox::startup_notice`]) says so. User-typed `!` and `!!` commands are
+//! never sandboxed — the user typing the command is the authorization.
 //!
 //! Configured via `~/.plank/sandbox.json` overlaid by `./.plank/sandbox.json`:
 //!
@@ -58,6 +62,46 @@
 //!
 //! `sandbox-exec` is deprecated by Apple but remains functional and is what
 //! the reference agents use on macOS.
+
+/// What confines a sandboxed `bash` command on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enforcement {
+    /// macOS: `sandbox-exec` with a generated profile.
+    Seatbelt,
+    /// Linux: a Landlock ruleset of this ABI version.
+    Landlock(i64),
+    /// No backend; the reason, for the startup notice.
+    Unavailable(String),
+}
+
+impl Enforcement {
+    /// True when `bash` commands can actually be confined.
+    #[must_use]
+    pub fn confines_bash(&self) -> bool {
+        !matches!(self, Self::Unavailable(_))
+    }
+}
+
+/// This machine's [`Enforcement`], probed once.
+#[must_use]
+pub fn enforcement() -> &'static Enforcement {
+    static PROBED: std::sync::OnceLock<Enforcement> = std::sync::OnceLock::new();
+    PROBED.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            Enforcement::Seatbelt
+        }
+        #[cfg(target_os = "linux")]
+        {
+            crate::landlock::abi_version()
+                .map_or_else(Enforcement::Unavailable, Enforcement::Landlock)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Enforcement::Unavailable("this OS has no sandbox plank can use yet".to_string())
+        }
+    })
+}
 
 use crate::tools::mcp::{Json, json_parse};
 use std::collections::BTreeSet;
@@ -253,7 +297,8 @@ fn toolchain_cache_roots(user_home: Option<&Path>) -> Vec<PathBuf> {
 /// Sandbox policy for model-initiated bash commands.
 #[derive(Debug, Clone)]
 pub struct Sandbox {
-    /// Master switch; on by default wherever `sandbox-exec` exists (macOS).
+    /// Master switch, on by default. Gates both the file tools' containment
+    /// check and, where [`enforcement`] has a backend, the `bash` confinement.
     pub enabled: bool,
     /// Extra roots writable in addition to cwd and temp dirs.
     pub writable_paths: Vec<PathBuf>,
@@ -266,12 +311,12 @@ pub struct Sandbox {
 }
 
 impl Default for Sandbox {
-    /// On where Seatbelt exists, off elsewhere: `sandbox-exec` is macOS-only,
-    /// and wrapping a command in a binary that is not there would fail every
-    /// model-initiated command on other platforms.
+    /// On everywhere: the file tools' containment is portable, and `bash` is
+    /// confined only where [`enforcement`] found a backend, so an OS without
+    /// one still runs commands, unconfined.
     fn default() -> Self {
         Self {
-            enabled: cfg!(target_os = "macos"),
+            enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
             granted: BTreeSet::new(),
@@ -280,10 +325,12 @@ impl Default for Sandbox {
 }
 
 impl Sandbox {
-    /// True when this command should run under `sandbox-exec`.
+    /// True when this command should run confined: the sandbox is on, this
+    /// machine can confine `bash` ([`enforcement`]), and no
+    /// `excludedCommands` pattern skips it.
     #[must_use]
     pub fn should_sandbox(&self, cmd: &str) -> bool {
-        if !self.enabled {
+        if !self.enabled || !enforcement().confines_bash() {
             return false;
         }
         let cmd = cmd.trim();
@@ -291,6 +338,59 @@ impl Sandbox {
             .excluded_commands
             .iter()
             .any(|pat| glob_match(pat.trim(), cmd))
+    }
+
+    /// The `sh` that runs `cmd` confined to [`write_roots`](Self::write_roots)
+    /// under this machine's [`enforcement`]; the caller adds `-c <cmd>`.
+    ///
+    /// # Errors
+    /// Building the Landlock ruleset failed.
+    pub fn shell_command(&self, cwd: &Path) -> std::io::Result<std::process::Command> {
+        match enforcement() {
+            Enforcement::Seatbelt => {
+                let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+                c.arg("-p").arg(self.profile(cwd)).arg("/bin/sh");
+                Ok(c)
+            }
+            #[cfg(target_os = "linux")]
+            Enforcement::Landlock(abi) => {
+                use std::os::unix::process::CommandExt as _;
+                let ruleset = crate::landlock::Ruleset::for_roots(*abi, &self.write_roots(cwd))?;
+                let mut c = crate::platform::shell_command();
+                // SAFETY: `apply_in_child` makes only async-signal-safe
+                // syscalls and allocates nothing.
+                unsafe {
+                    c.pre_exec(move || ruleset.apply_in_child());
+                }
+                Ok(c)
+            }
+            #[cfg(not(target_os = "linux"))]
+            Enforcement::Landlock(_) => Ok(crate::platform::shell_command()),
+            Enforcement::Unavailable(_) => Ok(crate::platform::shell_command()),
+        }
+    }
+
+    /// The line a confined command's failure carries when a write was refused:
+    /// Seatbelt reports `EPERM`, Landlock `EACCES`.
+    #[must_use]
+    pub fn denial_text() -> &'static str {
+        match enforcement() {
+            Enforcement::Landlock(_) => "Permission denied",
+            _ => "Operation not permitted",
+        }
+    }
+
+    /// A startup line when the sandbox is on but cannot confine `bash` here;
+    /// `None` when it can, or when the user turned it off.
+    #[must_use]
+    pub fn startup_notice(&self) -> Option<String> {
+        match enforcement() {
+            Enforcement::Unavailable(reason) if self.enabled => Some(format!(
+                "Sandbox: bash commands run unconfined ({reason}); file tools still write \
+                 only inside the workspace."
+            )),
+            _ => None,
+        }
     }
 
     /// Builds the Seatbelt (SBPL) profile: allow everything, deny all file
@@ -753,9 +853,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enabled_by_default_on_macos_only() {
+    fn enabled_by_default_and_confines_bash_where_a_backend_exists() {
         let sb = Sandbox::default();
-        assert_eq!(sb.should_sandbox("rm -rf /"), cfg!(target_os = "macos"));
+        assert!(sb.enabled);
+        assert_eq!(sb.should_sandbox("rm -rf /"), enforcement().confines_bash());
+        assert_eq!(
+            sb.startup_notice().is_some(),
+            !enforcement().confines_bash()
+        );
+        let off = Sandbox {
+            enabled: false,
+            ..sb
+        };
+        assert!(!off.should_sandbox("rm -rf /"));
+        assert!(off.startup_notice().is_none());
     }
 
     #[test]

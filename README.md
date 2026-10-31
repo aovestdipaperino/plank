@@ -230,7 +230,7 @@ A few keys cannot take effect until you restart, because what they configure is 
 | | `builtinEditor` | `true` | `Ctrl-G` opens the built-in editor (a fork of Microsoft Edit, in-process). `false` shells out to `$EDITOR` as before. |
 | | `screensaver` | `1m` | Idle time before the screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
 | | `screensaverFace` | `matrix` | Which screen it puts up: `matrix` (the rain), `starfield`, `minions`, or `random` for a fresh draw each time. |
-| `safety` | `sandbox` | on (macOS) | Default for the write sandbox: bash runs under Seatbelt, and `write`/`edit` refuse paths outside the workspace. Same as `--sandbox`/`--no-sandbox`. |
+| `safety` | `sandbox` | on | Default for the write sandbox: `write`/`edit` refuse paths outside the workspace on every OS, and bash runs confined to the same roots under Seatbelt (macOS) or Landlock (Linux 5.13+); on Windows bash is not confined yet, which the startup banner says. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |

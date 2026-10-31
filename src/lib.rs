@@ -115,6 +115,8 @@ pub mod kvpane;
 /// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
 pub mod kvtier;
 pub mod kvtree;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 pub mod logo;
 pub mod manifest;
 pub mod memextract;
