@@ -162,3 +162,56 @@ jobs:
         run: |
           cargo test --no-default-features \
             --features use_obscura,builtin_editor,docparse,images --verbose
+
+  # Linux and Windows (#89). The default features, without the ds4 C engine,
+  # which `crates/local-inference-engine` builds on macOS only: Gemma and
+  # Flint run on candle's CPU path here. The WASM guests are not built, so the
+  # guest-backed tests skip (PLANK_REQUIRE_GUESTS is unset); the macOS job
+  # above is the one that holds them. Both runner images ship cmake, which
+  # `docparse` needs for Tesseract.
+  portable:
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PLANK_NO_DS4: "1"
+      # The MSVC main-thread stack is 1 MB; the async-heavy tests need more.
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: portable
+
+      # See the macOS job: the pdfium download lives outside target/.
+      - name: Cache pdfium binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdfium-rs
+          key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Ensure pdfium is downloadable
+        shell: bash
+        run: |
+          if [ ! -d "$HOME/.cache/pdfium-rs" ]; then
+            cargo clean -p liteparse-pdfium-sys || true
+          fi
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `--release`, as in the macOS job, and here also required: tesseract-rs
+      # 0.2.0 looks for `leptonica-1.84.1.lib`, but an MSVC Debug build names
+      # it `leptonica-1.84.1d.lib`, so a debug test build fails to link.
+      - name: Test
+        run: cargo test --release --lib

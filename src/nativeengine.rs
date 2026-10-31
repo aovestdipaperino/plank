@@ -301,17 +301,9 @@ pub(crate) fn physical_memory() -> usize {
 /// Bytes of RAM on this machine, or `usize::MAX` when it cannot be read.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn physical_memory() -> usize {
-    // SAFETY: sysconf only reads system configuration.
-    let (pages, size) = unsafe {
-        (
-            libc::sysconf(libc::_SC_PHYS_PAGES),
-            libc::sysconf(libc::_SC_PAGESIZE),
-        )
-    };
-    match (usize::try_from(pages), usize::try_from(size)) {
-        (Ok(p), Ok(s)) => p.saturating_mul(s),
-        _ => usize::MAX,
-    }
+    crate::platform::physical_memory()
+        .and_then(|b| usize::try_from(b).ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// Metal when this machine has it, else the CPU.

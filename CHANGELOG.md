@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Linux and Windows builds** (#89, phases 1 and 2). plank builds, lints and
+  tests on Linux and Windows with the echo stub, Gemma and Flint on the CPU;
+  the ds4 C engine stays macOS-only for now. Desktop integrations (clipboard
+  text and images, open, sound, notifications, memory pressure) go through
+  `platform::desktop` with a tool list per OS. On Windows the bash tool and
+  hooks run a POSIX shell found on `PATH` or under Git for Windows
+  (`PLANK_SHELL` overrides it, and a missing one is named as such), every
+  spawned tree lives in a Job Object so a stop or timeout ends all of it, and
+  worktree build directories are linked with a junction when a directory
+  symlink needs privileges the account lacks.
+
+- **Linux write sandbox, and containment on every OS** (#89, step 4). On
+  Linux 5.13+ model `bash` commands run under a Landlock ruleset holding
+  writes to the same roots as on macOS (the working directory, temp dirs,
+  toolchain caches and `writablePaths`; reads stay open), built with the raw
+  syscalls and applied in the child before `exec`, so a command that cannot
+  be confined fails to start rather than running loose. The sandbox is now on
+  by default everywhere, which also turns on the `write`/`edit` workspace
+  check on Linux and Windows. Where `bash` cannot be confined (Windows, or a
+  kernel without Landlock) both front ends say so at startup.
+
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
   Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the
@@ -110,6 +131,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-applies the switched direction before the KV is restored.
 
 ### Fixed
+
+- **Writes into new directories pass the workspace check on every OS.** A
+  file tool writing several directories below the workspace that did not
+  exist yet was judged by a lexical path, which on Windows lacked the `\\?\`
+  prefix the canonical roots carry (on macOS, in a workspace under `/tmp`,
+  the `/private` one), and so
+  was refused. The deepest existing ancestor is now canonicalized for both the
+  target and the roots, and on Windows the comparison ignores case.
 
 - **Flint edits that repeat `path` are accepted.** Flint often gives `path`
   again at the end of an `edit` call; a key repeated with the same value is

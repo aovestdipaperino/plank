@@ -4007,3 +4007,35 @@ in, so they see it without the bump. The next catalog bump must wait until
 the 7.0.x clients have aged out, or the old fit rule has to be reckoned with
 (`enginefit.rs` in v7.0.8, `raw_str(entry, "family") == Some("gemma")`).
 
+
+## Write containment on Windows: canonical roots against a lexical target
+
+`Sandbox::write_roots` canonicalizes its roots, and on Windows
+`canonicalize` returns verbatim paths (`\\?\C:\work`). A write target whose
+parent did not exist yet was normalised lexically instead (`C:\work\a\b.txt`),
+so `starts_with` never matched and the write was refused as escaping the
+workspace; macOS has the same mismatch through `/tmp` -> `/private/tmp`.
+`realpath_for_write` now canonicalizes the deepest existing ancestor and folds
+`.`/`..` in the components re-attached after it (they do not exist, so they
+cannot be symlinks, and a `new/../../x` climb is still seen). Roots go through
+the same function, so a configured root that does not exist yet compares like
+a target. `platform::path_starts_with` ignores case and the verbatim prefix on
+Windows. Folding `..` *before* canonicalizing would be wrong: `link/../x`
+through a symlink lands beside the link's target, not beside the link.
+
+## Landlock for the bash sandbox: what the raw ABI needs
+
+`landlock_path_beneath_attr` is `__attribute__((packed))` (12 bytes); the
+Rust mirror is `#[repr(C, packed)]` to match the header, though the field
+offsets are the same either way since the padding would trail `parent_fd`.
+A rule on a regular file may only grant file
+rights (`WRITE_FILE`, `TRUNCATE`); the directory rights make it `EINVAL`, so
+a `writablePaths` entry naming a file is masked. Rights are handled per ABI
+(`REFER` from 2, `TRUNCATE` from 3): on ABI 1 a rename into another
+directory is always refused, even between two writable roots. A refused write
+reports `EACCES` ("Permission denied"), not Seatbelt's `EPERM`, so the
+`[sandbox blocked: ...]` hint matches on `Sandbox::denial_text()`. The ruleset
+is built in the parent and only `prctl(PR_SET_NO_NEW_PRIVS)` plus
+`landlock_restrict_self` run in `pre_exec`, the two syscalls safe between
+`fork` and `exec` in a multithreaded process. WSL2's 6.x kernel has Landlock
+(ABI 7), so the end-to-end tests run there.

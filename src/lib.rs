@@ -115,6 +115,8 @@ pub mod kvpane;
 /// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
 pub mod kvtier;
 pub mod kvtree;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 pub mod logo;
 pub mod manifest;
 pub mod memextract;
@@ -131,6 +133,7 @@ pub mod notify;
 #[cfg(feature = "use_obscura")]
 pub mod obscura_web;
 pub mod openfile;
+pub mod platform;
 pub mod plugins;
 pub mod prefix;
 pub mod profile;
@@ -158,6 +161,10 @@ pub mod spill;
 pub mod stats;
 pub mod status;
 pub mod statusbar;
+#[cfg(unix)]
+pub mod stderrline;
+#[cfg(windows)]
+#[path = "stderrline_windows.rs"]
 pub mod stderrline;
 pub mod steervec;
 pub mod suggest;

@@ -30,11 +30,11 @@ pub enum LockProbe {
 /// [`LockProbe::Free`], having released any lock it briefly took. An inability
 /// to open/probe the path is reported as `Free` (the engine's own guard still
 /// backstops it).
-#[cfg(unix)]
+///
+/// `File::try_lock` is `flock(LOCK_EX | LOCK_NB)` on Unix, the lock the ds4
+/// engine takes, and `LockFileEx` on Windows.
 #[must_use]
 pub fn probe_lock(path: &Path) -> LockProbe {
-    use std::os::unix::io::AsRawFd;
-
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -44,21 +44,12 @@ pub fn probe_lock(path: &Path) -> LockProbe {
     else {
         return LockProbe::Free;
     };
-    // SAFETY: `file` owns a valid fd; LOCK_NB makes flock non-blocking.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+    if matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
         return LockProbe::Contended;
     }
     // Release whatever we took so the engine can lock it itself; dropping the
     // File closes the fd and drops the flock.
     drop(file);
-    LockProbe::Free
-}
-
-/// Non-unix fallback: no advisory locking, so never reports contention.
-#[cfg(not(unix))]
-#[must_use]
-pub fn probe_lock(_path: &Path) -> LockProbe {
     LockProbe::Free
 }
 

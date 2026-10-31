@@ -50,11 +50,11 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::platform::CommandExt as _;
 use crate::tools::mcp::{Json, json_escape, json_parse};
 
 /// Default hook timeout, in seconds.
@@ -512,7 +512,7 @@ pub fn lifecycle_event_input(event: &str, fields: &[(&str, &str)], cwd: &Path) -
 /// stderr). A timeout or spawn failure reads as a user-visible warning (on
 /// stderr), never a block.
 fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
-    let child = Command::new("/bin/sh")
+    let child = crate::platform::shell_command()
         .arg("-c")
         .arg(&def.command)
         .current_dir(cwd)
@@ -521,8 +521,7 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
         .stderr(Stdio::piped())
         // Own process group: the timeout must take down `sleep 600; echo ok`
         // whole, not just the shell that forked the sleep.
-        .process_group(0)
-        .spawn();
+        .spawn_tree();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (1, String::new(), format!("hook failed to start: {e}")),

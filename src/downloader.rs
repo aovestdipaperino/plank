@@ -109,13 +109,7 @@ pub fn now_epoch() -> u64 {
 /// is emphatically not the question being asked, so it is refused up front.
 #[must_use]
 pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let pid = libc::pid_t::try_from(pid).unwrap_or(-1);
-    // SAFETY: signal 0 delivers nothing; this is a pure existence probe.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    crate::platform::pid_alive(pid)
 }
 
 /// `<root>/downloads/state.json`.
@@ -1404,7 +1398,7 @@ fn worker(sh: &Shared<'_>) -> Result<Option<Cancel>, String> {
 /// or a broken body up to `CHUNK_RETRY_ATTEMPTS` times. A retry asks only for
 /// the bytes this chunk still lacks, so nothing is written twice.
 fn fetch_chunk(sh: &Shared<'_>, c: u64) -> Result<ChunkEnd, String> {
-    use std::os::unix::fs::FileExt as _;
+    use crate::platform::FileExt as _;
     use std::sync::atomic::Ordering::SeqCst;
     let (root, kind, entry) = (sh.at.root, sh.at.kind, sh.at.entry);
     let start = c * RANGE_CHUNK;
@@ -1678,11 +1672,9 @@ pub fn running() -> bool {
 /// Takes the same machine-wide `flock` [`running_in`] probes and holds it
 /// until the returned guard drops, for tests that need to simulate a live
 /// helper. `None` if the lock is already held or could not be opened.
-#[cfg(all(unix, test))]
+#[cfg(test)]
 #[must_use]
 pub fn try_lock_in(root: &Path) -> Option<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
-
     let path = lock_path_in(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
@@ -1694,11 +1686,8 @@ pub fn try_lock_in(root: &Path) -> Option<std::fs::File> {
         .truncate(false)
         .open(&path)
         .ok()?;
-    // SAFETY: `file` owns a valid fd; LOCK_NB makes this non-blocking.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return None;
-    }
+    // `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx` on Windows.
+    file.try_lock().ok()?;
     Some(file)
 }
 
@@ -1786,9 +1775,15 @@ fn detach(cmd: &mut std::process::Command) {
     };
 }
 
-/// No session concept to detach from; the caller's fallback path applies.
-#[cfg(not(unix))]
-fn detach(_cmd: &mut std::process::Command) {}
+/// Detaches the child from this console and from its Ctrl-C group, so it
+/// survives the terminal closing (the Windows counterpart of `setsid`).
+#[cfg(windows)]
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
 
 /// The `plank --model-downloader` entry point. Returns a process exit code.
 ///
@@ -1809,15 +1804,10 @@ pub fn run_helper(set: crate::manifest::EngineId) -> i32 {
     else {
         return 1;
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd as _;
-        // SAFETY: `lock` owns a valid fd; LOCK_NB makes this non-blocking.
-        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            // Another helper owns the download. Not an error worth reporting.
-            return 0;
-        }
+    // `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx` on Windows.
+    if lock.try_lock().is_err() {
+        // Another helper owns the download. Not an error worth reporting.
+        return 0;
     }
     let Some(manifest) = read_job_in(&root, set) else {
         log_line("no job recorded; nothing to download");
@@ -4009,8 +3999,8 @@ pub(crate) mod tests {
     /// Pre-writes `chunks` of `full` at their offsets into the `.part` (leaving
     /// holes for the rest) and lists them in the `.chunks` sidecar.
     fn prewrite_chunks(root: &Path, full: &[u8], chunks: &[u64]) {
+        use crate::platform::FileExt as _;
         use std::fmt::Write as _;
-        use std::os::unix::fs::FileExt as _;
         let part = part_path_in(root, crate::manifest::EngineId::DS4VISION, "main");
         std::fs::create_dir_all(part.parent().expect("parent")).expect("staging dir");
         let f = File::create(&part).expect("part");
