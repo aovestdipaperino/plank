@@ -380,11 +380,9 @@ impl Sandbox {
         }
         // Resolve symlinks where possible: Seatbelt matches the real path,
         // and macOS cwds are often under the /tmp -> /private/tmp or
-        // /var -> /private/var symlinks.
-        roots
-            .into_iter()
-            .map(|root| root.canonicalize().unwrap_or(root))
-            .collect()
+        // /var -> /private/var symlinks. A root that does not exist yet
+        // resolves as a write target does, so the two stay comparable.
+        roots.iter().map(|root| realpath_for_write(root)).collect()
     }
 
     /// True when a file tool may write `target` (already resolved against
@@ -399,7 +397,9 @@ impl Sandbox {
             return true;
         }
         let real = realpath_for_write(target);
-        self.write_roots(cwd).iter().any(|r| real.starts_with(r))
+        self.write_roots(cwd)
+            .iter()
+            .any(|r| crate::platform::path_starts_with(&real, r))
     }
 }
 
@@ -434,21 +434,28 @@ fn worktree_git_roots(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The real location a write to `target` would land at. An existing target
-/// canonicalizes directly; a file about to be created canonicalizes its
-/// parent and re-attaches the file name; when even the parent is missing the
-/// path is normalised lexically (`.` and `..` folded) so a `..` escape is still
-/// visible to the containment check.
+/// The real location a write to `target` would land at: its deepest existing
+/// ancestor canonicalized, with the components that do not exist yet
+/// re-attached and their `.` and `..` folded. Those components cannot be
+/// symlinks, so folding them lexically is exact, and a `..` escape out of a
+/// directory about to be created is still visible to the containment check.
+/// [`Sandbox::write_roots`] resolves its roots the same way, so both sides of
+/// the containment check carry the `\\?\` prefix `canonicalize` adds on
+/// Windows, or neither does.
 fn realpath_for_write(target: &Path) -> PathBuf {
-    if let Ok(real) = target.canonicalize() {
-        return real;
+    let mut base = target;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(real) = base.canonicalize() {
+            return lexical_normalize(&missing.iter().rev().fold(real, |p, name| p.join(name)));
+        }
+        // Not `file_name`, which is `None` for a trailing `..`.
+        let (Some(parent), Some(last)) = (base.parent(), base.components().next_back()) else {
+            return lexical_normalize(target);
+        };
+        missing.push(last.as_os_str());
+        base = parent;
     }
-    if let (Some(parent), Some(name)) = (target.parent(), target.file_name())
-        && let Ok(real_parent) = parent.canonicalize()
-    {
-        return real_parent.join(name);
-    }
-    lexical_normalize(target)
 }
 
 /// Folds `.` and `..` components without touching the filesystem.
@@ -819,6 +826,10 @@ mod tests {
         assert!(!sb.should_sandbox("  git push  "));
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn profile_contains_cwd_and_escapes() {
         let sb = Sandbox {
@@ -839,6 +850,7 @@ mod tests {
     const FAKE_HOME: &str = "/nonexistent/home";
     const FAKE_PLANK_HOME: &str = "/nonexistent/home/.plank";
 
+    #[cfg(unix)]
     fn test_sandbox() -> Sandbox {
         Sandbox {
             enabled: true,
@@ -848,6 +860,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn profile_for(sb: &Sandbox, granted: &[Protected]) -> String {
         sb.profile_at(
             Path::new("/nonexistent/work"),
@@ -857,6 +870,10 @@ mod tests {
         )
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn protected_roots_are_not_writable_until_granted() {
         let mut sb = test_sandbox();
@@ -894,6 +911,10 @@ mod tests {
     /// writes `~/.cargo/registry`, which must be allowed, while
     /// `cargo install` writes `~/.cargo/bin`, which must not — so the grant
     /// cannot simply name `~/.cargo`.
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn toolchain_caches_are_writable_but_path_bins_are_not() {
         let sb = test_sandbox();
@@ -958,6 +979,10 @@ mod tests {
         ));
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn path_bin_mentions_include_cargo_install() {
         let m = |cmd: &str| {
@@ -1077,6 +1102,42 @@ mod tests {
             ..sb.clone()
         };
         assert!(off.contains_write_target(cwd, Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn write_containment_resolves_new_directories_against_a_real_cwd() {
+        let base = std::env::temp_dir().join(format!("plank-contain-{}", std::process::id()));
+        let cwd = base.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sb = Sandbox {
+            enabled: true,
+            writable_paths: vec![base.join("later")],
+            excluded_commands: Vec::new(),
+            granted: BTreeSet::new(),
+        };
+        let real_cwd = cwd.canonicalize().unwrap();
+        // `real_cwd` carries the `\\?\` prefix on Windows; a target several
+        // directories below it that do not exist yet must still match.
+        assert!(sb.contains_write_target(&cwd, &cwd.join("a/b/c.txt")));
+        assert!(sb.contains_write_target(&real_cwd, &cwd.join("a/b/c.txt")));
+        assert!(sb.contains_write_target(&cwd, &real_cwd.join("a/b/c.txt")));
+        // `..` out of a directory about to be created climbs out of cwd (the
+        // temp dir around it is itself a root, so this asserts the resolved
+        // location rather than the verdict).
+        let climb = cwd.join("new").join("..").join("..").join("outside.txt");
+        assert_eq!(
+            realpath_for_write(&climb),
+            base.canonicalize().unwrap().join("outside.txt")
+        );
+        assert!(sb.contains_write_target(&cwd, &cwd.join("new/../kept.txt")));
+        // A configured root that does not exist yet still admits its files.
+        assert!(sb.contains_write_target(&cwd, &base.join("later/x/y")));
+        #[cfg(windows)]
+        {
+            let upper = PathBuf::from(cwd.to_string_lossy().to_uppercase()).join("f.txt");
+            assert!(sb.contains_write_target(&cwd, &upper));
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

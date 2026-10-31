@@ -521,8 +521,7 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
         .stderr(Stdio::piped())
         // Own process group: the timeout must take down `sleep 600; echo ok`
         // whole, not just the shell that forked the sleep.
-        .own_process_group()
-        .spawn();
+        .spawn_tree();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (1, String::new(), format!("hook failed to start: {e}")),

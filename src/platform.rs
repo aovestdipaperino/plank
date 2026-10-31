@@ -412,6 +412,85 @@ pub fn link_file(target: &str, link: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Makes `link` name the directory `target` (an absolute path).
+///
+/// Unix: a symlink, as always. Windows: a directory symlink when the account
+/// may create one (Developer Mode or elevation), else a junction, which needs
+/// no privilege and works for any local directory.
+///
+/// # Errors
+/// The OS error from the last attempt.
+pub fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).or_else(|_| junction(target, link))
+    }
+}
+
+/// `mklink /J`: `cmd` is the only stock tool that makes a junction. Windows
+/// paths cannot contain `"`, so quoting both is enough for `cmd` to take them
+/// whole. The verbatim prefix is dropped first, since `cmd` built-ins do not
+/// reliably accept it.
+#[cfg(windows)]
+fn junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+    let status = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/D /C mklink /J \"{}\" \"{}\"",
+            simplified(link),
+            simplified(target)
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "mklink /J failed for {}",
+            link.display()
+        )))
+    }
+}
+
+/// Whether `path` lies under `root` (or is it), compared component-wise.
+///
+/// Windows: case-insensitive, as NTFS is, and blind to the `\\?\` prefix
+/// `canonicalize` adds, so a canonical path and a configured one compare
+/// equal. Unix: `Path::starts_with`.
+#[must_use]
+pub fn path_starts_with(path: &Path, root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        path.starts_with(root)
+    }
+    #[cfg(windows)]
+    {
+        let fold = |p: &Path| std::path::PathBuf::from(simplified(p).to_lowercase());
+        fold(path).starts_with(fold(root))
+    }
+}
+
+/// `p` without the verbatim prefix `canonicalize` adds on Windows:
+/// `\\?\C:\x` becomes `C:\x` and `\\?\UNC\host\share` becomes
+/// `\\host\share`. Other paths come back unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn simplified(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// A C-runtime file descriptor: `RawFd` on Unix, a CRT fd on Windows (both
 /// `c_int`).
 pub type Fd = libc::c_int;
@@ -540,24 +619,125 @@ fn shell_path() -> std::path::PathBuf {
         .clone()
 }
 
-/// Puts a child in a process group of its own, so the terminal's Ctrl-C
-/// reaches plank alone and [`kill_tree`] can end every descendant.
+/// Spawns children that own their whole process tree, so the terminal's
+/// Ctrl-C reaches plank alone and [`kill_tree`] can end every descendant.
 pub trait CommandExt {
-    /// `process_group(0)` on Unix, `CREATE_NEW_PROCESS_GROUP` on Windows.
-    fn own_process_group(&mut self) -> &mut Self;
+    /// Spawns the command as the root of a tree of its own.
+    ///
+    /// Unix: `process_group(0)`, so the child leads a group that
+    /// `kill(-pgid, ...)` reaches whole. Windows: `CREATE_NEW_PROCESS_GROUP`
+    /// plus a Job Object the child is assigned to straight after the spawn,
+    /// which every process it starts then inherits.
+    ///
+    /// # Errors
+    /// The spawn error. On Windows a missing POSIX shell (see
+    /// [`shell_command`]) is reported as such rather than as a bare
+    /// "program not found".
+    fn spawn_tree(&mut self) -> std::io::Result<std::process::Child>;
 }
 
 impl CommandExt for std::process::Command {
-    fn own_process_group(&mut self) -> &mut Self {
+    fn spawn_tree(&mut self) -> std::io::Result<std::process::Child> {
         #[cfg(unix)]
         {
-            std::os::unix::process::CommandExt::process_group(self, 0)
+            std::os::unix::process::CommandExt::process_group(self, 0).spawn()
         }
         #[cfg(windows)]
         {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            std::os::windows::process::CommandExt::creation_flags(self, CREATE_NEW_PROCESS_GROUP)
+            std::os::windows::process::CommandExt::creation_flags(self, CREATE_NEW_PROCESS_GROUP);
+            let child = self
+                .spawn()
+                .map_err(|e| explain_spawn_error(self.get_program(), e))?;
+            jobs::adopt(&child);
+            Ok(child)
         }
+    }
+}
+
+/// What the user is told when [`shell_command`] found no POSIX shell.
+#[cfg_attr(not(windows), allow(dead_code))]
+const NO_SHELL: &str = "no POSIX shell found: install Git for Windows, or set PLANK_SHELL \
+                        to the path of an sh.exe or bash.exe";
+
+/// Rewrites a "not found" spawn of the fallback `sh` into [`NO_SHELL`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn explain_spawn_error(program: &std::ffi::OsStr, e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::NotFound && program == "sh" {
+        std::io::Error::new(std::io::ErrorKind::NotFound, NO_SHELL)
+    } else {
+        e
+    }
+}
+
+/// The Job Objects that hold each spawned tree on Windows, keyed by the root's
+/// pid.
+///
+/// A child is assigned to its job right after `CreateProcess` returns; the
+/// shell has not started anything in those microseconds, in practice. A child
+/// without a job (the assignment failed) falls back to `taskkill /T`, which
+/// follows parent pids instead and so misses orphans. Jobs are not
+/// `KILL_ON_JOB_CLOSE`: as with a Unix process group, a tree the root left
+/// running in the background outlives it unless it is killed.
+#[cfg(windows)]
+mod jobs {
+    use std::collections::HashMap;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
+    use std::sync::{Mutex, PoisonError};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+    };
+
+    pub(super) static JOBS: Mutex<Option<HashMap<u32, OwnedHandle>>> = Mutex::new(None);
+
+    /// Puts `child` in a new job. A failure (plank's own job forbids
+    /// breakaway on an old Windows) leaves the child to `taskkill`.
+    pub(super) fn adopt(child: &std::process::Child) {
+        // SAFETY: both arguments may be null (default security, no name).
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return;
+        }
+        // SAFETY: `raw` is a fresh handle this function now owns.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        // SAFETY: both handles are live: `job` above, the child's from `std`.
+        let ok = unsafe { AssignProcessToJobObject(raw, child.as_raw_handle()) };
+        if ok == 0 {
+            return;
+        }
+        let mut guard = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+        let map = guard.get_or_insert_with(HashMap::new);
+        // Trees that have ended need no handle; a reused pid replaces its
+        // predecessor's entry here too.
+        map.retain(|_, job| active_processes(job) > 0);
+        map.insert(child.id(), job);
+    }
+
+    /// Terminates the job rooted at `pid`; `false` when there is none.
+    pub(super) fn terminate(pid: u32) -> bool {
+        let job = JOBS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .and_then(|m| m.remove(&pid));
+        // SAFETY: the handle is live for the duration of the call.
+        job.is_some_and(|job| unsafe { TerminateJobObject(job.as_raw_handle(), 1) } != 0)
+    }
+
+    pub(super) fn active_processes(job: &OwnedHandle) -> u32 {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `info` is a correctly sized, writable buffer for this class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                u32::try_from(size_of_val(&info)).unwrap_or(0),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { 0 } else { info.ActiveProcesses }
     }
 }
 
@@ -611,10 +791,15 @@ pub fn wait_readable(pipe: &std::process::ChildStdout, timeout: std::time::Durat
     }
 }
 
-/// Windows: forcibly ends the process tree rooted at `pid` (`taskkill /T /F`).
-/// There is no SIGTERM to offer first; console tools get no grace period.
+/// Windows: forcibly ends the process tree rooted at `pid`, a child started
+/// by [`CommandExt::spawn_tree`]: its Job Object, or `taskkill /T /F` when it
+/// has none. There is no SIGTERM to offer first; console tools get no grace
+/// period.
 #[cfg(windows)]
 pub fn kill_tree(pid: u32) {
+    if jobs::terminate(pid) {
+        return;
+    }
     let _ = std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -671,6 +856,86 @@ mod tests {
         };
         assert_eq!(lt.date(), "2026-03-04");
         assert_eq!(lt.date_time(), "2026-03-04 05:06:07");
+    }
+
+    #[test]
+    fn simplified_drops_only_the_verbatim_prefix() {
+        assert_eq!(simplified(Path::new(r"\\?\C:\x\y")), r"C:\x\y");
+        assert_eq!(
+            simplified(Path::new(r"\\?\UNC\host\share\f")),
+            r"\\host\share\f"
+        );
+        assert_eq!(simplified(Path::new(r"C:\x")), r"C:\x");
+        assert_eq!(simplified(Path::new("/tmp/x")), "/tmp/x");
+    }
+
+    #[test]
+    fn path_starts_with_is_component_wise() {
+        assert!(path_starts_with(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(path_starts_with(Path::new("/a/b"), Path::new("/a/b")));
+        assert!(!path_starts_with(Path::new("/a/bc"), Path::new("/a/b")));
+        #[cfg(windows)]
+        {
+            assert!(path_starts_with(
+                Path::new(r"\\?\C:\Work\Repo\f.rs"),
+                Path::new(r"c:\work\repo")
+            ));
+            assert!(!path_starts_with(
+                Path::new(r"\\?\C:\Work\Repository"),
+                Path::new(r"c:\work\repo")
+            ));
+        }
+    }
+
+    #[test]
+    fn a_missing_fallback_shell_is_named() {
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let e = explain_spawn_error(std::ffi::OsStr::new("sh"), missing());
+        assert!(e.to_string().contains("PLANK_SHELL"), "{e}");
+        let other = explain_spawn_error(std::ffi::OsStr::new("node"), missing());
+        assert!(!other.to_string().contains("PLANK_SHELL"));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let e = explain_spawn_error(std::ffi::OsStr::new("sh"), denied);
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn link_dir_reads_through_to_the_target() {
+        let base = std::env::temp_dir().join(format!("plank-linkdir-{}", std::process::id()));
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), "hi").unwrap();
+        let link = base.join("link");
+        link_dir(&target.canonicalize().unwrap(), &link).unwrap();
+        assert_eq!(std::fs::read_to_string(link.join("f.txt")).unwrap(), "hi");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The job holds the grandchild too: terminating it ends `ping`, which
+    /// `cmd` is waiting on, and with it `cmd`.
+    #[cfg(windows)]
+    #[test]
+    fn kill_tree_ends_a_spawned_tree_through_its_job() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .stdin(std::process::Stdio::null())
+            .spawn_tree()
+            .expect("spawn cmd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let active = || {
+            jobs::JOBS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&child.id()).map(jobs::active_processes))
+                .unwrap_or(0)
+        };
+        while active() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(active() >= 2, "ping never joined the job");
+        kill_tree(child.id());
+        assert!(child.wait().is_ok());
     }
 
     #[test]
