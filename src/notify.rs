@@ -1,15 +1,16 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Native macOS desktop notifications fired at turn lifecycle points.
+//! Native desktop notifications fired at turn lifecycle points.
 //!
 //! Best-effort and non-blocking: a failed or slow notification must never
-//! affect a turn, so delivery runs on a detached thread. Delivery is the
-//! `notify-rust` crate (an embedded `NSUserNotification` helper — no external
-//! binary, no subprocess); off macOS `notify` is a no-op. The enable flag is a
-//! module-level atomic seeded from `settings.ui.notifications` at startup and
-//! flipped by the `/notify` command (session-only; the persisted default lives
-//! in settings).
+//! affect a turn, so delivery runs on a detached thread. On macOS delivery is
+//! the `notify-rust` crate (an embedded `NSUserNotification` helper — no
+//! external binary, no subprocess); on Linux it is `notify-send`, and on
+//! Windows a PowerShell toast (`crate::platform::desktop::notify`). The enable
+//! flag is a module-level atomic seeded from `settings.ui.notifications` at
+//! startup and flipped by the `/notify` command (session-only; the persisted
+//! default lives in settings).
 //!
 //! ## Icon
 //! A bare CLI has no app bundle, so macOS would otherwise stamp the banner with
@@ -274,7 +275,14 @@ fn deliver_raw(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) 
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (summary, subtitle, body, sticky);
+        // `notify-send` on Linux, a PowerShell toast on Windows; detached for
+        // the same reason as above.
+        let summary = summary.to_string();
+        let subtitle = subtitle.map(str::to_string);
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            crate::platform::desktop::notify(&summary, subtitle.as_deref(), &body, sticky);
+        });
     }
 }
 

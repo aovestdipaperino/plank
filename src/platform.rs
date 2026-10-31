@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+pub mod desktop;
+
 /// Positional file I/O: `read_exact_at` / `write_all_at`.
 ///
 /// On Unix this is std's own `FileExt` (`pread`/`pwrite`). On Windows it is
@@ -253,6 +255,43 @@ pub fn physical_memory() -> Option<u64> {
         // SAFETY: `st` is a valid, initialized out-parameter.
         (unsafe { GlobalMemoryStatusEx(&raw mut st) } != 0).then_some(st.ullTotalPhys)
     }
+}
+
+/// Bytes of RAM available to start new work without swapping, or `None` where
+/// the OS has no such figure plank reads (macOS reports pressure levels
+/// instead, through `crate::mempressure`).
+///
+/// Linux: `MemAvailable` from `/proc/meminfo`, the kernel's own estimate,
+/// which counts reclaimable page cache (the mapped GGUF weights among it).
+/// Windows: `ullAvailPhys`.
+#[must_use]
+pub fn available_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: MEMORYSTATUSEX is plain-old-data; dwLength must be set first.
+        let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
+        // SAFETY: `st` is a valid, initialized out-parameter.
+        (unsafe { GlobalMemoryStatusEx(&raw mut st) } != 0).then_some(st.ullAvailPhys)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// The `MemAvailable` line of a `/proc/meminfo` text, in bytes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn meminfo_available(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let kib: u64 = fields.next()?.parse().ok()?;
+    (fields.next() == Some("kB")).then_some(kib.saturating_mul(1024))
 }
 
 /// Free bytes available to this user on the volume holding `dir`.
@@ -587,6 +626,14 @@ pub fn kill_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meminfo_available_reads_the_kib_line() {
+        let text = "MemTotal:       16384000 kB\nMemFree:  100 kB\nMemAvailable:    2048 kB\n";
+        assert_eq!(meminfo_available(text), Some(2048 * 1024));
+        assert_eq!(meminfo_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(meminfo_available("MemAvailable: x kB\n"), None);
+    }
 
     #[test]
     fn civil_round_trips_known_instants() {
