@@ -34,7 +34,7 @@ exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", 
 
 [features]
 default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins", "gemma", "flint"]
-# Image pasting (Cmd-V clipboard images, image file paths). This was off while
+# Image pasting (pasted clipboard images, image file paths). This was off while
 # the model had no way to act on an image-file reference — the attachment named
 # a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
 # (`transcribe_image` reads the cached file), so the gate has outlived its
@@ -82,6 +82,11 @@ gemma = ["dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/gemm
 # `nativeengine`, whose session and sampler are gemma-engine's, so it pulls
 # gemma-engine in too (without the `local-inference-engine` Gemma half).
 flint = ["dep:flint-engine", "flint-engine/candle", "dep:gemma-engine", "gemma-engine/candle", "local-inference-engine/flint"]
+# Gemma on an NVIDIA GPU through candle's CUDA backend (#89 step 5): needs the
+# CUDA toolkit (`nvcc`) to build. With it, a Gemma engine opens on the first
+# CUDA device unless `--cpu` says otherwise. Flint stays on the CPU off macOS:
+# its NVFP4 kernels exist for Metal and the CPU only.
+cuda = ["gemma", "gemma-engine/cuda"]
 # Qwen3.8-Flash-Next support: the `--qwen` flag and its default model paths,
 # the model's own tools prompt and `<tool_call>` dialect, the PLE n-gram
 # sidecar wiring, and the downloader's Qwen artifacts.
@@ -106,7 +111,6 @@ plank-lib = { path = "crates/plank-lib" }
 # cfg. Its Gemma half rides plank's own `gemma` feature.
 local-inference-engine = { path = "crates/local-inference-engine", default-features = false }
 gguf-delta = { path = "crates/gguf-delta", version = "0.1.0" }
-turbo-debug-client = "0.2.1"
 libc = "0.2"
 gemma-engine = { path = "crates/gemma-engine", optional = true }
 flint-engine = { path = "crates/flint-engine", optional = true }
@@ -249,3 +253,26 @@ workspace = true
 # no external binary). `default-features = false` drops the crate's Linux-only
 # zbus/dbus tree; the macOS `image_path` (content image) needs no feature.
 notify-rust = { version = "4.18.0", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# The `--debug` token mirror's console client. 0.2.1 probes the console with
+# `flock` and `std::os::unix`, so it does not build on Windows; there
+# `src/debugmirror.rs` uses a stand-in that reports no console. Move it back
+# to `[dependencies]` once the client uses `File::try_lock_shared`.
+turbo-debug-client = "0.2.1"
+
+[target.'cfg(windows)'.dependencies]
+# Win32 calls behind `src/platform.rs` (RAM, page size, free disk, process
+# liveness, the clipboard-image probe). Already in the lockfile through
+# tokio/mio and friends, so this adds no new code to the tree.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

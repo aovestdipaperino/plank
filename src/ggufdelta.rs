@@ -138,13 +138,7 @@ fn clonefile(_src: &Path, _dst: &Path) -> io::Result<()> {
 }
 
 fn free_bytes(dir: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `st` is a plain struct the call fills in; `c` outlives the call.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
-    (rc == 0).then(|| u64::from(st.f_bavail) * st.f_frsize)
+    crate::platform::free_bytes(dir)
 }
 
 fn sidecar_path(clone: &Path) -> PathBuf {

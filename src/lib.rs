@@ -131,6 +131,7 @@ pub mod notify;
 #[cfg(feature = "use_obscura")]
 pub mod obscura_web;
 pub mod openfile;
+pub mod platform;
 pub mod plugins;
 pub mod prefix;
 pub mod profile;
@@ -158,6 +159,10 @@ pub mod spill;
 pub mod stats;
 pub mod status;
 pub mod statusbar;
+#[cfg(unix)]
+pub mod stderrline;
+#[cfg(windows)]
+#[path = "stderrline_windows.rs"]
 pub mod stderrline;
 pub mod steervec;
 pub mod suggest;

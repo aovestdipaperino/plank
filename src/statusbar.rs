@@ -16,15 +16,9 @@ use crate::status::{self, Status};
 /// Terminal size `(rows, cols)` from `TIOCGWINSZ`, falling back to `(24, 80)`.
 #[must_use]
 pub fn term_size() -> (usize, usize) {
-    // SAFETY: winsize is plain-old-data; zeroed is valid and ioctl overwrites.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: stdout fd is valid and `ws` is a writable winsize buffer.
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) };
-    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-        (ws.ws_row as usize, ws.ws_col as usize)
-    } else {
-        (24, 80)
-    }
+    crate::platform::stdout_size().map_or((24, 80), |(cols, rows)| {
+        (usize::from(rows), usize::from(cols))
+    })
 }
 
 /// A single-line progress indicator rewritten in place.

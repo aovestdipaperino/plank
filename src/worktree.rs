@@ -512,10 +512,7 @@ fn symlink_dirs(root: &Path, worktree: &Path, dirs: &[String]) {
         if let Some(parent) = dst.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        #[cfg(unix)]
-        let _ = std::os::unix::fs::symlink(&src, &dst);
-        #[cfg(not(unix))]
-        let _ = std::os::windows::fs::symlink_dir(&src, &dst);
+        let _ = crate::platform::link_dir(&src, &dst);
     }
 }
 

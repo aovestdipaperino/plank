@@ -12,11 +12,12 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::platform::CommandExt as _;
 
 use crate::dsml::ToolCall;
 use crate::sandbox::Protected;
@@ -140,8 +141,16 @@ fn make_output_file(id: u64) -> Result<(PathBuf, std::fs::File), String> {
 fn status_code(status: std::process::ExitStatus) -> i64 {
     status.code().map_or_else(
         || {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map_or(-1, |sig| 128 + i64::from(sig))
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map_or(-1, |sig| 128 + i64::from(sig))
+            }
+            // Every Windows exit has a code; this branch is never taken there.
+            #[cfg(not(unix))]
+            {
+                -1
+            }
         },
         i64::from,
     )
@@ -160,14 +169,16 @@ fn export_gpu_yield(command: &mut Command) -> Option<PathBuf> {
 }
 
 /// How long a process group gets to exit after SIGTERM before SIGKILL.
+#[cfg(unix)]
 const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Terminates `child` together with every process in its process group and
 /// reaps it.
 ///
-/// Only meaningful for children spawned with `process_group(0)`, which makes
-/// the child the leader of a group of its own (its pgid equals its pid, and
-/// `sandbox-exec` keeps that pid because it execs the shell in place). A plain
+/// Only meaningful for children started by `platform::CommandExt::spawn_tree`,
+/// which on Unix makes the child the leader of a group of its own (its pgid
+/// equals its pid, and `sandbox-exec` keeps that pid because it execs the
+/// shell in place) and on Windows puts it in a Job Object. A plain
 /// `Child::kill` reaches only the shell, orphaning `sleep 9999 & wait` or
 /// `cmd | tee` pipelines, which then outlive plank. SIGTERM goes first so
 /// well-behaved tools can clean up; after [`GROUP_KILL_GRACE`] the group gets
@@ -185,6 +196,21 @@ pub(crate) fn kill_process_group(child: &mut Child) -> Option<std::process::Exit
     if let Ok(Some(status)) = child.try_wait() {
         return Some(status);
     }
+    #[cfg(windows)]
+    {
+        // No process groups to signal: end the whole tree, then reap.
+        crate::platform::kill_tree(child.id());
+        child.wait().ok()
+    }
+    #[cfg(unix)]
+    {
+        signal_group(child)
+    }
+}
+
+/// SIGTERM, a grace period, then SIGKILL to `child`'s process group.
+#[cfg(unix)]
+fn signal_group(child: &mut Child) -> Option<std::process::ExitStatus> {
     #[allow(clippy::cast_possible_wrap)]
     let pgid = child.id() as libc::pid_t;
     if pgid <= 0 {
@@ -534,7 +560,7 @@ impl BashJobs {
             c.arg("-p").arg(sb.profile(ctx_cwd)).arg("/bin/sh");
             c
         } else {
-            Command::new("/bin/sh")
+            crate::platform::shell_command()
         };
         command.arg("-c").arg(cmd).current_dir(ctx_cwd);
         // Tells a GPU-bound tool that plank can unload its model on request:
@@ -546,8 +572,7 @@ impl BashJobs {
             .stderr(Stdio::piped())
             // Own process group: stop/timeout/Drop kill every descendant, and
             // the terminal's Ctrl-C reaches plank alone (see refresh_for).
-            .process_group(0)
-            .spawn()
+            .spawn_tree()
             .map_err(|e| {
                 std::fs::remove_file(&path).ok();
                 format!("failed to fork: {e}")
@@ -1178,7 +1203,7 @@ pub fn run_immediate(
         })
     }
 
-    let mut command = Command::new("/bin/sh");
+    let mut command = crate::platform::shell_command();
     command.arg("-c").arg(cmd).current_dir(cwd);
     // The same promise the bash tool's jobs get: a `!` or `!!` that writes
     // its signal file, or exits 75 with the marker line, gets the model
@@ -1190,8 +1215,7 @@ pub fn run_immediate(
         .stderr(Stdio::piped())
         // Own group so an interrupt kills pipelines and backgrounded
         // grandchildren, not just the shell.
-        .process_group(0)
-        .spawn()
+        .spawn_tree()
         .map_err(|e| format!("failed to start: {e}"))?;
 
     let (tx, rx) = channel::<(Stream, Vec<u8>)>();
@@ -1259,7 +1283,9 @@ pub fn run_immediate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{home_writable, test_call, test_ctx};
+    #[cfg(target_os = "macos")]
+    use crate::tools::home_writable;
+    use crate::tools::{test_call, test_ctx};
 
     #[test]
     fn bash_echo_round_trip() {
@@ -2056,6 +2082,7 @@ mod tests {
 
     /// Extracts the first all-digit line from an observation: the pid a test
     /// command echoed with `$!`.
+    #[cfg(unix)]
     fn echoed_pid(obs: &str) -> libc::pid_t {
         obs.lines()
             .find_map(|l| l.trim().parse::<libc::pid_t>().ok())
@@ -2063,6 +2090,7 @@ mod tests {
     }
 
     /// Waits up to two seconds for `pid` to disappear (kill(pid, 0) fails).
+    #[cfg(unix)]
     fn wait_gone(pid: libc::pid_t) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -2075,6 +2103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stopping_a_job_kills_its_grandchildren() {
         let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
@@ -2106,6 +2135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unpolled_timed_out_job_is_swept_by_the_next_bash_call() {
         let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
@@ -2138,6 +2168,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn interrupting_an_immediate_command_kills_its_grandchildren() {
         // Give the shell a few ticks to echo the pid before interrupting.
         let mut polls = 0;

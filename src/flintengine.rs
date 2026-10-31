@@ -77,9 +77,7 @@ fn exceeds_gpu_buffer(file_len: u64, page: u64, limit: Option<u64>) -> bool {
 
 /// The VM page size, the granularity a mapping is bound to Metal at.
 fn page_size() -> u64 {
-    // SAFETY: sysconf has no preconditions.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(n).ok().filter(|&n| n > 0).unwrap_or(16_384)
+    crate::platform::page_size().unwrap_or(16_384)
 }
 
 /// Gigabytes (2^30 bytes) with one decimal, for the refusal message.
@@ -171,6 +169,7 @@ impl crate::nativeengine::NativeFamily for FlintFamily {
     type Model = Model;
     type Translator = ();
     const LABEL: &'static str = "flint";
+    const SUPPORTS_CUDA: bool = false;
 
     /// Refuses a file larger than the Metal device's `maxBufferLength`
     /// before mapping it: such a file cannot be one no-copy buffer, and the
