@@ -533,8 +533,7 @@ impl McpServer {
                 // with the UI, but it is the only place a server explains its
                 // own death, so a thread drains it into `stderr_tail`.
                 .stderr(Stdio::piped())
-                .own_process_group()
-                .spawn()
+                .spawn_tree()
                 .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
             let stdin = child.stdin.take().ok_or("no stdin pipe")?;
             let stdout = child.stdout.take().ok_or("no stdout pipe")?;

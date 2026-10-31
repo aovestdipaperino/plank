@@ -175,9 +175,10 @@ const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
 /// Terminates `child` together with every process in its process group and
 /// reaps it.
 ///
-/// Only meaningful for children spawned with `process_group(0)`, which makes
-/// the child the leader of a group of its own (its pgid equals its pid, and
-/// `sandbox-exec` keeps that pid because it execs the shell in place). A plain
+/// Only meaningful for children started by `platform::CommandExt::spawn_tree`,
+/// which on Unix makes the child the leader of a group of its own (its pgid
+/// equals its pid, and `sandbox-exec` keeps that pid because it execs the
+/// shell in place) and on Windows puts it in a Job Object. A plain
 /// `Child::kill` reaches only the shell, orphaning `sleep 9999 & wait` or
 /// `cmd | tee` pipelines, which then outlive plank. SIGTERM goes first so
 /// well-behaved tools can clean up; after [`GROUP_KILL_GRACE`] the group gets
@@ -571,8 +572,7 @@ impl BashJobs {
             .stderr(Stdio::piped())
             // Own process group: stop/timeout/Drop kill every descendant, and
             // the terminal's Ctrl-C reaches plank alone (see refresh_for).
-            .own_process_group()
-            .spawn()
+            .spawn_tree()
             .map_err(|e| {
                 std::fs::remove_file(&path).ok();
                 format!("failed to fork: {e}")
@@ -1215,8 +1215,7 @@ pub fn run_immediate(
         .stderr(Stdio::piped())
         // Own group so an interrupt kills pipelines and backgrounded
         // grandchildren, not just the shell.
-        .own_process_group()
-        .spawn()
+        .spawn_tree()
         .map_err(|e| format!("failed to start: {e}"))?;
 
     let (tx, rx) = channel::<(Stream, Vec<u8>)>();
