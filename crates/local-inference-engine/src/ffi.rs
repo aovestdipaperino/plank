@@ -6,18 +6,35 @@
 //! Only the subset plank and its tools need is declared: engine open/close,
 //! chat-template tokenization, session create/sync/sample/eval, and token text
 //! lookup. The declarations always compile; calling them links only when the
-//! `ds4_engine` cfg is set (macOS with the C sources built).
+//! `ds4_engine` cfg is set (macOS or Linux with the C sources built).
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Backend selector, mirroring `ds4_backend`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ds4Backend {
     Metal = 0,
     Cuda = 1,
     Cpu = 2,
+}
+
+/// The backend `libds4core.a` was compiled for (`DS4_BUILT_BACKEND`, set by
+/// the build script), or `None` when the engine was not built. A core built
+/// for one backend cannot open another, so this is the default to ask for.
+#[must_use]
+pub fn built_backend() -> Option<Ds4Backend> {
+    backend_named(option_env!("DS4_BUILT_BACKEND")?)
+}
+
+fn backend_named(name: &str) -> Option<Ds4Backend> {
+    match name {
+        "metal" => Some(Ds4Backend::Metal),
+        "cuda" => Some(Ds4Backend::Cuda),
+        "cpu" => Some(Ds4Backend::Cpu),
+        _ => None,
+    }
 }
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
@@ -707,6 +724,20 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+
+    /// The build script's names map onto the C enum; a build without the
+    /// engine reports none.
+    #[test]
+    fn built_backend_names_the_compiled_core() {
+        assert_eq!(backend_named("metal"), Some(Ds4Backend::Metal));
+        assert_eq!(backend_named("cuda"), Some(Ds4Backend::Cuda));
+        assert_eq!(backend_named("cpu"), Some(Ds4Backend::Cpu));
+        assert_eq!(backend_named("rocm"), None);
+        assert_eq!(
+            built_backend().is_some(),
+            option_env!("DS4_BUILT_BACKEND").is_some()
+        );
+    }
 
     /// Pins every field of [`Ds4EngineOptions`] to the byte offset the C
     /// `ds4_engine_options` puts it at.
