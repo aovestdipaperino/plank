@@ -407,6 +407,10 @@ fn ensure_role_with(
 /// is text-only. Prompting for a download it could not use would be worse than
 /// useless.
 ///
+/// On the CPU `backend` the encoder is dropped as well, since the CPU path has
+/// none, and SSD streaming is never turned on automatically, since the engine
+/// supports it only on a GPU backend.
+///
 /// Speculation is *not* switched off for Qwen. Under the unified `--mtp` it
 /// stays meaningful there — it just runs off the embedded block, which needs
 /// no download and no companion file.
@@ -416,9 +420,11 @@ fn ensure_role_with(
 pub fn ensure_side_artifacts(
     sel: &crate::engines::Selection,
     ctx: i32,
+    backend: crate::ffi::Ds4Backend,
     engine: &mut crate::config::EngineTuning,
 ) -> Result<(), String> {
     let model_path = sel.main.as_path();
+    let cpu = backend == crate::ffi::Ds4Backend::Cpu;
     apply_companions(sel, engine);
     // Qwen takes none of this. The engine refuses to open a Qwen3.8 checkpoint
     // with SSD streaming on ("requires single-host Metal ... SSD streaming ...
@@ -457,13 +463,19 @@ pub fn ensure_side_artifacts(
     // failing to open; decided before the companion resolution below, which it
     // does not depend on. It needs the context size, which is why this function
     // takes one.
-    auto_enable_ssd_streaming(model_path, ctx, engine);
+    if !cpu {
+        auto_enable_ssd_streaming(model_path, ctx, engine);
+    }
     // The streaming decision is final here — nothing below touches it — so
     // this is where the footer's `HD` marker learns about it. Published rather
     // than read off `cfg` by the bar, because the auto-enable lands on the
     // caller's local `EngineTuning` copy and never goes back into `cfg`.
     crate::status::set_ssd_streaming(engine.ssd_streaming);
     match engine.vision_path.clone() {
+        Some(_) if cpu && crate::gguf::supports_vision(model_path) => {
+            eprintln!("note: images are off: the ds4 CPU backend has no vision encoder");
+            engine.vision_path = None;
+        }
         Some(v) if crate::gguf::supports_vision(model_path) => ensure_role(sel, "vision", &v)?,
         _ => engine.vision_path = None,
     }
@@ -622,10 +634,10 @@ fn auto_enable_ssd_streaming(
     );
 }
 
-/// Total physical RAM in bytes, via `sysctl hw.memsize`.
+/// Total physical RAM in bytes: `sysctl hw.memsize` on macOS, else
+/// [`crate::platform::physical_memory`].
 ///
-/// `None` when it cannot be determined, and on every platform that is not
-/// macOS — the only one the ds4 engine builds on.
+/// `None` when it cannot be determined.
 #[must_use]
 pub fn total_ram_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -647,7 +659,7 @@ pub fn total_ram_bytes() -> Option<u64> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        None
+        crate::platform::physical_memory()
     }
 }
 
@@ -3072,9 +3084,8 @@ mod tests {
     /// The machine plank is running on reports a plausible RAM figure.
     #[test]
     fn installed_ram_is_readable_on_this_platform() {
-        if let Some(ram) = total_ram_bytes() {
-            assert!(ram >= GIB, "implausible RAM reading: {ram}");
-        }
+        let ram = total_ram_bytes().expect("every supported OS reports its RAM");
+        assert!(ram >= GIB, "implausible RAM reading: {ram}");
     }
 
     /// V4.1 has no `DSpark` drafter and the engine refuses to open the model at
@@ -3267,7 +3278,7 @@ mod tests {
             mtp: false,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert_eq!(
             e.vision_path, None,
             "never passed to a non-vision checkpoint"
@@ -3299,7 +3310,7 @@ mod tests {
             mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert_eq!(e.vision_path, None, "Gemma opens no vision encoder");
         assert_eq!(e.mtp_path, None, "Gemma opens no draft checkpoint");
         assert!(
@@ -3327,7 +3338,7 @@ mod tests {
             mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert_eq!(e.vision_path, None, "Flint opens no vision encoder");
         assert_eq!(e.mtp_path, None, "Flint opens no draft checkpoint");
         assert!(
@@ -3347,7 +3358,7 @@ mod tests {
             mtp_strict: true,
             ..Default::default()
         };
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert_eq!(e.vision_path, None, "Qwen opens no side artifact");
         // Speculation stays on: under the unified `--mtp` a Qwen run
         // speculates from the block embedded in its own main GGUF, which needs
@@ -3393,7 +3404,7 @@ mod tests {
         };
         let mut e = crate::config::EngineTuning::default();
         assert!(e.mtp, "speculation defaults to on");
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert!(
             !e.mtp,
             "speculation disabled: no mtp companion for this model"
@@ -3420,7 +3431,7 @@ mod tests {
             family: None,
         };
         let mut e = crate::config::EngineTuning::default();
-        assert!(ensure_side_artifacts(&sel, 32768, &mut e).is_ok());
+        assert!(ensure_side_artifacts(&sel, 32768, crate::ffi::Ds4Backend::Metal, &mut e).is_ok());
         assert!(!e.mtp || e.mtp_path.is_some());
     }
 

@@ -57,7 +57,7 @@ fn two_turns_over_an_image_message_do_not_double_free_the_embedding() {
     };
     let mut session = plank::ds4engine::Ds4Session::open(
         &model,
-        plank::ffi::Ds4Backend::Metal,
+        plank::ffi::built_backend().unwrap(),
         8192,
         0,
         100,
@@ -167,7 +167,7 @@ fn a_view_image_tool_result_grounds_its_image() {
     };
     let mut session = plank::ds4engine::Ds4Session::open(
         &model,
-        plank::ffi::Ds4Backend::Metal,
+        plank::ffi::built_backend().unwrap(),
         8192,
         0,
         100,

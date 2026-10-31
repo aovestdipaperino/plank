@@ -1351,6 +1351,25 @@ fn require_min_ram() -> Result<(), String> {
     Ok(())
 }
 
+/// The ds4 backend `--metal`/`--cuda`/`--cpu` ask for, else the one the core
+/// was compiled for (Metal on macOS, the CPU or CUDA on Linux).
+///
+/// # Errors
+/// When the core cannot run the backend asked for ([`plank::ffi::check_backend`]).
+#[cfg(ds4_engine)]
+fn ds4_backend(choice: Option<plank::config::Backend>) -> Result<plank::ffi::Ds4Backend, String> {
+    use plank::config::Backend;
+    use plank::ffi::Ds4Backend;
+    let backend = match choice {
+        Some(Backend::Cuda) => Ds4Backend::Cuda,
+        Some(Backend::Cpu) => Ds4Backend::Cpu,
+        Some(Backend::Metal) => Ds4Backend::Metal,
+        None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
+    };
+    plank::ffi::check_backend(backend)?;
+    Ok(backend)
+}
+
 /// Builds the inference engine: the real ds4 engine on macOS (the engine or
 /// path chosen by `-m`, else `engine.model` in settings.json, else the catalog
 /// `default` engine, downloading a managed engine's files if missing), else
@@ -1547,8 +1566,11 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     }
     #[cfg(ds4_engine)]
     {
-        use plank::{config::Backend, ds4engine::Ds4Engine, ffi::Ds4Backend};
+        use plank::ds4engine::Ds4Engine;
 
+        // A backend the core was not built for is refused before anything
+        // else, downloads included.
+        let backend = ds4_backend(cfg.backend)?;
         // The default quant needs ~82 GB resident; refuse on machines that
         // cannot hold it, before downloading or loading anything.
         require_min_ram()?;
@@ -1584,16 +1606,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         // into `cfg`: only the engine open needs it. A Qwen model skips both side artifacts, since it opens
         // neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
-
-        let backend = match cfg.backend {
-            Some(Backend::Cuda) => Ds4Backend::Cuda,
-            Some(Backend::Cpu) => Ds4Backend::Cpu,
-            Some(Backend::Metal) => Ds4Backend::Metal,
-            // The backend the core was compiled for: Metal on macOS, the CPU
-            // or CUDA on Linux.
-            None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
-        };
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, backend, &mut tuning)?;
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
         let replacer = plank::stderrline::StderrLineReplacer::start();
@@ -1641,8 +1654,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         drop(replacer);
         let (engine, opened_with) = opened?;
         eprintln!(
-            "plank: model ready: {}{}",
+            "plank: model ready: {} ({}){}",
             engine.model_name(),
+            backend.name(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
@@ -1993,10 +2007,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     }
     #[cfg(ds4_engine)]
     {
-        use plank::config::Backend;
         use plank::ds4engine::Ds4Model;
-        use plank::ffi::Ds4Backend;
 
+        let backend = ds4_backend(cfg.backend)?;
         require_min_ram()?;
         acquire_model_lock()?;
         let model_path = cfg.model_path.clone().expect("resolved by parse_config");
@@ -2015,13 +2028,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
-        let backend = match cfg.backend {
-            Some(Backend::Cuda) => Ds4Backend::Cuda,
-            Some(Backend::Cpu) => Ds4Backend::Cpu,
-            Some(Backend::Metal) => Ds4Backend::Metal,
-            None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
-        };
+        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, backend, &mut tuning)?;
         eprintln!("plank: loading shared model {}...", model_path.display());
         let replacer = plank::stderrline::StderrLineReplacer::start();
         let model = Ds4Model::open_shared(
@@ -2036,8 +2043,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         .map_err(|e| e.to_string())?;
         drop(replacer);
         eprintln!(
-            "plank: shared model ready: {}{}",
+            "plank: shared model ready: {} ({}){}",
             model.model_name(),
+            backend.name(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
