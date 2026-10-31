@@ -16,7 +16,7 @@ Plank is a fast-moving agent harness built on the [ds4](https://github.com/aoves
 
 Plank is an interactive coding agent with a Ratatui TUI, a plain terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web). The project website is [plank-agent.dev](https://plank-agent.dev).
 
-> **macOS first.** DeepSeek and Qwen inference uses the original ds4 C engine with the Metal backend, linked via the `refs/ds4` submodule, and needs a Mac. Gemma 4 and Flint run on plank's own Rust engine instead: Metal on a Mac, the CPU elsewhere, with no C to build. Homebrew bottles are macOS only.
+> **macOS first.** DeepSeek and Qwen inference uses the original ds4 C engine with the Metal backend, linked via the `refs/ds4` submodule, and needs a Mac. Gemma 4 and Flint run on plank's own Rust engine instead: Metal on a Mac, the CPU elsewhere (Gemma also on an NVIDIA GPU in a `--features cuda` build), with no C to build. Homebrew bottles are macOS only.
 
 ## Installing
 

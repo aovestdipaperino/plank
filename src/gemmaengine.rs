@@ -69,6 +69,7 @@ impl crate::nativeengine::NativeFamily for GemmaFamily {
     type Model = Model;
     type Translator = ThinkTranslator;
     const LABEL: &'static str = "gemma";
+    const SUPPORTS_CUDA: bool = true;
 
     fn open(path: &Path, device: &Device, cap: usize) -> Result<(Arc<Model>, Self), EngineError> {
         let model = Model::open_with_ctx(path, device, cap).map_err(engine_error)?;
@@ -647,7 +648,7 @@ mod tests {
             return;
         };
         let t = std::time::Instant::now();
-        let mut e = GemmaEngine::open(Path::new(&path), 4096).unwrap();
+        let mut e = GemmaEngine::open(Path::new(&path), 4096, None).unwrap();
         eprintln!(
             "open: {:.2?} on {} ({}, ctx {})",
             t.elapsed(),
@@ -693,7 +694,7 @@ mod tests {
         );
 
         // Thinking on: the thought channel must stream as <think> tags.
-        let mut e = GemmaEngine::open(Path::new(&path), 4096).unwrap();
+        let mut e = GemmaEngine::open(Path::new(&path), 4096, None).unwrap();
         e.set_think_mode(ThinkMode::Medium);
         let o = GenerationOptions {
             n_predict: 512,

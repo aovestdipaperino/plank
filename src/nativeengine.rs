@@ -22,6 +22,7 @@ use gemma_engine::sample::Sampler;
 use gemma_engine::session::Session;
 use gemma_engine::template::{self, Kind};
 
+use crate::config::Backend;
 use crate::ds4tokens::{SectionKey, SpanRole, TokenTranscript, parse_sections};
 use crate::engine::{
     Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, KvReuse, PrefillProgress,
@@ -46,6 +47,9 @@ pub trait NativeFamily: Sized + Send + std::fmt::Debug + 'static {
     type Translator: Default;
     /// Short tag for `PLANK_KV_DEBUG` lines ("gemma", "flint").
     const LABEL: &'static str;
+    /// Whether the family's kernels run on a CUDA device. Flint's NVFP4
+    /// kernels exist for Metal and the CPU only.
+    const SUPPORTS_CUDA: bool;
 
     /// Opens the model at `path` on `device`, with rotary tables for `cap`
     /// positions.
@@ -306,25 +310,85 @@ pub(crate) fn physical_memory() -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Metal when this machine has it, else the CPU.
-fn pick_device() -> (Device, &'static str) {
-    #[cfg(target_os = "macos")]
-    if let Ok(d) = Device::new_metal(0) {
-        return (d, "metal");
+/// The devices to try, in order, for a `--metal`/`--cuda`/`--cpu` choice
+/// (`None`: none given). An explicit choice is the only candidate, so a
+/// missing device is an error rather than a quiet fallback; with none, Metal
+/// (macOS), then CUDA (when built in and the family has the kernels), then
+/// the CPU.
+///
+/// # Errors
+/// `--cuda` for a family without CUDA kernels.
+fn device_order(
+    backend: Option<Backend>,
+    label: &str,
+    supports_cuda: bool,
+) -> Result<Vec<Backend>, String> {
+    Ok(match backend {
+        Some(Backend::Cuda) if !supports_cuda => {
+            return Err(format!(
+                "{label} has no CUDA kernels yet; run it with --cpu (or --metal on macOS)"
+            ));
+        }
+        Some(b) => vec![b],
+        None => {
+            let mut order = Vec::new();
+            if cfg!(target_os = "macos") {
+                order.push(Backend::Metal);
+            }
+            if cfg!(feature = "cuda") && supports_cuda {
+                order.push(Backend::Cuda);
+            }
+            order.push(Backend::Cpu);
+            order
+        }
+    })
+}
+
+/// Opens one device. candle defines `new_metal`/`new_cuda` in every build and
+/// fails them when the backend is not compiled in, so this needs no cfg.
+fn open_device(backend: Backend) -> Result<(Device, &'static str), String> {
+    match backend {
+        Backend::Cpu => Ok((Device::Cpu, "cpu")),
+        Backend::Metal => Device::new_metal(0)
+            .map(|d| (d, "metal"))
+            .map_err(|e| format!("no Metal device: {e}")),
+        Backend::Cuda => Device::new_cuda(0).map(|d| (d, "cuda")).map_err(|e| {
+            if cfg!(feature = "cuda") {
+                format!("no CUDA device: {e}")
+            } else {
+                "this build has no CUDA support; rebuild with --features cuda".to_string()
+            }
+        }),
     }
-    (Device::Cpu, "cpu")
+}
+
+/// The first device of [`device_order`] that opens.
+fn pick_device<F: NativeFamily>(
+    backend: Option<Backend>,
+) -> Result<(Device, &'static str), EngineError> {
+    let order = device_order(backend, F::LABEL, F::SUPPORTS_CUDA).map_err(EngineError::new)?;
+    let mut last = String::new();
+    for b in order {
+        match open_device(b) {
+            Ok(found) => return Ok(found),
+            Err(e) => last = e,
+        }
+    }
+    Err(EngineError::new(last))
 }
 
 impl<F: NativeFamily> NativeEngine<F> {
-    /// Opens the family's GGUF at `path` on Metal (the CPU when there is no
-    /// Metal device) with a `ctx`-token context, clamped to the model's; a
-    /// `ctx` of zero or less means [`default_ctx`]: sized from the RAM.
+    /// Opens the family's GGUF at `path` on the device `backend` names, or
+    /// the best one this machine has ([`device_order`]), with a `ctx`-token
+    /// context, clamped to the model's; a `ctx` of zero or less means
+    /// [`default_ctx`]: sized from the RAM.
     ///
     /// # Errors
-    /// When the file does not load as this family's model, or when the KV for
-    /// `ctx` tokens would take more than half the machine's memory.
-    pub fn open(path: &Path, ctx: i32) -> Result<Self, EngineError> {
-        let (device, name) = pick_device();
+    /// When the requested device is missing, the file does not load as this
+    /// family's model, or the KV for `ctx` tokens would take more than half
+    /// the machine's memory.
+    pub fn open(path: &Path, ctx: i32, backend: Option<Backend>) -> Result<Self, EngineError> {
+        let (device, name) = pick_device::<F>(backend)?;
         Self::open_on(path, ctx, &device, name)
     }
 
@@ -769,5 +833,43 @@ mod tests {
     fn the_default_context_reaches_the_files_window() {
         assert_eq!(default_ctx(128 * GIB, 262_144, 100_352), 262_144);
         assert_eq!(default_ctx(16 * GIB, 262_144, 100_352), 56_320);
+    }
+
+    /// An explicit choice is the only candidate; with none, the GPU this
+    /// build and family can use comes before the CPU.
+    #[test]
+    fn device_order_honours_an_explicit_backend_and_falls_back_otherwise() {
+        assert_eq!(
+            device_order(Some(Backend::Cpu), "gemma", true),
+            Ok(vec![Backend::Cpu])
+        );
+        assert_eq!(
+            device_order(Some(Backend::Cuda), "gemma", true),
+            Ok(vec![Backend::Cuda])
+        );
+        let refused = device_order(Some(Backend::Cuda), "flint", false).unwrap_err();
+        assert!(refused.contains("flint has no CUDA kernels"), "{refused}");
+
+        let auto = device_order(None, "gemma", true).unwrap();
+        assert_eq!(auto.last(), Some(&Backend::Cpu));
+        assert_eq!(auto.contains(&Backend::Metal), cfg!(target_os = "macos"));
+        assert_eq!(auto.contains(&Backend::Cuda), cfg!(feature = "cuda"));
+        // A family without CUDA kernels never tries the CUDA device.
+        let flint = device_order(None, "flint", false).unwrap();
+        assert!(!flint.contains(&Backend::Cuda));
+    }
+
+    /// The CPU always opens; a backend this build lacks names the rebuild.
+    #[test]
+    fn open_device_reports_a_missing_backend() {
+        assert_eq!(open_device(Backend::Cpu).map(|(_, n)| n), Ok("cpu"));
+        if !cfg!(feature = "cuda") {
+            let e = open_device(Backend::Cuda).map(|(_, n)| n).unwrap_err();
+            assert!(e.contains("--features cuda"), "{e}");
+        }
+        if !cfg!(target_os = "macos") {
+            let e = open_device(Backend::Metal).map(|(_, n)| n).unwrap_err();
+            assert!(e.starts_with("no Metal device"), "{e}");
+        }
     }
 }
