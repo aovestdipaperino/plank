@@ -4067,3 +4067,31 @@ with `PLANK_SANDBOX=low-integrity` and `platform::CommandExt::spawn_tree` starts
 it with `CREATE_SUSPENDED`. Since `spawn_tree` sets `creation_flags` itself,
 the suspend flag has to be added there; a flag set by the caller would be
 overwritten.
+
+## The ds4 CPU core: what it refuses, and the RAM figure that was never read
+
+A Linux build without CUDA links a `DS4_NO_GPU` core (`ds4_cpu.o`), and the C
+does not check the backend it is handed against what it was compiled with: the
+CLI's `--metal`/`--cuda` set `e->backend` unconditionally, so a `Metal` or
+`Cuda` open on that core walks into GPU paths compiled out of it. A GPU core
+keeps the CPU path beside its one GPU backend, so the rule is "your own
+backend, or the CPU" (`Ds4Backend::runs_on`), and `ffi::check_backend` refuses
+anything else before `ds4_engine_open`, in plank, the shared host and the
+crate's `Model::open` alike.
+
+Two things a GPU backend takes for granted fail outright on the CPU, both as an
+open failure rather than a degraded run: any `vision_path` ("GLM-5.3 vision
+requires --metal, --cuda, or --rocm", printed for DeepSeek's encoder too), and
+`ssd_streaming` ("supported only with --metal/--cuda/--rocm"). So
+`ensure_side_artifacts` takes the backend and, on the CPU, neither fetches the
+encoder nor auto-enables streaming, and `Ds4Model::open` drops the encoder as
+well for any other caller.
+
+The streaming auto-enable had never fired off macOS for another reason:
+`download::total_ram_bytes` returned `None` everywhere else, which also
+silently passed the 96 GB `require_min_ram` floor and left `enginefit` unable to
+dim the ds4 engines. It now falls back to `platform::physical_memory`.
+
+The `ffi.rs` offset pins were recorded on arm64 macOS; on x86-64 Linux
+`gcc`'s `offsetof` gives the same values (`ds4_engine_options` 280 bytes,
+`tp` at 216, `ds4_vision_embedding` 72, `ds4_vision_span` 80), as LP64 on both.

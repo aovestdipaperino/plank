@@ -39708,7 +39708,7 @@ or the user's next message aborts before its first token"
         };
         let model = crate::ds4engine::Ds4Model::open_shared(
             &model_path,
-            crate::ffi::Ds4Backend::Metal,
+            crate::ffi::built_backend().unwrap(),
             8192,
             0,
             100,

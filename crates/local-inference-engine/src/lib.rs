@@ -137,15 +137,16 @@ pub struct Options {
 }
 
 impl Options {
-    /// Options for the GGUF at `model` on Metal, with a 4096-token context
-    /// and every other setting at the engine's default.
+    /// Options for the GGUF at `model` on the backend the core was built for
+    /// (Metal on macOS), with a 4096-token context and every other setting at
+    /// the engine's default.
     #[must_use]
     pub fn new(model: impl AsRef<Path>) -> Self {
         Self {
             model: model.as_ref().to_path_buf(),
             mtp: None,
             vision: None,
-            backend: Backend::Metal,
+            backend: ffi::built_backend().unwrap_or(Backend::Metal),
             threads: 0,
             ctx_size: 4096,
             prefill_chunk: 0,
@@ -182,7 +183,8 @@ impl Options {
         self
     }
 
-    /// Selects the ds4 engine's compute backend; Metal is the only one built.
+    /// Selects the ds4 engine's compute backend: the one the core was built
+    /// for ([`ffi::built_backend`]), or the CPU.
     #[must_use]
     pub fn backend(mut self, backend: Backend) -> Self {
         self.backend = backend;

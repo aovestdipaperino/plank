@@ -36,8 +36,10 @@ impl Model {
     /// beforehand if that matters.
     ///
     /// # Errors
-    /// Fails when a path holds a NUL byte or the engine refuses the model.
+    /// Fails when the core was not built for `options`' backend, a path holds
+    /// a NUL byte, or the engine refuses the model.
     pub fn open(options: &Options) -> Result<Self, Error> {
+        ffi::check_backend(options.backend).map_err(Error::new)?;
         metal::set_source_env();
         let c_path = |p: &Path, what: &str| {
             CString::new(p.to_string_lossy().as_bytes())

@@ -71,8 +71,12 @@ const BUILT_DIR: Option<&str> = option_env!("DS4_METAL_DIR");
 /// Points every unset `DS4_METAL_<NAME>_SOURCE` at [`source_dir`].
 ///
 /// A variable already set is left alone, so a caller can override any single
-/// kernel. [`crate::Model::open`] calls this itself.
+/// kernel. [`crate::Model::open`] calls this itself. A core built for
+/// another backend compiles no kernels, so nothing is set for it.
 pub fn set_source_env() {
+    if !built_for_metal() {
+        return;
+    }
     let dir = source_dir();
     for &(var, file) in KERNEL_SOURCES {
         if std::env::var_os(var).is_none() {
@@ -115,8 +119,16 @@ pub fn source_dir() -> PathBuf {
 /// [`set_source_env`] points `DS4_METAL_FLASH_ATTN_SOURCE` at them when it can
 /// find them; if the variable is unset or names a path that is gone, the
 /// engine cannot build its kernels and an open fails with nothing on the model
-/// file's own account.
+/// file's own account. Always `false` for a core built for another backend,
+/// which never looks for them.
 #[must_use]
 pub fn kernels_missing() -> bool {
-    std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE").is_none_or(|p| !Path::new(&p).exists())
+    built_for_metal()
+        && std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE").is_none_or(|p| !Path::new(&p).exists())
+}
+
+/// Whether the linked core is the Metal one, the only one that compiles
+/// these kernels.
+fn built_for_metal() -> bool {
+    crate::ffi::built_backend() == Some(crate::ffi::Ds4Backend::Metal)
 }

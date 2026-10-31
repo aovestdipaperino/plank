@@ -67,10 +67,7 @@ fn main() {
         let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
         make.arg(format!("CUDA_ARCH={arch}"));
     }
-    let status = make
-        .args(&objs)
-        .status()
-        .expect("failed to run make");
+    let status = make.args(&objs).status().expect("failed to run make");
     assert!(status.success(), "ds4 engine build failed");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

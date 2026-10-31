@@ -29,12 +29,61 @@ pub fn built_backend() -> Option<Ds4Backend> {
 }
 
 fn backend_named(name: &str) -> Option<Ds4Backend> {
-    match name {
-        "metal" => Some(Ds4Backend::Metal),
-        "cuda" => Some(Ds4Backend::Cuda),
-        "cpu" => Some(Ds4Backend::Cpu),
-        _ => None,
+    [Ds4Backend::Metal, Ds4Backend::Cuda, Ds4Backend::Cpu]
+        .into_iter()
+        .find(|b| b.name() == name)
+}
+
+impl Ds4Backend {
+    /// The lowercase name the build script and the `--metal`/`--cuda`/`--cpu`
+    /// flags use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+            Self::Cpu => "cpu",
+        }
     }
+
+    /// Whether a core compiled for `built` can open this backend. A GPU core
+    /// keeps the CPU path beside its one GPU backend; a CPU core is built
+    /// with `DS4_NO_GPU` and has no GPU code at all.
+    #[must_use]
+    pub fn runs_on(self, built: Self) -> bool {
+        self == built || self == Self::Cpu
+    }
+}
+
+/// Refuses a backend the linked core cannot run, before the C is asked to:
+/// a CPU core handed `Metal` or `Cuda` would walk into GPU paths it was
+/// compiled without.
+///
+/// # Errors
+/// Names the backend asked for and the one the core was built for.
+pub fn check_backend(wanted: Ds4Backend) -> Result<(), String> {
+    match built_backend() {
+        Some(built) => backend_refusal(wanted, built).map_or(Ok(()), Err),
+        None => Ok(()),
+    }
+}
+
+fn backend_refusal(wanted: Ds4Backend, built: Ds4Backend) -> Option<String> {
+    if wanted.runs_on(built) {
+        return None;
+    }
+    let hint = match wanted {
+        Ds4Backend::Cuda => {
+            "; rebuild with PLANK_DS4_BACKEND=cuda on a machine with the CUDA toolkit"
+        }
+        Ds4Backend::Metal => "; Metal is built only on macOS",
+        Ds4Backend::Cpu => "",
+    };
+    Some(format!(
+        "--{} is not available: the ds4 engine was built for {}{hint}",
+        wanted.name(),
+        built.name()
+    ))
 }
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
@@ -737,6 +786,25 @@ mod tests {
             built_backend().is_some(),
             option_env!("DS4_BUILT_BACKEND").is_some()
         );
+    }
+
+    /// A GPU core also runs on the CPU; a CPU core runs nothing else, and no
+    /// core runs another GPU backend.
+    #[test]
+    fn a_core_runs_its_own_backend_and_the_cpu() {
+        use Ds4Backend::{Cpu, Cuda, Metal};
+        assert!(Metal.runs_on(Metal) && Cpu.runs_on(Metal));
+        assert!(Cuda.runs_on(Cuda) && Cpu.runs_on(Cuda));
+        assert!(Cpu.runs_on(Cpu));
+        assert!(!Cuda.runs_on(Metal) && !Metal.runs_on(Cuda));
+        assert!(!Metal.runs_on(Cpu) && !Cuda.runs_on(Cpu));
+        assert_eq!(backend_refusal(Cpu, Cuda), None);
+        let msg = backend_refusal(Cuda, Cpu).unwrap();
+        assert!(
+            msg.starts_with("--cuda is not available: the ds4 engine was built for cpu"),
+            "{msg}"
+        );
+        assert!(msg.contains("PLANK_DS4_BACKEND=cuda"), "{msg}");
     }
 
     /// Pins every field of [`Ds4EngineOptions`] to the byte offset the C
