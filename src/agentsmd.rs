@@ -54,7 +54,7 @@ pub fn prepare(dir: &Path) -> Result<Startup, String> {
             Startup::Missing
         });
     }
-    std::os::unix::fs::symlink("CLAUDE.md", &agents)
+    crate::platform::link_file("CLAUDE.md", &agents)
         .map_err(|e| format!("cannot link AGENTS.md to CLAUDE.md: {e}"))?;
     Ok(Startup::Linked(agents))
 }
@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dangling_agents_md_link_counts_as_present() {
         let dir = scratch("dangling");
         std::os::unix::fs::symlink("gone.md", dir.join("AGENTS.md")).unwrap();

@@ -564,7 +564,6 @@ pub fn restart_args_for(
 /// marks close-on-exec, so the new image can take it.
 #[must_use]
 pub fn exec_restart(restart: &Restart) -> String {
-    use std::os::unix::process::CommandExt as _;
     let Some(launch) = LAUNCH.get() else {
         return "the launch arguments were not recorded".to_owned();
     };
@@ -584,10 +583,26 @@ pub fn exec_restart(restart: &Restart) -> String {
     if let Some(switch) = &restart.steering {
         args = switch_steering(&args, switch);
     }
-    std::process::Command::new(exe)
-        .args(args)
-        .exec()
-        .to_string()
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    replace_process(&mut cmd)
+}
+
+/// Replaces this process with `cmd`, returning only the error on failure.
+#[cfg(unix)]
+fn replace_process(cmd: &mut std::process::Command) -> String {
+    use std::os::unix::process::CommandExt as _;
+    cmd.exec().to_string()
+}
+
+/// Windows has no `exec`: run `cmd` on the same console and leave with its
+/// exit code, which looks the same from the shell that started plank.
+#[cfg(windows)]
+fn replace_process(cmd: &mut std::process::Command) -> String {
+    match cmd.status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) => e.to_string(),
+    }
 }
 
 #[cfg(test)]

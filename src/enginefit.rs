@@ -373,21 +373,8 @@ fn fit_of(
 /// nearest existing ancestor (a fresh machine has no `~/.plank` yet).
 #[must_use]
 pub fn free_bytes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt as _;
     let dir = path.ancestors().find(|p| p.exists())?;
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `c` is a NUL-terminated path and `st` a valid out-parameter of
-    // the right type; it is read only when the call reports success.
-    let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: statvfs returned 0, so it filled `st`.
-    let st = unsafe { st.assume_init() };
-    #[allow(clippy::useless_conversion)]
-    let (avail, frsize) = (u64::from(st.f_bavail), u64::from(st.f_frsize));
-    Some(avail.saturating_mul(frsize))
+    crate::platform::free_bytes(dir)
 }
 #[cfg(test)]
 mod tests {

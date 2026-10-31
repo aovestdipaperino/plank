@@ -1052,6 +1052,7 @@ fn migrate_engine_layout_unconditionally() {
 }
 
 fn main() -> ExitCode {
+    plank::platform::ensure_home();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Before anything can move the process: `/edit-profile`'s restart re-runs
     // these arguments from this directory.

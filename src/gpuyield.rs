@@ -58,6 +58,7 @@ pub fn signal_path() -> Option<PathBuf> {
 
 /// Creates (or checks) the per-user signal directory under `base`: a real
 /// directory, owned by this user, mode 0700.
+#[cfg(unix)]
 fn signal_dir(base: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
     // SAFETY: getuid(2) has no preconditions and cannot fail.
@@ -76,6 +77,22 @@ fn signal_dir(base: &Path) -> Option<PathBuf> {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
     Some(dir)
+}
+
+/// Windows: the temp directory is already the user's own
+/// (`%LOCALAPPDATA%\Temp`, not shared between accounts), so the only check
+/// left is that the entry is a real directory rather than a link planted in
+/// its place.
+#[cfg(windows)]
+fn signal_dir(base: &Path) -> Option<PathBuf> {
+    let dir = base.join("plank-gpu-yield");
+    match std::fs::create_dir(&dir) {
+        Ok(()) => return Some(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    (meta.is_dir() && !meta.file_type().is_symlink()).then_some(dir)
 }
 
 /// Reads a run's signal file and deletes it, whatever it held. Returns the
@@ -578,6 +595,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn each_signal_path_is_fresh_in_a_private_directory_and_not_created() {
         use std::os::unix::fs::PermissionsExt as _;
         let a = signal_path().expect("a path");
@@ -592,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_loose_signal_directory_is_tightened_and_a_file_in_its_place_refused() {
         use std::os::unix::fs::PermissionsExt as _;
         let base = std::env::temp_dir().join(format!("plank-gpuyield-sigdir-{}", nonce()));
@@ -657,6 +676,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_fifo_at_the_signal_path_is_not_read_and_is_removed() {
         let dir = std::env::temp_dir().join(format!("plank-gpuyield-fifo-{}", nonce()));
         std::fs::create_dir_all(&dir).unwrap();

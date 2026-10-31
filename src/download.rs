@@ -1220,9 +1220,11 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 /// `Tada` is the one to play, but Apple dropped it from `/System/Library/Sounds`
 /// in recent macOS, so the list falls through to the nearest survivors rather
 /// than going silent on a machine that never had it.
+#[cfg(any(target_os = "macos", test))]
 const TADA_SOUNDS: [&str; 3] = ["Tada", "Hero", "Glass"];
 
 /// Where macOS keeps sounds: the user's own first, then the system's.
+#[cfg(target_os = "macos")]
 fn sound_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -1236,6 +1238,7 @@ fn sound_dirs() -> Vec<PathBuf> {
 ///
 /// Names are tried outermost so a user's own `Tada.aiff` beats a system
 /// fallback, rather than whichever directory happens to come first.
+#[cfg(any(target_os = "macos", test))]
 fn find_sound(names: &[&str], dirs: &[PathBuf]) -> Option<PathBuf> {
     names.iter().find_map(|name| {
         dirs.iter()

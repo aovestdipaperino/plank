@@ -1846,6 +1846,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlink_refuses_even_with_force() {
         let staged = staged_plugin("install-symlink", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
@@ -1859,6 +1860,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_contained_file_symlink_is_accepted_and_installs() {
         // The `obra/superpowers` case: `AGENTS.md -> CLAUDE.md`, a relative
         // link resolving inside the tree — the ordinary "same file under two
@@ -1873,6 +1875,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_absolute_escaping_symlink_is_refused() {
         let staged = staged_plugin("install-escape-absolute", "demo");
         std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
@@ -1883,6 +1886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_relative_escaping_symlink_is_refused() {
         let staged = staged_plugin("install-escape-relative", "demo");
         let secret_dir = tmpdir("install-escape-relative-secret");
@@ -1912,6 +1916,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn removing_the_containment_check_would_let_the_escaping_symlink_through() {
         // A direct regression pin on `scan_unsafe_symlinks`'s containment
         // test, independent of `install_staged`'s plumbing: a symlink whose
@@ -1927,6 +1932,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_contained_directory_symlink_is_refused_with_a_clear_message() {
         let staged = staged_plugin("install-dir-symlink", "demo");
         std::fs::create_dir_all(staged.join("real_dir")).expect("mkdir");
@@ -1940,6 +1946,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_local_directory_with_a_symlink_is_refused_and_the_target_never_copied() {
         // Exercises `fetch`'s local-directory fallback (a plain, non-git tree),
         // not `install_staged` directly: `copy_tree` follows symlinks and
@@ -1967,6 +1974,7 @@ mod tests {
     }
 
     /// True if any non-symlink file under `dir` contains `needle`.
+    #[cfg(unix)]
     fn walk_for_secret(dir: &Path, needle: &str) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;

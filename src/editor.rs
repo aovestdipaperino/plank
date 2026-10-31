@@ -22,6 +22,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write as _};
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,10 @@ use std::path::{Path, PathBuf};
 pub const HISTORY_MAX: usize = 512;
 
 /// Fallback terminal width when `TIOCGWINSZ` is unavailable.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 const DEFAULT_COLS: usize = 80;
 
 /// Result of one [`Editor::read_line`] call.
@@ -81,6 +86,10 @@ pub fn next_word_boundary(text: &str, cursor: usize) -> usize {
 /// xterm encodes the modifier as `1 + bitmask` (shift 1, alt 2, ctrl 4), so
 /// Alt is 3, Ctrl 5, Ctrl+Alt 7, and 9/13 appear when Meta is also set.
 #[must_use]
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 fn is_word_modifier(params: &str) -> bool {
     matches!(
         params.rsplit(';').next(),
@@ -666,6 +675,10 @@ pub fn default_history_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Tracks Tab-completion candidates and cycles through them like linenoise.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 #[derive(Debug, Default)]
 struct CompletionState {
     candidates: Vec<String>,
@@ -677,6 +690,10 @@ struct CompletionState {
     active: bool,
 }
 
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 impl CompletionState {
     /// Starts or advances a completion cycle. Returns the text to display in
     /// place of the completed word, or `None` when there are no candidates.
@@ -730,6 +747,7 @@ pub fn strip_paste_markers(data: &str) -> String {
 // Raw mode guard
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// Restores the saved termios state when dropped.
 #[derive(Debug)]
 struct RawModeGuard {
@@ -738,6 +756,7 @@ struct RawModeGuard {
     active: bool,
 }
 
+#[cfg(unix)]
 impl RawModeGuard {
     /// Puts `fd` into linenoise-style raw mode.
     fn enable(fd: RawFd) -> io::Result<Self> {
@@ -778,6 +797,7 @@ impl RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         self.restore();
@@ -795,6 +815,7 @@ pub type CompletionFn = Box<dyn Fn(&str) -> Vec<String>>;
 ///
 /// Not `Send`: it owns terminal state and a non-`Send` completion closure by
 /// design (it must live on the thread driving the TTY).
+#[cfg(unix)]
 pub struct Editor {
     buf: LineBuffer,
     /// Command history (public field-style access via methods).
@@ -812,6 +833,7 @@ pub struct Editor {
     in_fd: RawFd,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for Editor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Editor")
@@ -822,12 +844,14 @@ impl std::fmt::Debug for Editor {
     }
 }
 
+#[cfg(unix)]
 impl Default for Editor {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl Editor {
     /// Creates an editor reading from stdin and writing to stdout.
     #[must_use]
@@ -1220,6 +1244,10 @@ impl Editor {
 /// Layout: prompt line (with horizontal scrolling so the cursor stays
 /// visible), then the footer on the next line, then the cursor is moved back
 /// to its position on the prompt line. Embedded newlines display as `␤`.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 fn render_frame(prompt: &str, line: &str, cursor: usize, footer: &str, cols: usize) -> String {
     let cols = cols.max(2);
     let display: String = line
@@ -1248,20 +1276,15 @@ fn render_frame(prompt: &str, line: &str, cursor: usize, footer: &str, cols: usi
 }
 
 /// Terminal width from `TIOCGWINSZ`, falling back to 80.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 fn terminal_cols() -> usize {
-    // SAFETY: winsize is plain-old-data; zeroed is a valid value that ioctl
-    // overwrites on success.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: stdout fd is valid and `ws` is a properly aligned, writable
-    // winsize buffer, matching the TIOCGWINSZ contract.
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) };
-    if rc == 0 && ws.ws_col > 0 {
-        ws.ws_col as usize
-    } else {
-        DEFAULT_COLS
-    }
+    crate::platform::stdout_size().map_or(DEFAULT_COLS, |(cols, _)| usize::from(cols))
 }
 
+#[cfg(unix)]
 /// Reads one byte from `fd`; `Ok(None)` on EOF.
 fn read_byte(fd: RawFd) -> io::Result<Option<u8>> {
     // Use a File-like read via libc to avoid taking StdinLock (fd may be a
@@ -1285,6 +1308,10 @@ fn read_byte(fd: RawFd) -> io::Result<Option<u8>> {
     }
 }
 
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "used by the Unix-only raw-mode `Editor`")
+)]
 fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     let mut out = io::stdout().lock();
     out.write_all(bytes)?;

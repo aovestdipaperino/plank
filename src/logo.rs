@@ -90,16 +90,11 @@ fn kitty_mode() -> Option<crate::buddy::Mode> {
 /// A terminal cell's size in pixels `(width, height)`, from `TIOCGWINSZ`;
 /// `None` when the terminal does not report its pixel size.
 fn cell_pixels() -> Option<(u32, u32)> {
-    // SAFETY: winsize is plain-old-data; zeroed is valid and ioctl overwrites.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: stdout fd is valid and `ws` is a writable winsize buffer.
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) };
-    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
-        return None;
-    }
+    let (cols, rows) = crate::platform::stdout_size()?;
+    let (width, height) = crate::platform::stdout_pixels()?;
     Some((
-        u32::from(ws.ws_xpixel) / u32::from(ws.ws_col),
-        u32::from(ws.ws_ypixel) / u32::from(ws.ws_row),
+        u32::from(width) / u32::from(cols),
+        u32::from(height) / u32::from(rows),
     ))
 }
 

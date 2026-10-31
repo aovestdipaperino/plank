@@ -97,21 +97,12 @@ fn timestamp() -> String {
         .unwrap_or_default();
     let millis = now.subsec_millis();
     let secs = now.as_secs();
-    // SAFETY: localtime_r with valid pointers; tm is fully initialized on
-    // success and zeroed on failure.
-    let (y, mo, d, h, mi, s) = unsafe {
-        let t = libc::time_t::try_from(secs).unwrap_or(0);
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&raw const t, &raw mut tm);
-        (
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec,
-        )
-    };
+    let (y, mo, d, h, mi, s) = i64::try_from(secs)
+        .ok()
+        .and_then(crate::platform::local_time)
+        .map_or((1900, 1, 0, 0, 0, 0), |t| {
+            (t.year, t.month, t.day, t.hour, t.minute, t.second)
+        });
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{millis:03}")
 }
 
