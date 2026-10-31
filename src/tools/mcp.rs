@@ -21,14 +21,13 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::dsml::ToolCall;
 use crate::grid::{GridStaging, WriteBack};
+use crate::platform::CommandExt as _;
 
 /// Timeout for one MCP request round trip, in seconds.
 ///
@@ -534,8 +533,7 @@ impl McpServer {
                 // with the UI, but it is the only place a server explains its
                 // own death, so a thread drains it into `stderr_tail`.
                 .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()
+                .spawn_tree()
                 .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
             let stdin = child.stdin.take().ok_or("no stdin pipe")?;
             let stdout = child.stdout.take().ok_or("no stdout pipe")?;
@@ -845,15 +843,7 @@ impl StdioTransport {
                 return Some(line);
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
-            let mut pfd = libc::pollfd {
-                fd: self.stdout.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let timeout_ms = (remaining.as_millis() as libc::c_int).saturating_add(1);
-            let pr = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-            if pr <= 0 {
+            if !crate::platform::wait_readable(&self.stdout, remaining) {
                 return None;
             }
             let mut chunk = [0u8; 4096];
@@ -3278,6 +3268,7 @@ done
     }
 
     #[test]
+    #[cfg(unix)]
     fn dropping_a_server_marked_dead_still_kills_its_process_group() {
         // A request timeout marks the server dead while it keeps running.
         // Drop must kill it and its children anyway, or they outlive plank.

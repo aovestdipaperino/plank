@@ -148,6 +148,10 @@ pub(crate) fn moe_dims(
 struct MatmulOp {
     w: Arc<NvWeight>,
     /// Multiply in f32 on Metal even from `MM_MIN_TOKENS` up.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read by the Metal decode path only")
+    )]
     exact: bool,
 }
 

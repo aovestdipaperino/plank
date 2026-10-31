@@ -14,6 +14,10 @@ use crate::nvfp4::tensor::{MoeExperts, NvWeight};
 const MIN_WEIGHT_SUM: f64 = 6.103_515_625e-5;
 /// [`MIN_WEIGHT_SUM`] for the Metal kernels, exact in f32.
 #[allow(clippy::cast_possible_truncation)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "read by the Metal decode path only")
+)]
 pub(crate) const MIN_WEIGHT_SUM_F32: f32 = MIN_WEIGHT_SUM as f32;
 
 /// `down(silu(gate x) * up x)`; each projection's tensor scale is applied

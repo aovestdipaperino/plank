@@ -2791,6 +2791,7 @@ pub fn datetime_context_line(now: SystemTime) -> String {
 }
 
 /// Formats Unix seconds as local time `%Y-%m-%d %H:%M:%S %Z`, or `None` on failure.
+#[cfg(unix)]
 fn format_local(secs: i64) -> Option<String> {
     let t: libc::time_t = secs;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -2815,6 +2816,17 @@ fn format_local(secs: i64) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Windows has no `localtime_r`/`%Z` pair that names the zone portably, so the
+/// zone is written as its UTC offset (`UTC+01:00`) instead of an abbreviation.
+#[cfg(windows)]
+fn format_local(secs: i64) -> Option<String> {
+    let t = crate::platform::local_time(secs)?;
+    let off = t.utc_offset;
+    let sign = if off < 0 { '-' } else { '+' };
+    let (h, m) = (off.abs() / 3600, off.abs() % 3600 / 60);
+    Some(format!("{} UTC{sign}{h:02}:{m:02}", t.date_time()))
 }
 
 /// Pressure-controlled policy for re-injecting the system prompt reminder.
