@@ -13637,6 +13637,14 @@ impl Agent<'_> {
                 ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
             )]);
         }
+        // What the sandbox cannot enforce on this OS (#89); absent where it
+        // confines bash, or when it is off.
+        if let Some(notice) = self.tool_ctx.sandbox.startup_notice() {
+            log.push_spans(vec![ratatui::text::Span::styled(
+                notice,
+                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+            )]);
+        }
         // Only the echo stub has no model name, and it answers nothing useful.
         if self.engine.model_name().is_empty() {
             log.push_plain(String::new());
@@ -22588,6 +22596,10 @@ fn run_plain_flow(
     // reading a line from stdin (issue #34).
     agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
     agent.warm_plain()?;
+    // The plain mirror of the TUI banner's sandbox notice.
+    if let Some(notice) = agent.tool_ctx.sandbox.startup_notice() {
+        println!("plank: {notice}");
+    }
     // The plain REPL is up and accepting input.
     crate::title::set(crate::title::State::Idle);
     if let Some(history) = agent.resumed_history() {
