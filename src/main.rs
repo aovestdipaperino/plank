@@ -1752,8 +1752,13 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     } else {
         0
     };
-    let engine = NativeEngine::<F>::open(&model, ctx).map_err(|e| e.to_string())?;
-    eprintln!("plank: model ready: {}", engine.model_name());
+    let backend = cfg.backend;
+    let engine = NativeEngine::<F>::open(&model, ctx, backend).map_err(|e| e.to_string())?;
+    eprintln!(
+        "plank: model ready: {} ({})",
+        engine.model_name(),
+        engine.device_name()
+    );
     if ctx == 0 {
         #[allow(clippy::cast_precision_loss)]
         let kv_gb = engine.kv_bytes_at_ctx() as f64 / f64::from(1u32 << 30);
@@ -1764,7 +1769,7 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     }
     let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
         plank::gpuyield::check_model_files(vec![("model", model.as_path())])?;
-        NativeEngine::<F>::open(&model, ctx)
+        NativeEngine::<F>::open(&model, ctx, backend)
             .map(|e| Box::new(e) as Box<dyn Engine>)
             .map_err(|e| e.to_string())
     });

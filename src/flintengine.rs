@@ -169,6 +169,7 @@ impl crate::nativeengine::NativeFamily for FlintFamily {
     type Model = Model;
     type Translator = ();
     const LABEL: &'static str = "flint";
+    const SUPPORTS_CUDA: bool = false;
 
     /// Refuses a file larger than the Metal device's `maxBufferLength`
     /// before mapping it: such a file cannot be one no-copy buffer, and the

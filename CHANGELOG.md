@@ -19,6 +19,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worktree build directories are linked with a junction when a directory
   symlink needs privileges the account lacks.
 
+- **`--cpu` / `--cuda` / `--metal` pick the native engines' device, and Gemma
+  runs on CUDA** (#89, step 5). Gemma and Flint used to take Metal when there
+  was one and the CPU otherwise, whatever the flag said. An explicit backend
+  is now used or the engine fails to open with a reason, and with none they
+  try Metal, then CUDA, then the CPU. A new `cuda` cargo feature builds Gemma
+  on candle's CUDA backend (it needs the CUDA toolkit); Flint has no CUDA
+  kernels and stays on the CPU off macOS. The startup line names the device.
+  CI now runs the native engine crates' tests on Linux and Windows.
+
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
   Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the

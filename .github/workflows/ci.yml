@@ -215,3 +215,21 @@ jobs:
       # it `leptonica-1.84.1d.lib`, so a debug test build fails to link.
       - name: Test
         run: cargo test --release --lib
+
+      # The native engines on the CPU (#89 step 5): workspace members the
+      # steps above miss. Their kernels sit behind `candle`, and the
+      # real-GGUF reference tests are `#[ignore]`d without a model, so this
+      # runs the kernel, session and template checks (template_parity
+      # included) and the routing tests on a generated tiny GGUF.
+      - name: Lint the native engine crates
+        run: cargo clippy -p gemma-engine -p flint-engine --all-targets --features candle -- -D warnings
+
+      # bash on Windows too: under pwsh a failing first line would be masked
+      # by the exit status of the last.
+      - name: Test the native engine crates
+        shell: bash
+        run: |
+          set -e
+          cargo test --release -p gemma-engine --features candle
+          cargo test --release -p flint-engine --features candle
+          cargo test --release -p local-inference-engine
