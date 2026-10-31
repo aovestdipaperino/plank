@@ -4007,3 +4007,18 @@ in, so they see it without the bump. The next catalog bump must wait until
 the 7.0.x clients have aged out, or the old fit rule has to be reckoned with
 (`enginefit.rs` in v7.0.8, `raw_str(entry, "family") == Some("gemma")`).
 
+
+## Write containment on Windows: canonical roots against a lexical target
+
+`Sandbox::write_roots` canonicalizes its roots, and on Windows
+`canonicalize` returns verbatim paths (`\\?\C:\work`). A write target whose
+parent did not exist yet was normalised lexically instead (`C:\work\a\b.txt`),
+so `starts_with` never matched and the write was refused as escaping the
+workspace; macOS has the same mismatch through `/tmp` -> `/private/tmp`.
+`realpath_for_write` now canonicalizes the deepest existing ancestor and folds
+`.`/`..` in the components re-attached after it (they do not exist, so they
+cannot be symlinks, and a `new/../../x` climb is still seen). Roots go through
+the same function, so a configured root that does not exist yet compares like
+a target. `platform::path_starts_with` ignores case and the verbatim prefix on
+Windows. Folding `..` *before* canonicalizing would be wrong: `link/../x`
+through a symlink lands beside the link's target, not beside the link.
