@@ -105,18 +105,27 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       # Each OS gets its usual archive format: a .zip holding plank.exe on
-      # Windows, a .tar.gz holding plank everywhere else.
+      # Windows, a .tar.gz holding plank everywhere else. PDFium goes beside
+      # the binary: liteparse dlopens it at runtime, and otherwise looks only
+      # in this runner's download cache, which no user machine has.
       - name: Package binary archive
         id: package
         run: |
           cd "target/${{ matrix.target }}/release"
+          case "$RUNNER_OS" in
+            Windows) PDFIUM=pdfium.dll ;;
+            macOS) PDFIUM=libpdfium.dylib ;;
+            *) PDFIUM=libpdfium.so ;;
+          esac
+          cp "deps/$PDFIUM" .
           if [ "$RUNNER_OS" = "Windows" ]; then
             ARCHIVE="plank-${GITHUB_REF_NAME}-${{ matrix.name }}.zip"
-            7z a -tzip "../../../$ARCHIVE" plank.exe
+            7z a -tzip "../../../$ARCHIVE" plank.exe "$PDFIUM"
           else
             ARCHIVE="plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz"
-            tar czf "../../../$ARCHIVE" plank
+            tar czf "../../../$ARCHIVE" plank "$PDFIUM"
           fi
+          echo "pdfium=$PDFIUM" >> "$GITHUB_OUTPUT"
           cd ../../..
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
@@ -133,6 +142,7 @@ jobs:
             tar xzf "$ARCHIVE" -C smoke
             ./smoke/plank --version
           fi
+          test -f "smoke/${{ steps.package.outputs.pdfium }}"
 
       - name: Upload binary archive to release
         env:
@@ -188,9 +198,12 @@ jobs:
           VERSION="${{ needs.channel.outputs.version }}"
           BOTTLE_TAG="${{ matrix.bottle_tag }}"
           NAME=$([ "${{ needs.channel.outputs.channel }}" = "beta" ] && echo plank-agent-beta || echo plank-agent)
-          mkdir -p "$NAME/$VERSION/bin" "$NAME/$VERSION/share/plank/metal"
+          mkdir -p "$NAME/$VERSION/bin" "$NAME/$VERSION/lib" "$NAME/$VERSION/share/plank/metal"
           cp target/${{ matrix.target }}/release/plank "$NAME/$VERSION/bin/plank"
           chmod +x "$NAME/$VERSION/bin/plank"
+          # In lib/, not beside the binary, so Homebrew does not link it into
+          # the prefix's bin/; plank looks in ../lib relative to its real path.
+          cp target/${{ matrix.target }}/release/deps/libpdfium.dylib "$NAME/$VERSION/lib/"
           # The engine compiles its Metal kernels from source at model load;
           # the binary falls back to ../share/plank/metal relative to itself
           # when the compile-time path (the CI checkout) is gone.
