@@ -4156,3 +4156,12 @@ not what holds the layers.
 `ds4_engine_close` runs `ds4_gpu_cleanup`, which resets `g_n_gpus`, so the GPU
 yield's close-and-reopen gets a clean multi-GPU state. The reopen passes the
 same `EngineTuning`, placement included.
+## Windows test runs need `HOME`, which only `main` sets
+
+plank reads `HOME` directly in many places (the document cache, `~/.plank`),
+and on Windows `platform::ensure_home` fills it from `USERPROFILE` at the top
+of `main`. The test harness never runs `main`, so `cargo test` started from
+`cmd` or PowerShell fails wherever a test writes under `~/.plank`:
+`read_pdf_as_markdown_and_continue` reports "cannot write the document
+cache". CI's Windows job runs under `shell: bash` (Git Bash), which exports
+`HOME`, so it passes. From PowerShell, set `$env:HOME = $env:USERPROFILE` first.
