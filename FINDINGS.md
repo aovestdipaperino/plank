@@ -4039,3 +4039,31 @@ is built in the parent and only `prctl(PR_SET_NO_NEW_PRIVS)` plus
 `landlock_restrict_self` run in `pre_exec`, the two syscalls safe between
 `fork` and `exec` in a multithreaded process. WSL2's 6.x kernel has Landlock
 (ABI 7), so the end-to-end tests run there.
+
+## Windows `bash` sandbox: msys cannot run under a write-restricted token
+
+A write-restricted token (`CreateRestrictedToken(WRITE_RESTRICTED, ...)`) would
+have confined writes without touching any label: reads stay open, and a write
+succeeds only where an ACE names one of the token's restricting SIDs.
+Swapping it into a suspended child with `NtSetInformationProcess(ProcessAccessToken)`
+needs no privilege, since it is a restricted copy of plank's own token. But Git
+Bash dies under it. msys sets the token's default DACL (fixable by granting the
+restricted token object to its own SIDs), then creates
+`\BaseNamedObjects\msys-2.0S5-*` (passes only with Everyone among the
+restricting SIDs) and finally its signal pipe, whose security descriptor names
+only the user SID. A write-restricted check never accepts that, and adding the
+user SID to the restricting set cancels the confinement. Windows PowerShell 5.1
+hangs under the same token.
+
+A Low-integrity token runs Git Bash correctly: writes into a directory
+labelled `S:(ML;OICI;NW;;;LW)` succeed, writes elsewhere get `Permission
+denied`, and everything stays readable. Windows PowerShell 5.1 crashes at Low
+integrity (a .NET fail-fast, `0x80131623`), so the PowerShell dialect cannot be
+confined this way.
+Labelling `%TEMP%` would let every Low process write the user's temp files, so
+confined commands get `%TEMP%\plank-low` instead (`lowil::temp_dir`). A
+`std::process::Command` cannot carry a token, so `sandbox.rs` marks the command
+with `PLANK_SANDBOX=low-integrity` and `platform::CommandExt::spawn_tree` starts
+it with `CREATE_SUSPENDED`. Since `spawn_tree` sets `creation_flags` itself,
+the suspend flag has to be added there; a flag set by the caller would be
+overwritten.

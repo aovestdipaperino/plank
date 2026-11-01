@@ -118,6 +118,7 @@ pub mod kvtree;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 pub mod logo;
+pub mod lowil;
 pub mod manifest;
 pub mod memextract;
 pub mod memory;

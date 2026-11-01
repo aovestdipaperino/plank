@@ -744,11 +744,28 @@ impl CommandExt for std::process::Command {
         #[cfg(windows)]
         {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            std::os::windows::process::CommandExt::creation_flags(self, CREATE_NEW_PROCESS_GROUP);
-            let child = self
+            const CREATE_SUSPENDED: u32 = 0x0000_0004;
+            // A sandboxed command (`sandbox.rs`) is started suspended, so it
+            // is in its job and at Low integrity before its first instruction.
+            let low = self.get_envs().any(|(k, v)| {
+                k == crate::lowil::MARKER_VAR && v == Some(crate::lowil::MARKER_VALUE.as_ref())
+            });
+            let flags = if low {
+                CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
+            } else {
+                CREATE_NEW_PROCESS_GROUP
+            };
+            std::os::windows::process::CommandExt::creation_flags(self, flags);
+            let mut child = self
                 .spawn()
                 .map_err(|e| explain_spawn_error(self.get_program(), e))?;
             jobs::adopt(&child);
+            if low && let Err(e) = crate::lowil::confine(&child) {
+                // Never run it unconfined.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
             Ok(child)
         }
     }

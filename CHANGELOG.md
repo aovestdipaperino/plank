@@ -27,6 +27,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worktree build directories are linked with a junction when a directory
   symlink needs privileges the account lacks.
 
+- **Windows `bash` sandbox** (#89, step 4). Model `bash` commands run at
+  Low integrity: plank starts the shell suspended, swaps in a Low copy of its
+  own token, and resumes it, so it can read as before but write only where a
+  Low label allows. At the first confined command the write roots (the
+  workspace, toolchain caches, `writablePaths`) get a Low label, recorded in
+  `~/.plank/sandbox/low-labels` and removed when plank exits, or at the next
+  launch after a crash, unless another live plank still uses the root.
+  Confined commands get their own `%TEMP%\plank-low`. A command that cannot
+  be lowered fails to start. While a root is labelled, other Low-integrity
+  processes can write there too; a one-command grant of a protected root
+  lasts until plank exits.
+
 - **Linux write sandbox, and containment on every OS** (#89, step 4). On
   Linux 5.13+ model `bash` commands run under a Landlock ruleset holding
   writes to the same roots as on macOS (the working directory, temp dirs,
