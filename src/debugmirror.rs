@@ -59,14 +59,20 @@ use turbo_debug_client as tdc;
 use tdc::StreamKind;
 
 /// Windows stand-in for `turbo-debug-client`, whose 0.2.1 release is Unix-only
-/// (see `Cargo.toml`). It reports that no console is running and refuses to
-/// connect, which is what the mirror already does quietly when nobody listens.
+/// (see `Cargo.toml`) only because its liveness probe calls `flock`. The same
+/// protocol over `std`: a shared, non-blocking lock on the console's
+/// `tdk.lock` (`LockFileEx` here) fails exactly while the console holds its
+/// exclusive one, and the handshake is plain TCP.
 #[cfg(windows)]
 mod tdc {
+    use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpStream;
 
     /// The console's well-known control port.
     pub const CONTROL_PORT: u16 = 7878;
+
+    /// The handshake version the crate speaks.
+    const PROTOCOL_VERSION: u32 = 1;
 
     /// What the console should make of the bytes sent.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,18 +81,57 @@ mod tdc {
         Tokens,
     }
 
-    /// Never: the Windows build cannot probe the console's liveness lock.
+    /// Whether a console holds its liveness lock in the temp directory.
     #[must_use]
     pub fn is_console_running() -> bool {
-        false
+        is_console_running_at(&std::env::temp_dir().join("tdk.lock"))
     }
 
-    /// Always fails: no console client on Windows yet.
+    pub(super) fn is_console_running_at(path: &std::path::Path) -> bool {
+        // Read-only, never create: only the console creates the file.
+        std::fs::File::open(path)
+            .is_ok_and(|f| matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)))
+    }
+
+    /// Sends `HELLO <version> tokens <name>` to the control port and connects
+    /// to the data port the console replies with, as the crate does.
     ///
     /// # Errors
-    /// Always `Unsupported`.
-    pub fn connect_on(_port: u16, _kind: StreamKind, _name: &str) -> std::io::Result<TcpStream> {
-        Err(std::io::ErrorKind::Unsupported.into())
+    /// The I/O error, or `InvalidData` carrying the console's refusal.
+    pub fn connect_on(port: u16, _kind: StreamKind, name: &str) -> std::io::Result<TcpStream> {
+        let mut control = TcpStream::connect(("127.0.0.1", port))?;
+        writeln!(control, "HELLO {PROTOCOL_VERSION} tokens {name}")?;
+        control.flush()?;
+        let mut reply = String::new();
+        BufReader::new(control.try_clone()?).read_line(&mut reply)?;
+        let data: u16 = reply
+            .trim()
+            .strip_prefix("PORT ")
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("handshake refused: {}", reply.trim()),
+                )
+            })?;
+        TcpStream::connect(("127.0.0.1", data))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_liveness_lock_reads_as_the_crate_reads_flock() {
+            let path =
+                std::env::temp_dir().join(format!("plank-tdk-test-{}.lock", std::process::id()));
+            assert!(!super::is_console_running_at(&path), "no file: no console");
+            let holder = std::fs::File::create(&path).unwrap();
+            holder.lock().unwrap();
+            assert!(super::is_console_running_at(&path), "exclusive lock held");
+            holder.unlock().unwrap();
+            assert!(!super::is_console_running_at(&path), "released");
+            drop(holder);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 

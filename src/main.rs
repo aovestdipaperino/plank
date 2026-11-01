@@ -1064,6 +1064,8 @@ impl Drop for LowLabels {
 
 fn main() -> ExitCode {
     plank::platform::ensure_home();
+    // SAFETY: first thing in `main`, before plank starts a thread.
+    unsafe { plank::doc::locate_pdfium() };
     // The Windows sandbox's Low labels: a crashed plank's are removed now,
     // this one's when `main` returns (`lowil.rs`).
     #[cfg(windows)]
