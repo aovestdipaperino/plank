@@ -385,13 +385,57 @@ pub fn play_sound(wav: &Path) -> Option<std::process::Child> {
     sound_tools(wav).iter().find_map(|t| t.spawn().ok())
 }
 
+/// The host terminal a Linux notification borrows its icon from, as the
+/// `.desktop` entry name `notify-send` passes in its `desktop-entry` hint,
+/// read from the variables each terminal exports. The Linux counterpart of
+/// the macOS bundle id `crate::notify` derives from `TERM_PROGRAM`; `None`
+/// leaves the server's generic icon.
+#[must_use]
+pub fn linux_terminal_desktop_entry(env: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
+    let by_program = match env("TERM_PROGRAM").as_deref() {
+        Some("vscode") => Some("code"),
+        Some("WezTerm") => Some("org.wezfurlong.wezterm"),
+        Some("ghostty") => Some("com.mitchellh.ghostty"),
+        _ => None,
+    };
+    by_program.or_else(|| {
+        [
+            ("KITTY_WINDOW_ID", "kitty"),
+            ("KONSOLE_VERSION", "org.kde.konsole"),
+            ("GNOME_TERMINAL_SCREEN", "org.gnome.Terminal"),
+            ("ALACRITTY_WINDOW_ID", "Alacritty"),
+            ("TILIX_ID", "com.gexperts.Tilix"),
+            ("WEZTERM_PANE", "org.wezfurlong.wezterm"),
+        ]
+        .into_iter()
+        .find(|(var, _)| env(var).is_some())
+        .map(|(_, entry)| entry)
+    })
+}
+
+/// Windows PowerShell's `AppUserModelID`, which every install registers: what
+/// an unpackaged CLI's toast is shown under when no terminal's id is found.
+const POWERSHELL_AUMID: &str =
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
 /// The desktop notification command for Linux and Windows. macOS delivers
 /// through `notify-rust` in `crate::notify` instead.
 ///
 /// `sticky` asks for a notification that stays until dismissed: `critical`
-/// urgency for `notify-send`, a long-duration toast on Windows.
+/// urgency for `notify-send`, a long-duration toast on Windows. Both borrow
+/// the host terminal's identity when they can tell what it is.
 #[must_use]
 pub fn notify_tool(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) -> Tool {
+    notify_tool_in(summary, subtitle, body, sticky, &|k| std::env::var(k).ok())
+}
+
+fn notify_tool_in(
+    summary: &str,
+    subtitle: Option<&str>,
+    body: &str,
+    sticky: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Tool {
     let text = match subtitle {
         Some(sub) if !sub.is_empty() => format!("{sub}\n{body}"),
         _ => body.to_owned(),
@@ -405,17 +449,31 @@ pub fn notify_tool(summary: &str, subtitle: Option<&str>, body: &str, sticky: bo
             xml_escape(&text)
         );
         // A toast needs an AppUserModelID; an unpackaged CLI has none, so it
-        // borrows Windows PowerShell's, which every install registers.
+        // borrows one. Inside Windows Terminal (`WT_SESSION`) that is the
+        // terminal's, read from its installed package so a Preview build or a
+        // missing package falls back to Windows PowerShell's.
+        let id = if env("WT_SESSION").is_some() {
+            format!(
+                "$p = Get-AppxPackage -Name 'Microsoft.WindowsTerminal*' -ErrorAction SilentlyContinue | Select-Object -First 1; \
+                 $id = if ($p) {{ $p.PackageFamilyName + '!App' }} else {{ '{POWERSHELL_AUMID}' }}; "
+            )
+        } else {
+            format!("$id = '{POWERSHELL_AUMID}'; ")
+        };
         return Tool::powershell(&format!(
             "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; \
              [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null; \
-             $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml({}); \
-             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+             $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml({}); {id}\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show([Windows.UI.Notifications.ToastNotification]::new($x))",
             ps_quote(&xml)
         ));
     }
     let urgency = if sticky { "critical" } else { "normal" };
     let mut tool = Tool::new("notify-send", &["--app-name=plank", "--urgency", urgency]);
+    if let Some(entry) = linux_terminal_desktop_entry(env) {
+        tool.args
+            .push(format!("--hint=string:desktop-entry:{entry}").into());
+    }
     // `--` so a summary starting with `-` is not read as an option.
     tool.args.push("--".into());
     tool.args.push(summary.into());
@@ -536,10 +594,69 @@ mod tests {
         );
     }
 
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn the_linux_terminal_is_read_from_its_own_variables() {
+        let entry = |vars: &[(&str, &str)]| linux_terminal_desktop_entry(&env_of(vars));
+        assert_eq!(entry(&[("KITTY_WINDOW_ID", "1")]), Some("kitty"));
+        assert_eq!(
+            entry(&[("GNOME_TERMINAL_SCREEN", "/x")]),
+            Some("org.gnome.Terminal")
+        );
+        assert_eq!(
+            entry(&[("KONSOLE_VERSION", "230804")]),
+            Some("org.kde.konsole")
+        );
+        // `TERM_PROGRAM` names the innermost host, so VS Code inside a GNOME
+        // Terminal session reads as VS Code.
+        assert_eq!(
+            entry(&[("TERM_PROGRAM", "vscode"), ("GNOME_TERMINAL_SCREEN", "/x")]),
+            Some("code")
+        );
+        assert_eq!(entry(&[("TERM_PROGRAM", "tmux")]), None);
+        assert_eq!(entry(&[]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_toast_in_windows_terminal_looks_up_its_package() {
+        let script = |vars: &[(&str, &str)]| {
+            let tool = notify_tool_in("t", None, "b", false, &env_of(vars));
+            tool.args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(script(&[("WT_SESSION", "x")]).contains("Get-AppxPackage"));
+        let plain = script(&[]);
+        assert!(!plain.contains("Get-AppxPackage"), "{plain}");
+        assert!(plain.contains("WindowsPowerShell"), "{plain}");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn notify_send_borrows_the_terminal_entry() {
+        let tool = notify_tool_in("t", None, "b", false, &env_of(&[("KITTY_WINDOW_ID", "1")]));
+        assert!(
+            tool.args
+                .contains(&OsString::from("--hint=string:desktop-entry:kitty")),
+            "{:?}",
+            tool.args
+        );
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn notify_send_gets_urgency_and_a_separator_before_the_text() {
-        let tool = notify_tool("-done", Some("sub"), "body", true);
+        let tool = notify_tool_in("-done", Some("sub"), "body", true, &env_of(&[]));
         assert_eq!(tool.program, "notify-send");
         let args: Vec<_> = tool.args.iter().map(|a| a.to_string_lossy()).collect();
         assert_eq!(
@@ -554,7 +671,7 @@ mod tests {
             ]
         );
         assert!(
-            notify_tool("t", None, "b", false)
+            notify_tool_in("t", None, "b", false, &env_of(&[]))
                 .args
                 .contains(&OsString::from("normal"))
         );
