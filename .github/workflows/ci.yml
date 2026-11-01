@@ -233,3 +233,11 @@ jobs:
           cargo test --release -p gemma-engine --features candle
           cargo test --release -p flint-engine --features candle
           cargo test --release -p local-inference-engine
+
+      # The ds4 C engine's CPU backend on Linux (#89 step 5): builds
+      # libds4core.a from refs/ds4 and runs the FFI struct-offset pins
+      # against it. The job-wide PLANK_NO_DS4 is unset for this step only,
+      # since the build script treats any value, even empty, as set.
+      - name: Build the ds4 CPU engine (Linux)
+        if: runner.os == 'Linux'
+        run: env -u PLANK_NO_DS4 cargo test --release -p local-inference-engine

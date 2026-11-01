@@ -17,8 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   always run POSIX `sh`.
 
 - **Linux and Windows builds** (#89, phases 1 and 2). plank builds, lints and
-  tests on Linux and Windows with the echo stub, Gemma and Flint on the CPU;
-  the ds4 C engine stays macOS-only for now. Desktop integrations (clipboard
+  tests on Linux and Windows with the echo stub, Gemma and Flint on the CPU. Desktop integrations (clipboard
   text and images, open, sound, notifications, memory pressure) go through
   `platform::desktop` with a tool list per OS. On Windows the bash tool and
   hooks run a POSIX shell found on `PATH` or under Git for Windows
@@ -57,6 +56,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on candle's CUDA backend (it needs the CUDA toolkit); Flint has no CUDA
   kernels and stays on the CPU off macOS. The startup line names the device.
   CI now runs the native engine crates' tests on Linux and Windows.
+
+- **The ds4 C engine builds on Linux** (#89, step 5). With `refs/ds4`
+  present, the build compiles ds4's CPU backend on Linux, or its CUDA backend
+  with `PLANK_DS4_BACKEND=cuda` (`CUDA_ARCH`, `CUDA_HOME`; not yet tested on a
+  GPU), and plank defaults to the backend that was built. A backend the core
+  was not compiled with is refused before any download or open. On the CPU
+  the vision encoder and SSD streaming are skipped, since the C refuses both
+  there. The 96 GB RAM floor now holds off macOS too. CI builds the CPU core
+  on Linux and checks the FFI layout pins against it.
 
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
