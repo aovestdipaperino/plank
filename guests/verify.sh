@@ -12,6 +12,11 @@
 # after a toolchain bump is expected and is not evidence of tampering; a
 # mismatch on the same toolchain is.
 set -e
+# SHA-256 of a file as `<hash>  <name>`: `sha256sum` where it exists (most
+# Linux), else `shasum -a 256` (macOS, Git for Windows).
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
 cd "$(dirname "$0")"
 SUMS="${1:-dist/SHA256SUMS}"
 if [ ! -f "$SUMS" ]; then
@@ -41,7 +46,7 @@ while read -r expected name; do
   case "$expected" in \#*) continue ;; esac
   [ -n "$name" ] || continue
   guest=$(echo "$name" | sed 's/\.wasm$//')
-  actual=$(cd "dist/$guest/wasm" && shasum -a 256 "$name" | cut -d' ' -f1)
+  actual=$(cd "dist/$guest/wasm" && sha256 "$name" | cut -d' ' -f1)
   if [ "$actual" = "$expected" ]; then
     echo "ok       $name"
   else

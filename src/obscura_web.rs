@@ -61,3 +61,17 @@ pub fn fetch(url: &str) -> Result<String, String> {
         Ok(page.content())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    /// Loads a real page through the embedded browser, JavaScript engine
+    /// included. Needs the network, so it runs only with `--ignored`: the
+    /// check that obscura works at runtime on a new OS, not just that it
+    /// builds.
+    #[test]
+    #[ignore = "needs the network"]
+    fn fetches_and_renders_a_real_page() {
+        let html = super::fetch("https://example.com/").expect("fetch");
+        assert!(html.contains("Example Domain"), "{html}");
+    }
+}

@@ -30,8 +30,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `liteparse-pdfium-sys`'s build script downloads pdfium into
-      # ~/.cache/pdfium-rs, bakes that path into the binary, and copies the
+      # `liteparse-pdfium-sys`'s build script downloads pdfium into its cache
+      # dir (~/.cache/pdfium-rs on Linux, ~/Library/Caches/pdfium-rs on macOS,
+      # %LOCALAPPDATA%\pdfium-rs on Windows), bakes that path into the binary, and copies the
       # dylib into target/<profile>/deps. rust-cache restores target/ but not
       # that cache dir, so on a cache hit the script never re-runs: nothing
       # re-downloads, and the baked path points at a directory the runner does
@@ -41,7 +42,10 @@ jobs:
       - name: Cache pdfium binaries
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pdfium-rs
+          path: |
+            ~/.cache/pdfium-rs
+            ~/Library/Caches/pdfium-rs
+            ~/AppData/Local/pdfium-rs
           key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           # Deliberately no restore-keys: the build script takes whatever is in
           # the cache dir if it exists, so a partial-key restore would hand a
@@ -65,7 +69,7 @@ jobs:
       # discarding just that crate's artifacts when the download is missing.
       - name: Ensure pdfium is downloadable
         run: |
-          if [ ! -d "$HOME/.cache/pdfium-rs" ]; then
+          if [ ! -d "$HOME/Library/Caches/pdfium-rs" ]; then
             echo "pdfium cache absent; forcing liteparse-pdfium-sys to rebuild"
             cargo clean -p liteparse-pdfium-sys --release || true
           fi
@@ -143,7 +147,10 @@ jobs:
       - name: Cache pdfium binaries
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pdfium-rs
+          path: |
+            ~/.cache/pdfium-rs
+            ~/Library/Caches/pdfium-rs
+            ~/AppData/Local/pdfium-rs
           key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Ensure pdfium is downloadable
@@ -203,7 +210,11 @@ jobs:
       - name: Ensure pdfium is downloadable
         shell: bash
         run: |
-          if [ ! -d "$HOME/.cache/pdfium-rs" ]; then
+          case "$RUNNER_OS" in
+            Windows) PDFIUM_CACHE="$LOCALAPPDATA/pdfium-rs" ;;
+            *) PDFIUM_CACHE="$HOME/.cache/pdfium-rs" ;;
+          esac
+          if [ ! -d "$PDFIUM_CACHE" ]; then
             cargo clean -p liteparse-pdfium-sys || true
           fi
 

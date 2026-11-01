@@ -12,6 +12,11 @@
 #
 # Output: dist/<guest>/ (the installable directory) and dist/plank-<guest>.tar.gz.
 set -e
+# SHA-256 of a file as `<hash>  <name>`: `sha256sum` where it exists (most
+# Linux), else `shasum -a 256` (macOS, Git for Windows).
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
 cd "$(dirname "$0")"
 ROOT=$(pwd)
 DIST="$ROOT/dist"
@@ -51,7 +56,7 @@ done
   echo "# plank guest modules"
   echo "# $(rustc --version)"
   for guest in screensavers arcades csvedit; do
-    (cd "$DIST/$guest/wasm" && shasum -a 256 "$guest.wasm")
+    (cd "$DIST/$guest/wasm" && sha256 "$guest.wasm")
   done
 } > "$DIST/SHA256SUMS"
 cat "$DIST/SHA256SUMS"
