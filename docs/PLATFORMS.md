@@ -110,8 +110,7 @@ WSL2 instead, built as on Linux:
    `/mnt/c`: the engine memory-maps an ~87 GB file, and the Windows drive is
    much slower through WSL2.
 
-A native port would start upstream in `ds4` (clang-cl or MSVC with `nvcc`,
-replacing the POSIX pieces) before plank could link it.
+A native port would start upstream in `ds4`: [docs/DS4-WINDOWS-PORT.md](DS4-WINDOWS-PORT.md) assesses what it would take (feasible, no blocker; a POSIX compatibility header, stubs for the multi-host code plank does not use, then the CPU core with `clang-cl` and CUDA with `nvcc` and MSVC).
 
 ## Not done yet
 
