@@ -680,7 +680,7 @@ Options:
         + "  -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
-      --cuda               use the CUDA backend
+      --cuda               use the CUDA backend (ROCm on a ds4 ROCm build)
       --cpu                use the CPU backend
       --power N            GPU power cap percent (1..100)
       --mtp                multi-token prediction, i.e. speculative decoding

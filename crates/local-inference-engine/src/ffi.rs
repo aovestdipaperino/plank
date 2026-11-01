@@ -28,10 +28,20 @@ pub fn built_backend() -> Option<Ds4Backend> {
     backend_named(option_env!("DS4_BUILT_BACKEND")?)
 }
 
+/// A `ROCm` core is the C's CUDA backend built with `DS4_ROCM_BUILD`, so it
+/// opens as [`Ds4Backend::Cuda`].
 fn backend_named(name: &str) -> Option<Ds4Backend> {
+    if name == "rocm" {
+        return Some(Ds4Backend::Cuda);
+    }
     [Ds4Backend::Metal, Ds4Backend::Cuda, Ds4Backend::Cpu]
         .into_iter()
         .find(|b| b.name() == name)
+}
+
+/// Whether the linked core is the `ROCm` build of the CUDA backend.
+fn built_rocm() -> bool {
+    option_env!("DS4_BUILT_BACKEND") == Some("rocm")
 }
 
 impl Ds4Backend {
@@ -43,6 +53,17 @@ impl Ds4Backend {
             Self::Metal => "metal",
             Self::Cuda => "cuda",
             Self::Cpu => "cpu",
+        }
+    }
+
+    /// The name to show for this backend on the linked core: `rocm` for the
+    /// CUDA backend of a `ROCm` core, else [`Self::name`].
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        if self == Self::Cuda && built_rocm() {
+            "rocm"
+        } else {
+            self.name()
         }
     }
 
@@ -63,18 +84,18 @@ impl Ds4Backend {
 /// Names the backend asked for and the one the core was built for.
 pub fn check_backend(wanted: Ds4Backend) -> Result<(), String> {
     match built_backend() {
-        Some(built) => backend_refusal(wanted, built).map_or(Ok(()), Err),
+        Some(built) => backend_refusal(wanted, built, built.label()).map_or(Ok(()), Err),
         None => Ok(()),
     }
 }
 
-fn backend_refusal(wanted: Ds4Backend, built: Ds4Backend) -> Option<String> {
+fn backend_refusal(wanted: Ds4Backend, built: Ds4Backend, built_label: &str) -> Option<String> {
     if wanted.runs_on(built) {
         return None;
     }
     let hint = match wanted {
         Ds4Backend::Cuda => {
-            "; rebuild with PLANK_DS4_BACKEND=cuda on a machine with the CUDA toolkit"
+            "; rebuild with PLANK_DS4_BACKEND=cuda (CUDA toolkit) or PLANK_DS4_BACKEND=rocm (ROCm)"
         }
         Ds4Backend::Metal => "; Metal is built only on macOS",
         Ds4Backend::Cpu => "",
@@ -82,7 +103,7 @@ fn backend_refusal(wanted: Ds4Backend, built: Ds4Backend) -> Option<String> {
     Some(format!(
         "--{} is not available: the ds4 engine was built for {}{hint}",
         wanted.name(),
-        built.name()
+        built_label
     ))
 }
 
@@ -781,7 +802,8 @@ mod tests {
         assert_eq!(backend_named("metal"), Some(Ds4Backend::Metal));
         assert_eq!(backend_named("cuda"), Some(Ds4Backend::Cuda));
         assert_eq!(backend_named("cpu"), Some(Ds4Backend::Cpu));
-        assert_eq!(backend_named("rocm"), None);
+        assert_eq!(backend_named("rocm"), Some(Ds4Backend::Cuda));
+        assert_eq!(backend_named("vulkan"), None);
         assert_eq!(
             built_backend().is_some(),
             option_env!("DS4_BUILT_BACKEND").is_some()
@@ -798,13 +820,17 @@ mod tests {
         assert!(Cpu.runs_on(Cpu));
         assert!(!Cuda.runs_on(Metal) && !Metal.runs_on(Cuda));
         assert!(!Metal.runs_on(Cpu) && !Cuda.runs_on(Cpu));
-        assert_eq!(backend_refusal(Cpu, Cuda), None);
-        let msg = backend_refusal(Cuda, Cpu).unwrap();
+        assert_eq!(backend_refusal(Cpu, Cuda, "cuda"), None);
+        let msg = backend_refusal(Cuda, Cpu, "cpu").unwrap();
         assert!(
             msg.starts_with("--cuda is not available: the ds4 engine was built for cpu"),
             "{msg}"
         );
         assert!(msg.contains("PLANK_DS4_BACKEND=cuda"), "{msg}");
+        assert!(msg.contains("PLANK_DS4_BACKEND=rocm"), "{msg}");
+        // A ROCm core is named as such, though it opens as CUDA.
+        let msg = backend_refusal(Metal, Cuda, "rocm").unwrap();
+        assert!(msg.contains("built for rocm"), "{msg}");
     }
 
     /// Pins every field of [`Ds4EngineOptions`] to the byte offset the C

@@ -59,8 +59,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The ds4 C engine builds on Linux** (#89, step 5). With `refs/ds4`
   present, the build compiles ds4's CPU backend on Linux, or its CUDA backend
-  with `PLANK_DS4_BACKEND=cuda` (`CUDA_ARCH`, `CUDA_HOME`; not yet tested on a
-  GPU), and plank defaults to the backend that was built. A backend the core
+  with `PLANK_DS4_BACKEND=cuda` (`CUDA_ARCH`, `CUDA_HOME`) or its ROCm
+  backend with `PLANK_DS4_BACKEND=rocm` (`ROCM_ARCH`, `ROCM_PATH`; `--cuda`
+  selects it, since the C runs ROCm as its CUDA backend), neither yet tested
+  on a GPU, and plank defaults to the backend that was built. A backend the core
   was not compiled with is refused before any download or open. On the CPU
   the vision encoder and SSD streaming are skipped, since the C refuses both
   there. The 96 GB RAM floor now holds off macOS too. CI builds the CPU core
