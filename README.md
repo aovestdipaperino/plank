@@ -16,7 +16,7 @@ Plank is a fast-moving agent harness built on the [ds4](https://github.com/aoves
 
 Plank is an interactive coding agent with a Ratatui TUI, a plain terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web). The project website is [plank-agent.dev](https://plank-agent.dev).
 
-> **macOS first.** DeepSeek and Qwen inference uses the original ds4 C engine, linked via the `refs/ds4` submodule: the Metal backend on a Mac, and on Linux the CPU backend by default or, not yet tested, CUDA with `PLANK_DS4_BACKEND=cuda` or ROCm with `PLANK_DS4_BACKEND=rocm`. Either way it needs 96 GB of RAM. Gemma 4 and Flint run on plank's own Rust engine instead: Metal on a Mac, the CPU elsewhere (Gemma also on an NVIDIA GPU in a `--features cuda` build), with no C to build. Homebrew bottles are macOS only.
+> **macOS first, Linux and Windows too.** DeepSeek and Qwen inference uses the original ds4 C engine, linked via the `refs/ds4` submodule: the Metal backend on a Mac, and on Linux the CPU backend by default or, not yet tested, CUDA with `PLANK_DS4_BACKEND=cuda` or ROCm with `PLANK_DS4_BACKEND=rocm`. Either way it needs 96 GB of RAM, or as much GPU memory. On Windows it runs under WSL2. Gemma 4 and Flint run on plank's own Rust engine instead: Metal on a Mac, the CPU elsewhere (Gemma also on an NVIDIA GPU in a `--features cuda` build), with no C to build. Homebrew bottles are macOS only. [docs/PLATFORMS.md](docs/PLATFORMS.md) has the full matrix of what works where.
 
 ## Installing
 
@@ -47,7 +47,7 @@ The Linux and Windows builds are experimental ([#89](https://github.com/aovestdi
 
 ## Building
 
-Requires macOS (Apple Silicon or Intel) with the Xcode command line tools. Clone with the submodule to get the ds4 engine:
+On macOS this needs the Xcode command line tools; Linux needs a C/C++ toolchain, `make` and `cmake`; Windows needs the MSVC Rust toolchain and the Visual Studio Build Tools (see [docs/PLATFORMS.md](docs/PLATFORMS.md#building), including the CUDA and ROCm builds). Clone with the submodule to get the ds4 engine:
 
 ```sh
 git clone --recurse-submodules https://github.com/aovestdipaperino/plank
@@ -55,9 +55,9 @@ cd plank
 cargo build --release
 ```
 
-- **With `refs/ds4` present:** `crates/local-inference-engine` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg. The crate can be used on its own by other tools: its `Model`/`Session` API opens a ds4-engine model, a Gemma 4 GGUF or a Flint GGUF, chosen from the file's architecture.
+- **With `refs/ds4` present:** `crates/local-inference-engine` builds `libds4core.a`, from the Metal-backend objects on macOS and the CPU objects on Linux (`PLANK_DS4_BACKEND=cuda` or `rocm` for a GPU), and enables the `ds4_engine` cfg. The crate can be used on its own by other tools: its `Model`/`Session` API opens a ds4-engine model, a Gemma 4 GGUF or a Flint GGUF, chosen from the file's architecture.
 - **Missing submodule (or `PLANK_NO_DS4=1`):** plank still builds and runs Gemma 4 and Flint for real on its native Rust engines (`crates/gemma-engine`, candle, no C; `crates/flint-engine`, NVFP4 kernels on top of it). DeepSeek and Qwen need the submodule; without any usable engine plank falls back to the echo stub (useful for development/CI).
-- **Linux and Windows (experimental, [#89](https://github.com/aovestdipaperino/plank/issues/89)):** plank builds and its unit tests pass with the default features, minus the ds4 engine: Gemma 4 and Flint run on the CPU, and `--provider` / `--remote` work as on a Mac. `docparse` needs `cmake` on `PATH` (on Windows, the copy bundled with the Visual Studio Build Tools works). On Windows the shell tool needs a POSIX shell: plank uses `PLANK_SHELL` when set, else an `sh.exe` or `bash.exe` on `PATH`, else Git for Windows' `sh.exe`. Set `"tools": {"shell": "powershell"}` in `settings.json` to run the shell tool and `!` escapes in PowerShell instead (`pwsh` when on `PATH`, else Windows PowerShell; the model is told in its system prompt). Not yet available there: desktop notifications, clipboard images, the `--debug` console mirror and the plain-REPL line editor.
+- **Linux and Windows (experimental, [#89](https://github.com/aovestdipaperino/plank/issues/89)):** plank builds and its unit tests pass with the default features, minus the ds4 engine: Gemma 4 and Flint run on the CPU, and `--provider` / `--remote` work as on a Mac. `docparse` needs `cmake` on `PATH` (on Windows, the copy bundled with the Visual Studio Build Tools works). On Windows the shell tool needs a POSIX shell: plank uses `PLANK_SHELL` when set, else an `sh.exe` or `bash.exe` on `PATH`, else Git for Windows' `sh.exe`. Set `"tools": {"shell": "powershell"}` in `settings.json` to run the shell tool and `!` escapes in PowerShell instead (`pwsh` when on `PATH`, else Windows PowerShell; the model is told in its system prompt). Not yet available on Windows: a native ds4 engine (DeepSeek and Qwen run through WSL2). [docs/PLATFORMS.md](docs/PLATFORMS.md) lists the rest.
 - **Five model families, one build.** Gemma 4 (`gemma4-e4b`, `gemma4-12b`, `.gemma.kv` transcripts and its own `<|tool_call>` dialect) runs on the Rust engine; see [docs/GEMMA.md](docs/GEMMA.md). So does Flint (`flint`, Recursive's 40B NVFP4 mixture-of-experts, `.flint.kv` transcripts and its `<tool_call>` dialect); see [docs/FLINT.md](docs/FLINT.md). DeepSeek V4 Flash, V4.1 Flash and Qwen3.8-Flash-Next are all compiled in and told apart from the GGUF's own `general.architecture`; each has its own tool-call dialect, artifact set and transcript extension (`.ds4.kv` / `.ds41.kv` / `.qwn.kv`). Qwen was retired once, when upstream deleted its Metal kernels; upstream has since merged it properly and publishes the weights, so it is back unconditionally, addressed as the `qwen` engine with `--model qwen`.
 
 You will also need a GGUF model file for real inference; use `--model <name|path>` to pick one, either a catalog engine name (`ds4vision`, `ds41`, `qwen`, `gemma4-e4b`, `gemma4-12b`, `flint`) or a path of your own. See the `download_model.sh` script in `refs/ds4`.
@@ -90,7 +90,7 @@ Details worth knowing:
 - **Kept current.** Each engine in the `engines.json` catalog carries its own monotonic `version`; plank checks the catalog at most once a day and offers an upgrade only when an installed engine's version is behind, so a symlinked or manually placed GGUF is left alone rather than re-downloaded.
 - **Headless-safe.** With stdin not attached to a terminal there is no prompt to answer, so plank exits with instructions instead of hanging a script.
 
-Without a model (or on non-macOS platforms) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
+Without a model (or in a build with no usable engine) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
 
 ### Speculative decoding (MTP)
 
@@ -130,7 +130,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
 - **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
 - **`/install-claude-plugin`** — fetches and installs a Claude Code plugin from a GitHub repo, an `owner/repo` shorthand, a browser-copied `/tree/`/`/blob/` URL, a marketplace, a `.tar.gz`, or a local directory. It rewrites `${CLAUDE_PLUGIN_ROOT}` to the real install path and unwraps Claude Code's nested hook config, since plank's hook runner and hook reader expect neither as-is; `.mcp.json` and `settings.json` need no such translation and merge in the same way any other plugin's do.
-- **Desktop notifications & live window title** — long turns end with a persistent macOS banner (`'<prompt>' finished` and the tail of the answer; `interrupted` for aborted turns), configurable to fire `always`, only while `unfocused`, or `never`; the terminal title tracks the task (`🪵 plank - fix the bug…`).
+- **Desktop notifications & live window title** — long turns end with a desktop notification (a persistent macOS banner, `notify-send` on Linux, a toast on Windows) (`'<prompt>' finished` and the tail of the answer; `interrupted` for aborted turns), configurable to fire `always`, only while `unfocused`, or `never`; the terminal title tracks the task (`🪵 plank - fix the bug…`).
 
 See **[docs/FEATURES.md](docs/FEATURES.md)** for the complete list.
 
@@ -162,7 +162,7 @@ The `/context` command visualizes context-window usage by category:
 
 One Metal command queue means this is time-slicing, not parallelism — nothing finishes sooner overall. What changes is that the main task no longer stops. The aside takes the larger share of the thread while it runs, since it is the one you are waiting on.
 
-Long turns end with a native macOS notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon and plank's logo. `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`:
+Long turns end with a native desktop notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon (on macOS with plank's logo too; on Linux through `notify-send`, on Windows as a toast). `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`:
 
 <p align="center">
   <img src="assets/notification.png" alt="macOS desktop notification: a finished plank task with the prompt as headline and the answer tail as body" width="500">
@@ -224,7 +224,7 @@ A few keys cannot take effect until you restart, because what they configure is 
 |---|---|---|---|
 | `engine` | `model` | the catalog default (`ds4vision`) | An engine name or a path (`~` expanded). Same as `-m`/`--model`. |
 | | `threads` | engine default | Worker threads. Same as `-t`. |
-| | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. |
+| | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. The default is the ds4 engine's built backend (Metal on macOS, the CPU, CUDA or ROCm on Linux); native engines try Metal, then CUDA, then the CPU. A ROCm build is selected with `cuda`. |
 | | `power` | unset | GPU power cap percent. Same as `--power`. |
 | | `ctx` | 1048576 | Context window in tokens. Same as `-c`. |
 | | `thinkingToolCalls` | `true` | Dispatch tool calls the model emits inside its thinking block. Set `false` for strict `refs/ds4` parity. |

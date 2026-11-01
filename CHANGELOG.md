@@ -276,6 +276,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Platform docs** (#89, step 9). `docs/PLATFORMS.md` has the support matrix
+  (engines, backends, sandbox and desktop features on each OS), the build
+  requirements per OS including the CUDA and ROCm builds, the memory floor,
+  the WSL2 route for DeepSeek and Qwen on Windows, and what is not done yet.
+  The README and the crate's description no longer say macOS only.
+
 - **Notifications on Linux and Windows borrow the host terminal's identity**
   (#89, step 7), as they already did on macOS. `notify-send` gets a
   `desktop-entry` hint for kitty, GNOME Terminal, Konsole, Alacritty, Tilix,
