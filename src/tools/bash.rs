@@ -555,14 +555,19 @@ impl BashJobs {
         // When a sandbox policy applies, wrap the shell in sandbox-exec with
         // a generated Seatbelt profile (read everywhere, write only under
         // cwd/temp/configured roots). See src/sandbox.rs.
+        // The shell is `tools.shell`'s: `sh -c`, or PowerShell.
+        let shell = crate::platform::ShellDialect::active().command(cmd);
         let mut command = if let Some(sb) = sandbox {
             let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(sb.profile(ctx_cwd)).arg("/bin/sh");
+            c.arg("-p")
+                .arg(sb.profile(ctx_cwd))
+                .arg(shell.get_program())
+                .args(shell.get_args());
             c
         } else {
-            crate::platform::shell_command()
+            shell
         };
-        command.arg("-c").arg(cmd).current_dir(ctx_cwd);
+        command.current_dir(ctx_cwd);
         // Tells a GPU-bound tool that plank can unload its model on request:
         // a line in the signal file, or exit 75 plus the marker line.
         let signal = export_gpu_yield(&mut command);
@@ -1203,8 +1208,8 @@ pub fn run_immediate(
         })
     }
 
-    let mut command = crate::platform::shell_command();
-    command.arg("-c").arg(cmd).current_dir(cwd);
+    let mut command = crate::platform::ShellDialect::active().command(cmd);
+    command.current_dir(cwd);
     // The same promise the bash tool's jobs get: a `!` or `!!` that writes
     // its signal file, or exits 75 with the marker line, gets the model
     // unloaded for a second run.

@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **PowerShell as a shell dialect** (#89, step 3). `tools.shell: "powershell"`
+  runs the `bash` tool's commands and the `!`/`!!` escapes in PowerShell
+  (`pwsh` when it is on `PATH`, else Windows PowerShell 5.1) with UTF-8 output,
+  and adds a short note to the system prompt saying so, which changes the
+  prompt fingerprint and so takes effect in a new session. The default stays
+  `"posix"`, so the prompt and the C parity fixtures are unchanged. Hooks
+  always run POSIX `sh`.
+
 - **Linux and Windows builds** (#89, phases 1 and 2). plank builds, lints and
   tests on Linux and Windows with the echo stub, Gemma and Flint on the CPU;
   the ds4 C engine stays macOS-only for now. Desktop integrations (clipboard

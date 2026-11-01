@@ -746,8 +746,8 @@ fn trusted_prose(
         append_working_style(&mut out);
         out
     };
-    if gpu_suspend && profile.is_none_or(|(_, spec)| spec.builtin_enabled("bash")) {
-        append_gpu_suspend_note(&mut out, syntax);
+    if profile.is_none_or(|(_, spec)| spec.builtin_enabled("bash")) {
+        append_bash_notes(&mut out, syntax, gpu_suspend);
     }
     // The V4.1 tag respelling happens here and nowhere else: at this point
     // `out` is entirely trusted prompt text (plank's own, or the installed
@@ -820,8 +820,8 @@ fn build_qwen_tools_prompt_parts(
 
     if let Some((text, spec)) = profile {
         let mut out = compose_qwen_profile_prompt(text, spec, &foreign);
-        if gpu_suspend && spec.builtin_enabled("bash") {
-            append_gpu_suspend_note(&mut out, ToolSyntax::Qwen);
+        if spec.builtin_enabled("bash") {
+            append_bash_notes(&mut out, ToolSyntax::Qwen, gpu_suspend);
         }
         crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
         return (out, 0);
@@ -843,9 +843,7 @@ fn build_qwen_tools_prompt_parts(
     out.push_str(&prompt[at..]);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_working_style(&mut out);
-    if gpu_suspend {
-        append_gpu_suspend_note(&mut out, ToolSyntax::Qwen);
-    }
+    append_bash_notes(&mut out, ToolSyntax::Qwen, gpu_suspend);
     (out, 0)
 }
 
@@ -942,15 +940,13 @@ fn build_gemma_tools_prompt_parts(
 ) -> (String, usize) {
     let mut out = if let Some((text, spec)) = profile {
         let mut text = text.to_string();
-        if gpu_suspend && spec.builtin_enabled("bash") {
-            append_gpu_suspend_note(&mut text, ToolSyntax::Gemma);
+        if spec.builtin_enabled("bash") {
+            append_bash_notes(&mut text, ToolSyntax::Gemma, gpu_suspend);
         }
         compose_gemma_profile_prompt(&text, spec, parity)
     } else {
         let mut out = gemma_prose();
-        if gpu_suspend {
-            append_gpu_suspend_note(&mut out, ToolSyntax::Gemma);
-        }
+        append_bash_notes(&mut out, ToolSyntax::Gemma, gpu_suspend);
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -1265,8 +1261,8 @@ fn build_flint_tools_prompt_parts(
     let (mut out, builtins): (String, Vec<crate::engine::ToolSpec>) =
         if let Some((text, spec)) = profile {
             let mut text = text.to_string();
-            if gpu_suspend && spec.builtin_enabled("bash") {
-                append_gpu_suspend_note(&mut text, ToolSyntax::Flint);
+            if spec.builtin_enabled("bash") {
+                append_bash_notes(&mut text, ToolSyntax::Flint, gpu_suspend);
             }
             (
                 compose_flint_profile_prompt(&text, parity),
@@ -1276,9 +1272,7 @@ fn build_flint_tools_prompt_parts(
             )
         } else {
             let mut out = flint_prose();
-            if gpu_suspend {
-                append_gpu_suspend_note(&mut out, ToolSyntax::Flint);
-            }
+            append_bash_notes(&mut out, ToolSyntax::Flint, gpu_suspend);
             if parity {
                 if !out.ends_with('\n') {
                     out.push('\n');
@@ -1777,6 +1771,43 @@ const GPU_SUSPEND_EXAMPLE_GEMMA: &str =
 /// `<arg_key>`/`<arg_value>` pair, the dialect's own parameter form.
 const GPU_SUSPEND_EXAMPLE_FLINT: &str =
     "<arg_key>suspend_model</arg_key><arg_value>true</arg_value>\n";
+
+/// What the model is told when `tools.shell` is PowerShell: the trained
+/// prompt says `bash` runs a POSIX shell, and nothing else would correct it.
+/// Appended only then, so the default prompt (and `tests/c_parity.rs`) is
+/// untouched.
+pub const POWERSHELL_NOTE: &str = "The bash tool runs commands in PowerShell, not in a POSIX shell: write PowerShell (Get-ChildItem, Select-String, Get-Content, `$env:NAME`, `;` between statements). A command's exit status is 0 or 1 unless it ends with `exit N`; for a native program's code, end with `exit $LASTEXITCODE`.\n";
+
+/// The notes plank adds after the trained `bash` schema: [`GPU_SUSPEND_NOTE`]
+/// when `gpu_suspend`, and [`POWERSHELL_NOTE`] when `tools.shell` is
+/// PowerShell. Both are fixed for a launch, so the Tier 1 fingerprint never
+/// changes within one.
+fn append_bash_notes(out: &mut String, syntax: ToolSyntax, gpu_suspend: bool) {
+    append_bash_notes_with(
+        out,
+        syntax,
+        gpu_suspend,
+        crate::platform::ShellDialect::active(),
+    );
+}
+
+fn append_bash_notes_with(
+    out: &mut String,
+    syntax: ToolSyntax,
+    gpu_suspend: bool,
+    shell: crate::platform::ShellDialect,
+) {
+    if shell == crate::platform::ShellDialect::PowerShell {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n# Shell\n\n");
+        out.push_str(POWERSHELL_NOTE);
+    }
+    if gpu_suspend {
+        append_gpu_suspend_note(out, syntax);
+    }
+}
 
 /// Appends [`GPU_SUSPEND_NOTE`] and the call form for `syntax` under its own
 /// heading. Deterministic for a given launch: whether plank holds a
@@ -2873,6 +2904,22 @@ impl SystemPromptReminder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_powershell_note_appears_only_for_that_dialect() {
+        use crate::platform::ShellDialect;
+        let mut posix = String::from("prompt\n");
+        append_bash_notes_with(&mut posix, ToolSyntax::Dsml, false, ShellDialect::Posix);
+        assert_eq!(posix, "prompt\n");
+        let mut ps = String::from("prompt\n");
+        append_bash_notes_with(&mut ps, ToolSyntax::Dsml, true, ShellDialect::PowerShell);
+        assert!(ps.contains(POWERSHELL_NOTE), "{ps}");
+        // Shell first, then the GPU note, each under its own heading.
+        assert!(
+            ps.find("# Shell").unwrap() < ps.find("# GPU commands").unwrap(),
+            "{ps}"
+        );
+    }
     use std::time::Duration;
 
     #[test]
