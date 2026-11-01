@@ -36,6 +36,60 @@ use std::path::{Path, PathBuf};
 /// handled explicitly.
 const DOC_EXTENSIONS: &[&str] = &["pdf"];
 
+/// The file name of the `PDFium` shared library liteparse loads at runtime.
+const PDFIUM_DYLIB: &str = if cfg!(target_os = "macos") {
+    "libpdfium.dylib"
+} else if cfg!(windows) {
+    "pdfium.dll"
+} else {
+    "libpdfium.so"
+};
+
+/// Directories a packaged plank keeps `PDFium` in, given the real (symlinks
+/// resolved) executable: beside it, as the release archives ship it, or in
+/// `../lib`, as a Homebrew keg lays it out under `bin/plank`.
+#[must_use]
+pub fn pdfium_dirs(exe: &Path) -> Vec<PathBuf> {
+    exe.parent()
+        .map(|bin| {
+            let mut dirs = vec![bin.to_path_buf()];
+            if let Some(prefix) = bin.parent() {
+                dirs.push(prefix.join("lib"));
+            }
+            dirs
+        })
+        .unwrap_or_default()
+}
+
+/// Points liteparse at a `PDFium` shipped with plank, unless `PDFIUM_LIB_PATH`
+/// already names one. liteparse's own search tries the build machine's cache
+/// (baked in at compile time, absent on every other machine) and the
+/// directory of `current_exe`, which on macOS is the `bin/` symlink a
+/// Homebrew install runs through rather than the keg the library sits in.
+/// Without this, `read` on a PDF fails on any machine but the builder's.
+///
+/// # Safety
+/// Sets an environment variable, so it must run before plank starts a
+/// thread: at the top of `main`.
+pub unsafe fn locate_pdfium() {
+    if !cfg!(feature = "docparse") || std::env::var_os("PDFIUM_LIB_PATH").is_some() {
+        return;
+    }
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.canonicalize().ok())
+    else {
+        return;
+    };
+    if let Some(dir) = pdfium_dirs(&exe)
+        .into_iter()
+        .find(|d| d.join(PDFIUM_DYLIB).is_file())
+    {
+        // SAFETY: the caller guarantees no other thread is running.
+        unsafe { std::env::set_var("PDFIUM_LIB_PATH", dir) };
+    }
+}
+
 /// True when `read` should route this path through conversion.
 #[must_use]
 pub fn is_document(path: &Path) -> bool {
@@ -282,6 +336,23 @@ pub fn to_markdown(_path: &Path, display: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdfium_is_looked_for_beside_the_binary_then_in_the_keg_lib() {
+        let dirs = pdfium_dirs(Path::new("/opt/homebrew/Cellar/plank/7/bin/plank"));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("/opt/homebrew/Cellar/plank/7/bin"),
+                PathBuf::from("/opt/homebrew/Cellar/plank/7/lib"),
+            ]
+        );
+        assert!(
+            pdfium_dirs(Path::new("plank"))
+                .iter()
+                .all(|d| d.as_os_str().is_empty() || d.ends_with("lib"))
+        );
+    }
 
     /// Extension routing is case-insensitive and does not catch neighbours.
     #[test]

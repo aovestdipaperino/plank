@@ -179,6 +179,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`read` on a PDF outside the build machine** (#89, step 6). liteparse
+  loads PDFium at runtime and looks only in the builder's download cache and
+  beside `current_exe`, so a released binary could not find it. plank now
+  points `PDFIUM_LIB_PATH` at a PDFium shipped beside the real binary or in
+  `../lib` (a Homebrew keg), unless the variable is already set. The release
+  archives must ship the library for this to find it.
+- **`--debug` reaches the console on Windows** (#89, step 6). The stand-in for
+  the Unix-only `turbo-debug-client` now speaks its protocol: a shared,
+  non-blocking lock probe of `tdk.lock` and the TCP handshake.
+
 - **`glob` on Windows** (#89, step 3) accepts `\` as a separator, matches
   names case-insensitively as the filesystem does, and checks containment
   with the case- and prefix-insensitive comparison the write tools use.
