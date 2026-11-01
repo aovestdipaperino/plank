@@ -68,6 +68,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   there. The 96 GB RAM floor now holds off macOS too. CI builds the CPU core
   on Linux and checks the FFI layout pins against it.
 
+- **`--gpu-vram` / `--gpu-devices` place the ds4 engine's layers across GPUs**
+  (#89, step 5), as `ds4-agent` does, on a CUDA or ROCm build: `auto` uses the
+  free VRAM, `N[,N...]` gives per-device budgets in GiB, and `0` runs on the
+  CPU. The 96 GB floor now also counts the GPUs' total VRAM (`nvidia-smi`,
+  `rocm-smi`). When RAM is short but the GPUs hold the model, plank places the
+  layers with `--gpu-vram auto` instead of refusing, and the engine menu no
+  longer greys DeepSeek out on such a machine.
+
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
   Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the

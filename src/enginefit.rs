@@ -2,7 +2,8 @@
 //!
 //! Pure: RAM, free disk, the build's engines and file existence are all passed
 //! in, so every rule is tested without a machine. The menu (`enginepick`) and
-//! the launch gate (`require_min_ram` in `main.rs`) read the same constants, so
+//! the launch gate (`require_min_ram` in `main.rs`, through
+//! [`ds4_memory_verdict`]) read the same constants, so
 //! the menu never offers a model the load would then refuse.
 
 use std::path::{Path, PathBuf};
@@ -73,6 +74,9 @@ pub struct Machine {
     /// The largest buffer the Metal device makes, when known (Flint builds on
     /// a Mac with a device only). A model file larger than this cannot run.
     pub metal_max_buffer: Option<u64>,
+    /// The total VRAM of the GPUs a CUDA or `ROCm` ds4 core can place layers on
+    /// ([`gpu_memory_total`]), when there are any.
+    pub gpu_memory: Option<u64>,
 }
 
 /// This machine, with downloads landing under `root`.
@@ -83,7 +87,106 @@ pub fn machine(root: &Path) -> Machine {
         free_disk: free_bytes(root),
         caps: BuildCaps::current(),
         metal_max_buffer: metal_max_buffer(),
+        gpu_memory: gpu_memory_total(),
     }
+}
+
+/// What the ds4 launch does about memory ([`ds4_memory_verdict`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ds4Memory {
+    /// Open as asked: RAM meets [`MIN_RAM_BYTES`], RAM is unknown, or
+    /// `--gpu-vram`/`--gpu-devices` asked for a placement the C will judge.
+    Open,
+    /// RAM is short but the GPUs together hold the floor: place the layers
+    /// on them, as `--gpu-vram auto` does.
+    PlaceOnGpus,
+    /// Neither RAM nor VRAM is enough, for this reason.
+    Refuse(String),
+}
+
+/// Whether a ds4 model can open here. `gpu_memory` counts only on a core
+/// that can place layers on GPUs; on unified memory (DGX Spark, Strix Halo)
+/// the RAM figure already holds what the GPU can use.
+#[must_use]
+pub fn ds4_memory_verdict(
+    ram: Option<u64>,
+    gpu_memory: Option<u64>,
+    placement_requested: bool,
+) -> Ds4Memory {
+    if placement_requested || ram.is_none_or(|r| r >= MIN_RAM_BYTES) {
+        return Ds4Memory::Open;
+    }
+    if gpu_memory.is_some_and(|g| g >= MIN_RAM_BYTES) {
+        return Ds4Memory::PlaceOnGpus;
+    }
+    let have = ram.map_or(0, have_gb);
+    let gpus = gpu_memory.map_or_else(String::new, |g| {
+        format!(" and {} GB of GPU memory", have_gb(g))
+    });
+    Ds4Memory::Refuse(format!(
+        "plank needs at least 96 GB of RAM (or of GPU memory) to run DeepSeek V4 Flash; \
+         this machine has {have} GB of RAM{gpus}"
+    ))
+}
+
+/// The summed VRAM of this machine's GPUs, when the ds4 core can place
+/// layers on them (a CUDA or `ROCm` build): `nvidia-smi`, or `rocm-smi` on a
+/// `ROCm` core. Probed once per process, since each is a subprocess.
+#[must_use]
+pub fn gpu_memory_total() -> Option<u64> {
+    static CACHE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let built = crate::ffi::built_backend()?;
+        if built != crate::ffi::Ds4Backend::Cuda {
+            return None;
+        }
+        let rocm = built.label() == "rocm";
+        let (tool, args): (&str, &[&str]) = if rocm {
+            ("rocm-smi", &["--showmeminfo", "vram", "--csv"])
+        } else {
+            (
+                "nvidia-smi",
+                &["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            )
+        };
+        let out = std::process::Command::new(tool).args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        if rocm {
+            parse_rocm_smi_total(&text)
+        } else {
+            parse_nvidia_smi_total(&text)
+        }
+    })
+}
+
+/// Sums `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`:
+/// one MiB figure per GPU. A unified-memory GPU (GB10) reports `[N/A]`,
+/// which is skipped; `None` when no line parses.
+#[must_use]
+pub fn parse_nvidia_smi_total(text: &str) -> Option<u64> {
+    let mibs: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
+    (!mibs.is_empty()).then(|| mibs.iter().map(|m| m * 1024 * 1024).sum())
+}
+
+/// Sums the `VRAM Total Memory (B)` column of `rocm-smi --showmeminfo vram
+/// --csv`; `None` when there is no such column or no row parses.
+#[must_use]
+pub fn parse_rocm_smi_total(text: &str) -> Option<u64> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.find(|l| l.contains("VRAM Total Memory (B)"))?;
+    let col = header
+        .split(',')
+        .position(|h| h.trim() == "VRAM Total Memory (B)")?;
+    let bytes: Vec<u64> = lines
+        .filter_map(|l| l.split(',').nth(col)?.trim().parse().ok())
+        .collect();
+    (!bytes.is_empty()).then(|| bytes.iter().sum())
 }
 
 /// `MTLDevice::maxBufferLength`, probed at most once per process: opening a
@@ -315,6 +418,9 @@ fn fit_of(
                     / crate::download::SSD_STREAMING_RAM_PERCENT
                     * 100
             })
+        } else if m.gpu_memory.is_some_and(|g| g >= MIN_RAM_BYTES) {
+            // The launch places the layers on the GPUs (`ds4_memory_verdict`).
+            None
         } else {
             Some(MIN_RAM_BYTES)
         };
@@ -407,6 +513,7 @@ mod tests {
                 flint: true,
             },
             metal_max_buffer: None,
+            gpu_memory: None,
         }
     }
 
@@ -590,6 +697,59 @@ mod tests {
             }
         );
         assert!(row(&rows, "gemma4-e4b").selectable());
+    }
+
+    #[test]
+    fn deepseek_below_the_ram_floor_runs_when_the_gpus_hold_it() {
+        let mut m = machine(Some(64), Some(500));
+        m.gpu_memory = Some(4 * 48 * GIB);
+        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None, &no_staged);
+        assert!(row(&rows, "ds4vision").selectable());
+        m.gpu_memory = Some(24 * GIB);
+        let rows = evaluate(Path::new("/r"), &catalog(), &m, &none, None, &no_staged);
+        assert!(!row(&rows, "ds4vision").selectable());
+    }
+
+    #[test]
+    fn the_ds4_launch_places_on_gpus_only_when_ram_is_short() {
+        let (r64, r128) = (Some(64 * GIB), Some(128 * GIB));
+        let gpus = Some(192 * GIB);
+        assert_eq!(ds4_memory_verdict(r128, None, false), Ds4Memory::Open);
+        assert_eq!(ds4_memory_verdict(None, None, false), Ds4Memory::Open);
+        assert_eq!(ds4_memory_verdict(r128, gpus, false), Ds4Memory::Open);
+        assert_eq!(ds4_memory_verdict(r64, gpus, false), Ds4Memory::PlaceOnGpus);
+        // An explicit placement is the C's to judge.
+        assert_eq!(ds4_memory_verdict(r64, None, true), Ds4Memory::Open);
+        let Ds4Memory::Refuse(msg) = ds4_memory_verdict(r64, Some(24 * GIB), false) else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            msg.ends_with("this machine has 64 GB of RAM and 24 GB of GPU memory"),
+            "{msg}"
+        );
+        let Ds4Memory::Refuse(msg) = ds4_memory_verdict(r64, None, false) else {
+            panic!("expected a refusal");
+        };
+        assert!(msg.ends_with("this machine has 64 GB of RAM"), "{msg}");
+    }
+
+    #[test]
+    fn nvidia_smi_totals_sum_and_skip_unified_memory() {
+        assert_eq!(
+            parse_nvidia_smi_total("49140\n49140\n"),
+            Some(2 * 49140 * 1024 * 1024)
+        );
+        assert_eq!(parse_nvidia_smi_total("[N/A]\n"), None);
+        assert_eq!(parse_nvidia_smi_total(""), None);
+    }
+
+    #[test]
+    fn rocm_smi_totals_read_the_vram_total_column() {
+        let csv = "device,VRAM Total Memory (B),VRAM Total Used Memory (B)\n\
+                   card0,103079215104,1048576\n\
+                   card1,1000,0\n";
+        assert_eq!(parse_rocm_smi_total(csv), Some(103_079_215_104 + 1000));
+        assert_eq!(parse_rocm_smi_total("device,GTT\ncard0,5\n"), None);
     }
 
     #[test]

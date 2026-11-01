@@ -400,9 +400,52 @@ pub struct EngineTuning {
     /// Whether `--dir-steering-from` was given, so an engine entry's own
     /// `from` does not override the command line.
     pub dir_steering_from_explicit: bool,
+    /// `--gpu-vram auto|0|N[,N...]`: per-device VRAM budgets in GiB for the
+    /// ds4 engine's multi-GPU layer placement, as `ds4-agent` takes it
+    /// (`ffi::gpu_placement`). `0` runs on the CPU.
+    pub gpu_vram: Option<String>,
+    /// `--gpu-devices N[,N...]`: the CUDA devices that placement uses; alone
+    /// it implies `--gpu-vram auto`.
+    pub gpu_devices: Option<String>,
 }
 
 impl EngineTuning {
+    /// Whether `--gpu-vram` or `--gpu-devices` asked for multi-GPU placement.
+    #[must_use]
+    pub fn gpu_placement_requested(&self) -> bool {
+        self.gpu_vram.is_some() || self.gpu_devices.is_some()
+    }
+
+    /// The ds4 backend `--gpu-vram`/`--gpu-devices` imply, as `ds4-agent`
+    /// sets it: the CPU for `--gpu-vram 0`, else CUDA (a `ROCm` core opens as
+    /// CUDA too). `choice` is `--metal`/`--cuda`/`--cpu` or `engine.backend`;
+    /// `None` without placement, so the caller keeps its own default.
+    ///
+    /// # Errors
+    /// When `choice` names a different backend than the placement needs.
+    pub fn placement_backend(&self, choice: Option<Backend>) -> Result<Option<Backend>, String> {
+        if !self.gpu_placement_requested() {
+            return Ok(choice);
+        }
+        let implied = if self.gpu_vram.as_deref() == Some("0") {
+            Backend::Cpu
+        } else {
+            Backend::Cuda
+        };
+        match choice {
+            Some(b) if b != implied => Err(format!(
+                "--gpu-vram/--gpu-devices {} conflict with the {} backend",
+                if implied == Backend::Cpu {
+                    "0 runs on the CPU and so"
+                } else {
+                    "place layers on CUDA GPUs and so"
+                },
+                format!("{b:?}").to_lowercase()
+            )),
+            _ => Ok(Some(implied)),
+        }
+    }
+
     /// The same tuning with a plank-chosen `DSpark` companion removed, when
     /// there is one to remove.
     ///
@@ -458,6 +501,8 @@ impl Default for EngineTuning {
             dir_steering_ffn: 0.0,
             dir_steering_from_user: true,
             dir_steering_from_explicit: false,
+            gpu_vram: None,
+            gpu_devices: None,
         }
     }
 }
@@ -702,6 +747,10 @@ Options:
       --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
       --ssd-streaming-preload-experts N       preload N experts at startup
       --simulate-used-memory <N>GB  pretend N GiB of memory is already used
+      --gpu-vram auto|0|N[,N...]    ds4 on CUDA/ROCm: place layers across GPUs
+                                    with these per-device budgets in GiB, or
+                                    the free VRAM (auto); 0 = the CPU
+      --gpu-devices N[,N...]        GPUs used by that placement (implies auto)
       --dir-steering NAME           steer along direction NAME, stored for this
                                     model in ~/.plank/models/vectors.json
                                     (`pt vectorize -n NAME`); positive scales
@@ -1526,6 +1575,8 @@ fn parse_engine_option(
             e.simulate_used_memory_bytes = parse_gib_arg(v)
                 .ok_or_else(|| format!("{arg} must be a positive GiB value, e.g. 64GB: {v}"))?;
         }
+        "--gpu-vram" => e.gpu_vram = Some(v.to_string()),
+        "--gpu-devices" => e.gpu_devices = Some(v.to_string()),
         "--dir-steering" => {
             if v.trim().is_empty() {
                 return Err("--dir-steering needs a direction name".to_string());
@@ -1849,6 +1900,8 @@ pub fn parse_options_with(
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
+            | "--gpu-vram"
+            | "--gpu-devices"
             | "--dir-steering"
             | "--dir-steering-file"
             | "--dir-steering-ffn"
@@ -3115,6 +3168,38 @@ mod tests {
         assert!(err.contains("vectors.json"), "{err}");
         let err = parse_options(&args(&["--dir-steering", " "])).unwrap_err();
         assert!(err.contains("direction name"), "{err}");
+    }
+
+    #[test]
+    fn gpu_vram_and_devices_are_kept_for_the_c_parser() {
+        let c = parse_options(&args(&["--gpu-vram", "40,12", "--gpu-devices", "1,0"])).unwrap();
+        assert_eq!(c.engine.gpu_vram.as_deref(), Some("40,12"));
+        assert_eq!(c.engine.gpu_devices.as_deref(), Some("1,0"));
+        assert!(c.engine.gpu_placement_requested());
+        assert!(!parse_options(&[]).unwrap().engine.gpu_placement_requested());
+    }
+
+    #[test]
+    fn gpu_placement_implies_cuda_or_the_cpu_and_refuses_another_backend() {
+        let auto = parse_options(&args(&["--gpu-vram", "auto"]))
+            .unwrap()
+            .engine;
+        assert_eq!(auto.placement_backend(None), Ok(Some(Backend::Cuda)));
+        assert_eq!(
+            auto.placement_backend(Some(Backend::Cuda)),
+            Ok(Some(Backend::Cuda))
+        );
+        let err = auto.placement_backend(Some(Backend::Cpu)).unwrap_err();
+        assert!(err.contains("conflict with the cpu backend"), "{err}");
+        let zero = parse_options(&args(&["--gpu-vram", "0"])).unwrap().engine;
+        assert_eq!(zero.placement_backend(None), Ok(Some(Backend::Cpu)));
+        assert!(zero.placement_backend(Some(Backend::Metal)).is_err());
+        let none = EngineTuning::default();
+        assert_eq!(
+            none.placement_backend(Some(Backend::Metal)),
+            Ok(Some(Backend::Metal))
+        );
+        assert_eq!(none.placement_backend(None), Ok(None));
     }
 
     #[test]
