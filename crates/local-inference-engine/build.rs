@@ -27,6 +27,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ds4_engine)");
+    println!("cargo:rustc-check-cfg=cfg(ds4_multi_gpu)");
     println!("cargo:rerun-if-env-changed=DS4_SRC");
     println!("cargo:rerun-if-env-changed=PLANK_NO_DS4");
     println!("cargo:rerun-if-env-changed=PLANK_DS4_BACKEND");
@@ -85,6 +86,9 @@ fn main() {
     emit_links(&ds4, backend);
     println!("cargo:rustc-env=DS4_BUILT_BACKEND={}", backend.name());
     println!("cargo:rustc-cfg=ds4_engine");
+    if backend.multi_gpu() {
+        println!("cargo:rustc-cfg=ds4_multi_gpu");
+    }
     println!("cargo:engine=1");
     println!("cargo:backend={}", backend.name());
     for f in [
@@ -105,6 +109,7 @@ fn main() {
         "ds4_engram.h",
         "ds4_web.c",
         "ds4_web.h",
+        "ds4_gpu_args.c",
     ] {
         println!("cargo:rerun-if-changed={}", ds4.join(f).display());
     }
@@ -132,6 +137,14 @@ impl Backend {
             Self::Cuda => "cuda",
             Self::Rocm => "rocm",
         }
+    }
+
+    /// Whether the core places layers across GPUs: `ds4_gpu_args.o` (the
+    /// `--gpu-vram`/`--gpu-devices` parser) is linked, and its `auto` probe
+    /// is defined by `ds4_cuda.o` or `ds4_rocm_compat.o`. A Metal or CPU core
+    /// leaves it out, since the parser would reference that probe anyway.
+    fn multi_gpu(self) -> bool {
+        matches!(self, Self::Cuda | Self::Rocm)
     }
 
     /// The objects of the ds4 Makefile's `CORE_OBJS` (`CPU_CORE_OBJS` for the
@@ -176,6 +189,9 @@ impl Backend {
             "ds4_engram.o",
             "ds4_web.o",
         ]);
+        if self.multi_gpu() {
+            objs.push("ds4_gpu_args.o");
+        }
         objs
     }
 }

@@ -4123,3 +4123,36 @@ script keeps `.plank-backend.o` in the ds4 tree (the `.o` suffix puts it under
 the submodule's `*.o` ignore rule) and deletes those two objects when it names
 another backend. Recompiling `ds4.o` unconditionally is not an option: it is
 ~88k lines at `-O3`.
+
+## ds4 on discrete GPUs: placement is opt-in, and the RAM floor counted only RAM
+
+A plain `ds4_engine_open` on CUDA never spreads layers over several GPUs.
+That takes `ds4_engine_create_with_gpu_config` with a `ds4_gpu_config` (devices
+plus a byte budget each), which the C front ends fill from `--gpu-vram` and
+`--gpu-devices` through `parse_gpu_vram_arg` (`ds4_gpu_args.c`). plank takes the
+same two flags and calls the same parser (`ffi::gpu_placement`), so `auto`, `0`
+and the CSV budgets mean exactly what they mean to `ds4-agent`, and like the C
+it forces CUDA for a placement and the CPU for `0`
+(`EngineTuning::placement_backend`).
+
+`ds4_gpu_args.o` is linked only into CUDA and ROCm cores (cfg `ds4_multi_gpu`
+inside the engine crate): it is built without `DS4_NO_GPU`, so its `auto` branch
+references `ds4_gpu_args_probe_auto_cuda`, which only `ds4_cuda.o` and
+`ds4_rocm_compat.o` define. A CPU core that linked it would fail to link as soon
+as plank called the parser.
+
+The 96 GB floor read only host RAM, which refused exactly the machines
+multi-GPU placement is for (four 48 GB L40S cards in a 64 GB host).
+`enginefit::ds4_memory_verdict` now also accepts the GPUs' summed VRAM
+(`nvidia-smi --query-gpu=memory.total`, or `rocm-smi --showmeminfo vram --csv`
+on a ROCm core), and when RAM is short but VRAM is not, the launch places
+layers with `--gpu-vram auto` instead of refusing. An explicit placement skips
+the floor: the C refuses a layout that would need unsupported CPU execution.
+Unified-memory GPUs need no special case. GB10 reports `[N/A]` to the
+`nvidia-smi` query (skipped), and its RAM figure already counts what the GPU can
+use. SSD streaming is not auto-enabled under a placement, because host RAM is
+not what holds the layers.
+
+`ds4_engine_close` runs `ds4_gpu_cleanup`, which resets `g_n_gpus`, so the GPU
+yield's close-and-reopen gets a clean multi-GPU state. The reopen passes the
+same `EngineTuning`, placement included.

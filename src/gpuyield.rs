@@ -12,7 +12,9 @@
 //! it survives pipes, `2>&1` and `| tail`, which replace the exit status), or
 //! by exiting with [`EXIT_CODE`] and printing a line starting with [`MARKER`].
 //! When a foreground bash call or a shell escape ends either way, the agent saves the
-//! live KV, drops the engine (which frees the Metal state and the model lock),
+//! live KV, drops the engine (which frees the GPU state and the model lock: the
+//! Metal device, or on CUDA and `ROCm` every device the layers were placed on,
+//! since `ds4_engine_close` runs `ds4_gpu_cleanup`),
 //! runs the command once more, reopens the model with its startup parameters
 //! and restores the KV (`docs/ARCHITECTURE.md`, "GPU yield").
 //!

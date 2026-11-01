@@ -465,6 +465,34 @@ fn wants_empty_system(model_name: &str, trusted: &str) -> bool {
             == crate::sysprompt::ToolSyntax::Dsml41
 }
 
+/// Opens the engine, through `ds4_engine_create_with_gpu_config` when
+/// `--gpu-vram`/`--gpu-devices` asked for multi-GPU placement (after printing
+/// the C's layout line, as `ds4-agent` does), else `ds4_engine_open`.
+///
+/// # Errors
+/// When the GPU options do not parse, or this core cannot place layers.
+fn open_engine(
+    engine: &mut *mut ffi::Ds4Engine,
+    opts: &ffi::Ds4EngineOptions,
+    tuning: &crate::config::EngineTuning,
+) -> Result<i32, EngineError> {
+    if tuning.gpu_placement_requested() {
+        let placement =
+            ffi::gpu_placement(tuning.gpu_vram.as_deref(), tuning.gpu_devices.as_deref())
+                .map_err(EngineError::new)?;
+        if let ffi::GpuPlacement::Gpus { config, layout } = placement {
+            if !layout.is_empty() {
+                eprintln!("plank: {layout}");
+            }
+            // SAFETY: opts, its CStrings and config outlive the call; engine
+            // is a valid out-pointer.
+            return Ok(unsafe { ffi::ds4_engine_open_on_gpus(engine, opts, &config) });
+        }
+    }
+    // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
+    Ok(unsafe { ffi::ds4_engine_open(engine, opts) })
+}
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -579,8 +607,7 @@ impl Ds4Model {
             tp: ffi::Ds4TpOptions::default(),
         };
         let mut engine: *mut ffi::Ds4Engine = std::ptr::null_mut();
-        // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
-        let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
+        let rc = open_engine(&mut engine, &opts, tuning)?;
         if rc != 0 || engine.is_null() {
             // Everything the message can establish without the engine lives in
             // `gguf`, which is always compiled and so CI-tested; this side

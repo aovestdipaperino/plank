@@ -462,8 +462,9 @@ pub fn ensure_side_artifacts(
     // A checkpoint too large to hold resident is streamed from SSD rather than
     // failing to open; decided before the companion resolution below, which it
     // does not depend on. It needs the context size, which is why this function
-    // takes one.
-    if !cpu {
+    // takes one. Not under multi-GPU placement: the layers live in VRAM, so
+    // host RAM is not what has to hold them.
+    if !cpu && !engine.gpu_placement_requested() {
         auto_enable_ssd_streaming(model_path, ctx, engine);
     }
     // The streaming decision is final here — nothing below touches it — so
