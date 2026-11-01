@@ -4,9 +4,12 @@
 //! Builds the ds4 C engine from source on macOS and Linux.
 //!
 //! Produces `libds4core.a` from the ds4 Makefile's objects: the Metal backend
-//! on macOS (linking Foundation and Metal), the CPU backend on Linux, or with
+//! on macOS (linking Foundation and Metal), the CPU backend on Linux, with
 //! `PLANK_DS4_BACKEND=cuda` the CUDA backend (`CUDA_ARCH`, default `native`,
-//! and `CUDA_HOME` as the Makefile reads them). The sources come from
+//! and `CUDA_HOME` as the Makefile reads them), or with
+//! `PLANK_DS4_BACKEND=rocm` the `ROCm` backend (`ROCM_ARCH`, the Makefile's
+//! default `gfx1151` when unset, and `ROCM_PATH`, default `/opt/rocm`). The
+//! sources come from
 //! `DS4_SRC` when set, else from plank's `refs/ds4` submodule two directories
 //! up. On other platforms, when the sources are missing, or with
 //! `PLANK_NO_DS4` set, nothing is compiled:
@@ -29,6 +32,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PLANK_DS4_BACKEND");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=ROCM_ARCH");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=HIPCC");
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if os != "macos" && os != "linux" {
         return;
@@ -55,22 +61,15 @@ fn main() {
         match std::env::var("PLANK_DS4_BACKEND").as_deref() {
             Ok("" | "cpu") | Err(_) => Backend::Cpu,
             Ok("cuda") => Backend::Cuda,
-            Ok(other) => panic!("PLANK_DS4_BACKEND={other}: expected cpu or cuda"),
+            Ok("rocm") => Backend::Rocm,
+            Ok(other) => panic!("PLANK_DS4_BACKEND={other}: expected cpu, cuda or rocm"),
         }
     };
-    let objs = backend.objects();
-    let mut make = Command::new("make");
-    make.arg("-C").arg(&ds4);
-    if backend == Backend::Cuda {
-        // The Makefile refuses an empty arch; `native` targets the GPU in
-        // this machine, as `make cuda-generic` does.
-        let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
-        make.arg(format!("CUDA_ARCH={arch}"));
-    }
-    let status = make.args(&objs).status().expect("failed to run make");
-    assert!(status.success(), "ds4 engine build failed");
-
     let out_dir = std::env::var("OUT_DIR").unwrap();
+    forget_other_backend_objects(&ds4, backend);
+    let objs = backend.objects();
+    run_make(&ds4, backend, &objs, &out_dir);
+
     let lib = Path::new(&out_dir).join("libds4core.a");
     let _ = std::fs::remove_file(&lib);
     let status = Command::new("ar")
@@ -83,27 +82,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=ds4core");
-    match backend {
-        Backend::Metal => {
-            let metal = ds4.join("metal");
-            println!("cargo:rustc-env=DS4_METAL_DIR={}", metal.display());
-            println!("cargo:rustc-link-lib=framework=Foundation");
-            println!("cargo:rustc-link-lib=framework=Metal");
-            println!("cargo:metal_dir={}", metal.display());
-        }
-        Backend::Cpu => {
-            println!("cargo:rustc-link-lib=m");
-        }
-        Backend::Cuda => {
-            let home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
-            for dir in ["lib64", "targets/sbsa-linux/lib"] {
-                println!("cargo:rustc-link-search=native={home}/{dir}");
-            }
-            for lib in ["cudart", "cublas", "stdc++", "m"] {
-                println!("cargo:rustc-link-lib={lib}");
-            }
-        }
-    }
+    emit_links(&ds4, backend);
     println!("cargo:rustc-env=DS4_BUILT_BACKEND={}", backend.name());
     println!("cargo:rustc-cfg=ds4_engine");
     println!("cargo:engine=1");
@@ -116,6 +95,8 @@ fn main() {
         "ds4_image.h",
         "ds4_metal.m",
         "ds4_cuda.cu",
+        "ds4_rocm.cu",
+        "ds4_rocm_compat.cu",
         "ds4_ssd.c",
         "ds4_distributed.c",
         "ds4_tp.c",
@@ -138,6 +119,9 @@ enum Backend {
     Cpu,
     /// Linux with the CUDA toolkit (`PLANK_DS4_BACKEND=cuda`).
     Cuda,
+    /// Linux with `ROCm` (`PLANK_DS4_BACKEND=rocm`). The C runs it as its CUDA
+    /// backend, so it opens with `DS4_BACKEND_CUDA`.
+    Rocm,
 }
 
 impl Backend {
@@ -146,6 +130,7 @@ impl Backend {
             Self::Metal => "metal",
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
+            Self::Rocm => "rocm",
         }
     }
 
@@ -168,6 +153,19 @@ impl Backend {
                 "cuda/mmq/mmvq.o",
                 "cuda/mmq/ds4_repack.o",
             ],
+            // `make strix-halo`'s `CORE_OBJS`.
+            Self::Rocm => vec![
+                "ds4.o",
+                "ds4_rocm.o",
+                "ds4_rocm_compat.o",
+                "ds4_rocm_unavailable.o",
+                "cuda/mmq/ds4_ggml_stubs.rocm.o",
+                "cuda/mmq/ds4_mmq.rocm.o",
+                "cuda/mmq/quantize.rocm.o",
+                "cuda/mmq/mmid.rocm.o",
+                "cuda/mmq/mmvq.rocm.o",
+                "cuda/mmq/d2r_stubs.rocm.o",
+            ],
         };
         objs.extend([
             "ds4_image.o",
@@ -180,6 +178,87 @@ impl Backend {
         ]);
         objs
     }
+}
+
+/// Builds `objs` in the ds4 tree with the Makefile's rules for `backend`.
+fn run_make(ds4: &Path, backend: Backend, objs: &[&str], out_dir: &str) {
+    let mut make = Command::new("make");
+    make.arg("-C").arg(ds4);
+    match backend {
+        Backend::Cuda => {
+            // The Makefile refuses an empty arch; `native` targets the GPU in
+            // this machine, as `make cuda-generic` does.
+            let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
+            make.arg(format!("CUDA_ARCH={arch}"));
+        }
+        Backend::Rocm => {
+            // `make strix-halo` passes the host objects these flags on a
+            // recursive make; appending them after the Makefile's own
+            // `CFLAGS` keeps its defaults, which a command-line `CFLAGS=`
+            // would replace.
+            let mk = Path::new(out_dir).join("ds4-rocm.mk");
+            std::fs::write(
+                &mk,
+                "include Makefile\nCFLAGS += $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD\n",
+            )
+            .expect("failed to write the ROCm makefile");
+            make.arg("-f").arg(&mk);
+        }
+        Backend::Metal | Backend::Cpu => {}
+    }
+    let status = make.args(objs).status().expect("failed to run make");
+    assert!(status.success(), "ds4 engine build failed");
+}
+
+/// Links the backend's system libraries, and on macOS exports the Metal
+/// kernel directory.
+fn emit_links(ds4: &Path, backend: Backend) {
+    match backend {
+        Backend::Metal => {
+            let metal = ds4.join("metal");
+            println!("cargo:rustc-env=DS4_METAL_DIR={}", metal.display());
+            println!("cargo:rustc-link-lib=framework=Foundation");
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:metal_dir={}", metal.display());
+        }
+        Backend::Cpu => {
+            println!("cargo:rustc-link-lib=m");
+        }
+        Backend::Cuda => {
+            let home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+            for dir in ["lib64", "targets/sbsa-linux/lib"] {
+                println!("cargo:rustc-link-search=native={home}/{dir}");
+            }
+            for lib in ["cudart", "cublas", "stdc++", "m"] {
+                println!("cargo:rustc-link-lib={lib}");
+            }
+        }
+        Backend::Rocm => {
+            // hipcc links amdhip64 on its own; plain cc needs it named.
+            let home = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+            println!("cargo:rustc-link-search=native={home}/lib");
+            for lib in ["amdhip64", "hipblas", "hipblaslt", "rocblas", "stdc++", "m"] {
+                println!("cargo:rustc-link-lib={lib}");
+            }
+        }
+    }
+}
+
+/// The objects in the ds4 tree compile differently per backend: `ds4.o`
+/// (CUDA, or `ROCm` with `DS4_ROCM_BUILD`) and `ds4_tp.o` (which also reads
+/// `DS4_ROCM_BUILD`). make sees no flags, only timestamps, so after a switch
+/// it would link the other backend's copies. A stamp beside them records the
+/// backend they were last built for; when it differs they are deleted. The
+/// stamp ends in `.o` so the tree's `*.o` ignore rule covers it.
+fn forget_other_backend_objects(ds4: &Path, backend: Backend) {
+    let stamp = ds4.join(".plank-backend.o");
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s == backend.name()) {
+        return;
+    }
+    for obj in ["ds4.o", "ds4_tp.o"] {
+        let _ = std::fs::remove_file(ds4.join(obj));
+    }
+    std::fs::write(&stamp, backend.name()).expect("failed to write the backend stamp");
 }
 
 /// `DS4_SRC`, else `refs/ds4` in the plank checkout this crate lives in.

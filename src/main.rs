@@ -1656,7 +1656,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         eprintln!(
             "plank: model ready: {} ({}){}",
             engine.model_name(),
-            backend.name(),
+            backend.label(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
@@ -2045,7 +2045,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         eprintln!(
             "plank: shared model ready: {} ({}){}",
             model.model_name(),
-            backend.name(),
+            backend.label(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))

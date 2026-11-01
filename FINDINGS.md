@@ -4095,3 +4095,31 @@ dim the ds4 engines. It now falls back to `platform::physical_memory`.
 The `ffi.rs` offset pins were recorded on arm64 macOS; on x86-64 Linux
 `gcc`'s `offsetof` gives the same values (`ds4_engine_options` 280 bytes,
 `tp` at 216, `ds4_vision_embedding` 72, `ds4_vision_span` 80), as LP64 on both.
+
+## The ds4 ROCm core opens as CUDA, and shares objects with the CUDA build
+
+ds4 has no `DS4_BACKEND_ROCM`: `make strix-halo` compiles the host sources with
+`-DDS4_ROCM_BUILD` and links `ds4_rocm.o` where the CUDA build links
+`ds4_cuda.o`, and the C's own `--rocm` flag sets `DS4_BACKEND_CUDA`. So a
+`PLANK_DS4_BACKEND=rocm` core reports `Ds4Backend::Cuda` from
+`ffi::built_backend`, `--cuda` is the flag that selects it, and only
+`Ds4Backend::label` (the ready line, the refusal message) says `rocm`. On that
+core Qwen's GPU path is compiled out (`DS4_HAS_QWEN4_GPU` excludes
+`DS4_ROCM_BUILD`).
+
+The Makefile sets those host flags by re-invoking itself with
+`CFLAGS="$(CFLAGS) ..."`. From outside, a command-line `CFLAGS=` would replace
+the Makefile's defaults *and* its later `CFLAGS +=` line (command-line values
+override makefile assignments), so the build script runs make with a two-line
+wrapper (`include Makefile` then `CFLAGS += $(ROCM_HOST_CFLAGS)
+-DDS4_ROCM_BUILD`) given by `-f`. `--eval` does not work: it runs before the
+Makefile is read, so its `CFLAGS ?=` default is then skipped.
+
+The objects live in the source tree, and make compares timestamps, not flags:
+`ds4.o` (CUDA vs ROCm) and `ds4_tp.o` (which reads `DS4_ROCM_BUILD`) are the
+same filenames with different contents per backend. After switching
+`PLANK_DS4_BACKEND`, make would link the previous backend's copies. The build
+script keeps `.plank-backend.o` in the ds4 tree (the `.o` suffix puts it under
+the submodule's `*.o` ignore rule) and deletes those two objects when it names
+another backend. Recompiling `ds4.o` unconditionally is not an option: it is
+~88k lines at `-O3`.
