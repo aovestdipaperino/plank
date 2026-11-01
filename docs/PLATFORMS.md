@@ -60,6 +60,23 @@ Clone with `--recurse-submodules`.
 
 `PLANK_NO_DS4=1` skips the ds4 engine on any OS.
 
+### `cargo install`
+
+plank is not on crates.io, but `cargo install` builds it from the repository.
+Cargo checks out the submodules of a git source, `refs/ds4` included, so this
+builds the ds4 engine as a checkout would: Metal on macOS, the CPU on Linux,
+and nothing on Windows.
+
+```sh
+cargo install --locked --git https://github.com/aovestdipaperino/plank plank
+# ds4 on an NVIDIA GPU (Linux):
+PLANK_DS4_BACKEND=cuda cargo install --locked --git https://github.com/aovestdipaperino/plank plank
+# Gemma on an NVIDIA GPU (Linux, Windows):
+cargo install --locked --git https://github.com/aovestdipaperino/plank plank --features cuda
+# Without the ds4 engine (much faster to build):
+PLANK_NO_DS4=1 cargo install --locked --git https://github.com/aovestdipaperino/plank plank
+```
+
 ## Memory
 
 DeepSeek V4 Flash needs 96 GB. plank checks that floor before downloading or
