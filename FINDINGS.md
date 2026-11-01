@@ -4165,3 +4165,20 @@ of `main`. The test harness never runs `main`, so `cargo test` started from
 `read_pdf_as_markdown_and_continue` reports "cannot write the document
 cache". CI's Windows job runs under `shell: bash` (Git Bash), which exports
 `HOME`, so it passes. From PowerShell, set `$env:HOME = $env:USERPROFILE` first.
+## WASM guest hashes depended on the builder's home directory
+
+`guests/verify.sh` and the release `SHA256SUMS` compare guest modules by hash,
+but every panic location embeds an absolute source path
+(`/home/<user>/.cargo/registry/src/...`, the guest's own `src/`), so no build on
+another machine could match. `guests/build.sh` and `spike/build-guest.sh` now
+pass `--remap-path-prefix` for the Cargo home (`/cargo`) and the source tree
+(`/src`), converted with `cygpath -m` under Git Bash, since rustc on Windows
+needs a native path. That removes the home directory from Linux and macOS
+builds. A Windows build still differs, because rustc remaps only the prefix and
+keeps `\` in the rest of each path, local crate paths included (`src\minions.rs`).
+Cargo's `profile.release.trim-paths` would fix that, but is still unstable in
+Cargo 1.99. So hashes reproduce between Unix builders, not from Windows.
+
+Git Bash's `sha256sum` also writes `<hash> *<name>` (binary mode), which
+`verify.sh` would read as a file called `*name`; the scripts prefer `shasum` and
+drop the `*`.

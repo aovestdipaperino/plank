@@ -5,6 +5,12 @@
 # critical path of a normal build or of CI's default job.
 set -e
 cd "$(dirname "$0")"
+# Builds are compared by hash (`verify.sh`, the release `SHA256SUMS`), and
+# panic locations embed absolute source paths, so map the two that differ per
+# machine to fixed names. `cygpath -m` gives rustc a native path under Git Bash.
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
+REMAP="--remap-path-prefix=$(native "${CARGO_HOME:-$HOME/.cargo}")=/cargo --remap-path-prefix=$(native "$(pwd)")=/src"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$REMAP"
 for guest in abi-guest min-guest text-guest; do
   (cd "$guest" && cargo build --release --target wasm32-unknown-unknown)
   echo "guest: $(pwd)/$guest/target/wasm32-unknown-unknown/release/$(echo "plank_$guest" | tr - _).wasm"

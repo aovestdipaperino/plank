@@ -12,10 +12,13 @@
 #
 # Output: dist/<guest>/ (the installable directory) and dist/plank-<guest>.tar.gz.
 set -e
-# SHA-256 of a file as `<hash>  <name>`: `sha256sum` where it exists (most
-# Linux), else `shasum -a 256` (macOS, Git for Windows).
+# SHA-256 of a file as `<hash>  <name>`: `shasum -a 256` where it exists
+# (macOS, Git for Windows), else `sha256sum` (most Linux). Git Bash's
+# `sha256sum` marks binary mode as `<hash> *<name>`; the `*` is dropped so
+# every OS writes the same line.
 sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi |
+    sed 's/ \*/  /'
 }
 cd "$(dirname "$0")"
 ROOT=$(pwd)

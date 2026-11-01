@@ -179,6 +179,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **CI cached PDFium at the wrong place on macOS and Windows** (#89, step 6).
+  The download lands in `~/Library/Caches/pdfium-rs` and
+  `%LOCALAPPDATA%\pdfium-rs` there, not `~/.cache/pdfium-rs`, so those jobs
+  re-downloaded it on every run. Each job now caches all three locations and
+  checks the one its OS uses.
+- **WASM guest hashes no longer depend on the builder's home directory**
+  (#89, step 6): the guest build scripts remap the Cargo home and source paths.
+  Hashes reproduce between Linux and macOS builders; a Windows build still
+  differs (FINDINGS.md). The scripts also work where only `sha256sum` exists,
+  and with Git Bash's `*`-marked output.
+- **The logo in the classic Windows console** (#89, step 6) uses half blocks:
+  conhost's usual font lacks the quadrant glyphs `logo-art` picks for an
+  unknown terminal. Windows Terminal keeps quadrants.
+
 - **`read` on a PDF outside the build machine** (#89, step 6). liteparse
   loads PDFium at runtime and looks only in the builder's download cache and
   beside `current_exe`, so a released binary could not find it. plank now
