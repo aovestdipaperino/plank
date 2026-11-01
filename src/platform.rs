@@ -619,6 +619,105 @@ fn shell_path() -> std::path::PathBuf {
         .clone()
 }
 
+/// The shell the `bash` tool and the `!`/`!!` escapes run commands in
+/// (`tools.shell`). Hooks always use [`shell_command`]: their commands are
+/// written for POSIX `sh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellDialect {
+    /// `sh -c`: [`shell_command`]'s shell, `/bin/sh` on Unix.
+    #[default]
+    Posix,
+    /// PowerShell: `pwsh` when it is on `PATH`, else Windows PowerShell 5.1
+    /// on Windows. The system prompt tells the model (`sysprompt`).
+    PowerShell,
+}
+
+impl ShellDialect {
+    /// The dialect named `s` (`posix`, `sh`, `powershell`, `pwsh`; any case).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "posix" | "sh" => Some(Self::Posix),
+            "powershell" | "pwsh" => Some(Self::PowerShell),
+            _ => None,
+        }
+    }
+
+    /// The settings spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::PowerShell => "powershell",
+        }
+    }
+
+    /// The dialect in effect, from the installed settings.
+    #[must_use]
+    pub fn active() -> Self {
+        crate::settings::active().tools.shell
+    }
+
+    /// A `Command` that runs `cmd` in this dialect's shell. PowerShell gets
+    /// no profile, no prompt and no banner, and writes UTF-8: Windows
+    /// PowerShell otherwise encodes piped output in the console's OEM code
+    /// page, which turns every non-ASCII character the model reads into
+    /// mojibake.
+    #[must_use]
+    pub fn command(self, cmd: &str) -> std::process::Command {
+        match self {
+            Self::Posix => {
+                let mut c = shell_command();
+                c.arg("-c").arg(cmd);
+                c
+            }
+            Self::PowerShell => {
+                let mut c = std::process::Command::new(powershell_path());
+                c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(powershell_script(cmd));
+                c
+            }
+        }
+    }
+}
+
+/// `cmd` behind the preamble that makes PowerShell write UTF-8.
+fn powershell_script(cmd: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         $OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}"
+    )
+}
+
+/// `pwsh` (PowerShell 7) when it is on `PATH`, else, on Windows, Windows
+/// PowerShell under `%SystemRoot%`, which every install has. Elsewhere a
+/// missing `pwsh` stays `pwsh`, so the spawn error names it.
+fn powershell_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let exe = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+        let on_path = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .map(|dir| dir.join(exe))
+            .find(|p| p.is_file());
+        if let Some(p) = on_path {
+            return p;
+        }
+        if cfg!(windows)
+            && let Some(root) = std::env::var_os("SystemRoot")
+        {
+            let ps = PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+            if ps.is_file() {
+                return ps;
+            }
+        }
+        PathBuf::from(exe)
+    })
+    .clone()
+}
+
 /// Spawns children that own their whole process tree, so the terminal's
 /// Ctrl-C reaches plank alone and [`kill_tree`] can end every descendant.
 pub trait CommandExt {
@@ -885,6 +984,59 @@ mod tests {
                 Path::new(r"c:\work\repo")
             ));
         }
+    }
+
+    #[test]
+    fn shell_dialects_parse_and_spell_back() {
+        assert_eq!(ShellDialect::parse("PWSH"), Some(ShellDialect::PowerShell));
+        assert_eq!(ShellDialect::parse("sh"), Some(ShellDialect::Posix));
+        assert_eq!(ShellDialect::parse("cmd"), None);
+        for d in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            assert_eq!(ShellDialect::parse(d.as_str()), Some(d));
+        }
+    }
+
+    #[test]
+    fn a_posix_command_is_sh_dash_c() {
+        let c = ShellDialect::Posix.command("echo hi");
+        let args: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn a_powershell_command_skips_the_profile_and_writes_utf8() {
+        let c = ShellDialect::PowerShell.command("Get-ChildItem");
+        let args: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[..4],
+            ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+        );
+        assert!(
+            args[4].starts_with("[Console]::OutputEncoding"),
+            "{}",
+            args[4]
+        );
+        assert!(args[4].ends_with("; Get-ChildItem"), "{}", args[4]);
+    }
+
+    /// Runs a real PowerShell where there is one: on Windows always.
+    #[test]
+    fn powershell_runs_a_command_and_prints_utf8() {
+        if !cfg!(windows) && !powershell_path().is_file() {
+            return;
+        }
+        let out = ShellDialect::PowerShell
+            .command("Write-Output 'caf\u{e9}'; exit 3")
+            .output()
+            .expect("spawn PowerShell");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "caf\u{e9}");
     }
 
     #[test]
