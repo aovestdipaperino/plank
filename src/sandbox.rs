@@ -12,9 +12,10 @@
 //! directory, temp dirs, and any configured extra roots. What enforces that on
 //! `bash` depends on the OS ([`enforcement`]): `/usr/bin/sandbox-exec` with a
 //! generated Seatbelt profile on macOS, a Landlock ruleset on Linux
-//! (`landlock.rs`), and nothing yet on Windows, where only the file tools'
-//! check ([`Sandbox::contains_write_target`]) applies and the startup notice
-//! ([`Sandbox::startup_notice`]) says so. User-typed `!` and `!!` commands are
+//! (`landlock.rs`), and on Windows a Low-integrity token with the write roots
+//! labelled Low while plank runs (`lowil.rs`). Where none applies, only the
+//! file tools' check ([`Sandbox::contains_write_target`]) does, and the
+//! startup notice ([`Sandbox::startup_notice`]) says so. User-typed `!` and `!!` commands are
 //! never sandboxed — the user typing the command is the authorization.
 //!
 //! Configured via `~/.plank/sandbox.json` overlaid by `./.plank/sandbox.json`:
@@ -70,6 +71,9 @@ pub enum Enforcement {
     Seatbelt,
     /// Linux: a Landlock ruleset of this ABI version.
     Landlock(i64),
+    /// Windows: a Low-integrity token, with the write roots labelled Low
+    /// while plank runs (`lowil.rs`).
+    LowIntegrity,
     /// No backend; the reason, for the startup notice.
     Unavailable(String),
 }
@@ -96,7 +100,11 @@ pub fn enforcement() -> &'static Enforcement {
             crate::landlock::abi_version()
                 .map_or_else(Enforcement::Unavailable, Enforcement::Landlock)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            Enforcement::LowIntegrity
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             Enforcement::Unavailable("this OS has no sandbox plank can use yet".to_string())
         }
@@ -344,8 +352,13 @@ impl Sandbox {
     /// confined to [`write_roots`](Self::write_roots) under this machine's
     /// [`enforcement`].
     ///
+    /// On Windows the write roots are labelled Low first, and the command is
+    /// marked ([`crate::lowil::MARKER_VAR`]) so that `spawn_tree` starts it at
+    /// Low integrity, with its own Low temp directory.
+    ///
     /// # Errors
-    /// Building the Landlock ruleset failed.
+    /// Building the Landlock ruleset failed, or the working directory could
+    /// not be labelled.
     pub fn shell_command(
         &self,
         cwd: &Path,
@@ -374,6 +387,20 @@ impl Sandbox {
             }
             #[cfg(not(target_os = "linux"))]
             Enforcement::Landlock(_) => Ok(shell),
+            #[cfg(windows)]
+            Enforcement::LowIntegrity => {
+                let roots = self.write_roots(cwd);
+                crate::lowil::ensure_labelled(&roots, Some(&realpath_for_write(cwd)))?;
+                let temp = crate::lowil::temp_dir()?;
+                let mut c = shell;
+                c.env(crate::lowil::MARKER_VAR, crate::lowil::MARKER_VALUE)
+                    .env("TEMP", &temp)
+                    .env("TMP", &temp)
+                    .env("TMPDIR", &temp);
+                Ok(c)
+            }
+            #[cfg(not(windows))]
+            Enforcement::LowIntegrity => Ok(shell),
             Enforcement::Unavailable(_) => Ok(shell),
         }
     }
@@ -383,7 +410,7 @@ impl Sandbox {
     #[must_use]
     pub fn denial_text() -> &'static str {
         match enforcement() {
-            Enforcement::Landlock(_) => "Permission denied",
+            Enforcement::Landlock(_) | Enforcement::LowIntegrity => "Permission denied",
             _ => "Operation not permitted",
         }
     }

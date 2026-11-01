@@ -1051,8 +1051,25 @@ fn migrate_engine_layout_unconditionally() {
     }
 }
 
+/// Removes this plank's Low labels when dropped at the end of `main`.
+#[cfg(windows)]
+struct LowLabels;
+
+#[cfg(windows)]
+impl Drop for LowLabels {
+    fn drop(&mut self) {
+        plank::lowil::release_mine();
+    }
+}
+
 fn main() -> ExitCode {
     plank::platform::ensure_home();
+    // The Windows sandbox's Low labels: a crashed plank's are removed now,
+    // this one's when `main` returns (`lowil.rs`).
+    #[cfg(windows)]
+    plank::lowil::sweep_stale();
+    #[cfg(windows)]
+    let _labels = LowLabels;
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Before anything can move the process: `/edit-profile`'s restart re-runs
     // these arguments from this directory.
