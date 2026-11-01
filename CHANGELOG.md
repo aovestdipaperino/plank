@@ -179,6 +179,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`glob` on Windows** (#89, step 3) accepts `\` as a separator, matches
+  names case-insensitively as the filesystem does, and checks containment
+  with the case- and prefix-insensitive comparison the write tools use.
+
 - **Writes into new directories pass the workspace check on every OS.** A
   file tool writing several directories below the workspace that did not
   exist yet was judged by a lexical path, which on Windows lacked the `\\?\`
@@ -261,6 +265,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile builds its prompt cache once more on the next launch.
 
 ### Changed
+
+- **Notifications on Linux and Windows borrow the host terminal's identity**
+  (#89, step 7), as they already did on macOS. `notify-send` gets a
+  `desktop-entry` hint for kitty, GNOME Terminal, Konsole, Alacritty, Tilix,
+  WezTerm, Ghostty or VS Code. Inside Windows Terminal the toast is shown
+  under its installed package's app id, falling back to Windows PowerShell's.
 
 - **A native engine opens the model's own context by default.** With no
   `-c`, Gemma and Flint open the file's whole trained window when its KV fits
