@@ -20,7 +20,7 @@ hardware it needs; it is not a promise that it works.
 | Flint | Metal or CPU | CPU (no CUDA kernels yet) | CPU (no CUDA kernels yet) |
 | GPU yield (`PLANK_GPU_YIELD`) | Metal | CUDA and ROCm (untested) | no local GPU engine |
 | `bash` tool | `/bin/sh` | `/bin/sh` | a POSIX shell: `PLANK_SHELL`, else `sh.exe`/`bash.exe` on `PATH`, else Git for Windows |
-| `bash` write sandbox | Seatbelt | Landlock (kernel 5.13+) | not confined (the startup banner says so) |
+| `bash` write sandbox | Seatbelt | Landlock (kernel 5.13+) | Low integrity token, write roots labelled Low (`sh`/`bash`; see FINDINGS.md) |
 | `write`/`edit` workspace containment | yes | yes | yes |
 | `read` on a PDF (`docparse`) | yes | yes | yes |
 | Web tools (`use_obscura`) | yes | builds; not yet exercised | builds; not yet exercised |
@@ -116,17 +116,10 @@ A native port would start upstream in `ds4`: [docs/DS4-WINDOWS-PORT.md](DS4-WIND
 
 - **Flint on CUDA.** Its NVFP4 matmul and MoE kernels exist for Metal and the
   CPU only; `--cuda` refuses Flint until they are ported.
-- **A Windows `bash` sandbox.** The two candidates both need the write roots'
-  security descriptors changed before a confined process may write there:
-  - an AppContainer process can write only where an ACE grants its SID, and
-    also loses read access to most of the user's files unless granted;
-  - a Low-integrity token (in a Job Object) keeps reads but can write only to
-    objects labelled Low, so the workspace, temp and cache roots would need a
-    Low mandatory label, which any other Low-integrity process on the machine
-    could then also write through.
-
-  Either means persistently editing ACLs or labels on the user's directories,
-  so it is a design decision still to make, not a missing port.
+- **Confining the PowerShell dialect on Windows.** The `bash` write sandbox
+  runs `sh`/`bash` at Low integrity, but Windows PowerShell 5.1 crashes at that
+  level (a .NET fail-fast), so `tools.shell: powershell` cannot be confined the
+  same way. FINDINGS.md has the details.
 - **Terminal testing.** Windows Terminal, conhost, and the common Linux
   terminals (GNOME Terminal, Konsole, kitty, Alacritty, WezTerm, tmux) still
   need checking for key events, focus events, the OSC title, true colour and
