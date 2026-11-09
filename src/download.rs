@@ -3299,12 +3299,14 @@ mod tests {
         let model = stub_model("gemma", "gemma4");
         // Sparse, so the file is larger than any machine's RAM without taking
         // the disk: the DeepSeek SSD heuristic would fire on it.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&model)
-            .unwrap()
-            .set_len(1 << 42)
-            .unwrap();
+        crate::platform::set_len_sparse(
+            &std::fs::OpenOptions::new()
+                .write(true)
+                .open(&model)
+                .unwrap(),
+            1 << 42,
+        )
+        .unwrap();
         let sel = stub_selection(crate::manifest::EngineId::DS4VISION, &model);
         let mut e = crate::config::EngineTuning {
             mtp: true,
@@ -3327,12 +3329,14 @@ mod tests {
         let model = stub_model("flint", "flint");
         // Sparse, as in the Gemma case: big enough for the DeepSeek SSD
         // heuristic to fire if Flint were mistaken for DeepSeek.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&model)
-            .unwrap()
-            .set_len(1 << 42)
-            .unwrap();
+        crate::platform::set_len_sparse(
+            &std::fs::OpenOptions::new()
+                .write(true)
+                .open(&model)
+                .unwrap(),
+            1 << 42,
+        )
+        .unwrap();
         let sel = stub_selection(crate::manifest::EngineId::DS4VISION, &model);
         let mut e = crate::config::EngineTuning {
             mtp: true,
@@ -3668,9 +3672,10 @@ mod tests {
     /// so nothing touches the real `~/.plank`.
     fn local_url_selection(root: &Path) -> (crate::engines::Catalog, crate::engines::Selection) {
         let text = format!(
-            r#"{{"engines":{{"mine":{{"main":{{"path":"{m}","url":"https://huggingface.co/o/r/blob/main/mine.gguf"}},"vision":{{"path":"{v}","url":"https://example.com/v.gguf"}}}}}}}}"#,
-            m = root.join("models/mine.gguf").display(),
-            v = root.join("models/mine-vision.gguf").display(),
+            r#"{{"engines":{{"mine":{{"main":{{"path":{m},"url":"https://huggingface.co/o/r/blob/main/mine.gguf"}},"vision":{{"path":{v},"url":"https://example.com/v.gguf"}}}}}}}}"#,
+            // JSON-quoted: a Windows path's `\` is an escape in a bare splice.
+            m = serde_json::json!(root.join("models/mine.gguf")),
+            v = serde_json::json!(root.join("models/mine-vision.gguf")),
         );
         let over = crate::engines::parse(&text, crate::engines::Layer::Local, &mut Vec::new())
             .expect("local layer parses");

@@ -1143,6 +1143,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// `path` as it appears inside a JSON string: a Windows root's `\`
+    /// separators come back doubled.
+    fn json_escaped(path: &Path) -> String {
+        let quoted = serde_json::json!(path).to_string();
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
     /// Writes `body` to `root/rel`, creating parent directories.
     fn write(root: &Path, rel: &str, body: &str) {
         let path = root.join(rel);
@@ -1531,7 +1538,7 @@ mod tests {
             r#"{"mcpServers":{"s":{"command":"$CLAUDE_PLUGIN_ROOT/bin/s"}}}"#,
         );
         assert!(rewrite_plugin_root(&dest).expect("ok"));
-        let root = dest.display().to_string();
+        let root = json_escaped(&dest);
         let hooks = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
         assert!(hooks.contains(&format!("{root}/bin/g")), "{hooks}");
         assert!(!hooks.contains("CLAUDE_PLUGIN_ROOT"), "{hooks}");
@@ -2052,7 +2059,7 @@ mod tests {
         let out = install_staged(&staged, None, &install_dir(&home), false).expect("installs");
         assert!(out.rewrote_plugin_root);
         let mcp = std::fs::read_to_string(out.dest.join(".mcp.json")).expect("read");
-        assert!(mcp.contains(&out.dest.display().to_string()), "{mcp}");
+        assert!(mcp.contains(&json_escaped(&out.dest)), "{mcp}");
     }
 
     #[test]
@@ -2148,7 +2155,12 @@ mod tests {
     #[test]
     fn rewrite_escapes_a_root_containing_a_quote() {
         let base = tmpdir("rewrite-quote");
+        // Windows refuses `"` in a name, but every root there already holds
+        // `\` separators, which take the same escaping path.
+        #[cfg(not(windows))]
         let dest = base.join(r#"odd"name\dir"#);
+        #[cfg(windows)]
+        let dest = base.join("odd name");
         write(
             &dest,
             "hooks/hooks.json",

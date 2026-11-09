@@ -1462,8 +1462,8 @@ mod tests {
         let r = root("rec-local-path");
         let main = r.join("elsewhere/mine.gguf");
         let text = format!(
-            r#"{{"engines":{{"mine":{{"main":{{"path":"{}"}}}}}}}}"#,
-            main.display()
+            r#"{{"engines":{{"mine":{{"main":{{"path":{}}}}}}}}}"#,
+            serde_json::json!(main)
         );
         let c = layer(
             compiled(),

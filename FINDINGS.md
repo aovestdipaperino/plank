@@ -4182,3 +4182,45 @@ Cargo 1.99. So hashes reproduce between Unix builders, not from Windows.
 Git Bash's `sha256sum` also writes `<hash> *<name>` (binary mode), which
 `verify.sh` would read as a file called `*name`; the scripts prefer `shasum` and
 drop the `*`.
+
+The two remaps still left the toolchain's own path in the module on any machine
+with the `rust-src` component, which rust-analyzer installs. std ships its
+locations as `/rustc/<commit>/library/...`, but when `rust-src` is present
+rustc rewrites them to the local
+`<sysroot>/lib/rustlib/src/rust/library/...`. Inlined std code panics there, so
+the module embedded `C:\Users\<user>\.rustup\toolchains\...` and hashed
+differently from a CI runner without `rust-src`. This is not Windows-specific:
+it hits a macOS laptop the same way. A third remap,
+`<sysroot>/lib/rustlib/src/rust=/rustc/<commit-hash>` (from
+`rustc --print sysroot` and `rustc -vV`), maps the paths back. It matches
+nothing where `rust-src` is absent.
+
+With that, a Windows build reproduces itself (`verify.sh` passes on a clean
+rebuild), and only the `\` separators set it apart. `package.sh` records
+`# built on: windows|unix`, and `verify.sh` reports a cross-family comparison as
+expected, as it does a toolchain change. `verify.sh` also read its default
+`dist/SHA256SUMS` after `package.sh` had emptied `dist/`, so run without an
+argument it checked the rebuild against its own output and always passed. CI
+was unaffected, because it copies the sums out first; the script now does too.
+
+## Windows CI: what the test harness sees that plank never does
+
+The Windows lib suite failed ~67 tests for reasons that never reach a real
+launch. `HOME`: Windows sets only `USERPROFILE`, and `platform::ensure_home`
+copies it at the top of `main`, which a test binary never runs, so under pwsh
+every `~/.plank` reader saw none ("no plank home"); the CI Test step runs under
+Git Bash, which sets `HOME`. Line endings: Git for Windows checks out CRLF, and
+every `include_str!` prompt, skill and signature fixture changed with it;
+`.gitattributes` pins LF. Sparse files: NTFS allocates on `set_len` unless the
+file is marked sparse, so a `1 << 42` stand-in fails with "not enough space on
+the disk"; `platform::set_len_sparse` sets `FSCTL_SET_SPARSE` first. And the
+console: a Windows test process can read its console's width, so markdown
+wrapped at the window's width instead of the 80-column fallback; under
+`cfg(test)` `markdown_width` uses the fallback. The editor's text buffer
+defaults to CRLF on Windows, which would have sent prompts as `\r\n`; prompt
+mode now pins LF.
+
+Locally on an AzureAD-joined machine, msys `sh.exe` at Low integrity (the
+`lowil` sandbox) can fail creating `\BaseNamedObjects\msys-2.0S5-*`
+(`0xC0000022`, child exit `0xC0000142`), after which even medium-integrity
+`sh` in the same run can fail the same way. Judge the shell-sandbox tests on CI.

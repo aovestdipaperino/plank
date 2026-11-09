@@ -189,6 +189,9 @@ impl State {
                 let seeded = crate::miniedit::file_seed_text(initial);
                 tb.write_raw(seeded.as_bytes());
             } else {
+                // A prompt is LF whatever the platform: the buffer defaults
+                // to CRLF on Windows, which would reach the model as `\r\n`.
+                tb.set_crlf(false);
                 tb.write_canon(initial.as_bytes());
             }
             tb.cursor_move_to_offset(initial.len());

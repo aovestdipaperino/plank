@@ -3819,21 +3819,25 @@ pub(crate) mod tests {
         // actually written to disk, and 20 GB held live on the heap until
         // process exit — enough to fail outright on a CI runner with ~14 GB
         // free.
-        File::create(part_path_in(
-            &dir,
-            crate::manifest::EngineId::DS4VISION,
-            "main",
-        ))
-        .expect("create main part")
-        .set_len(20_000_000_000)
+        crate::platform::set_len_sparse(
+            &File::create(part_path_in(
+                &dir,
+                crate::manifest::EngineId::DS4VISION,
+                "main",
+            ))
+            .expect("create main part"),
+            20_000_000_000,
+        )
         .expect("size main part");
-        File::create(part_path_in(
-            &dir,
-            crate::manifest::EngineId::DS4VISION,
-            "vision",
-        ))
-        .expect("create vision part")
-        .set_len(16_200_000_000)
+        crate::platform::set_len_sparse(
+            &File::create(part_path_in(
+                &dir,
+                crate::manifest::EngineId::DS4VISION,
+                "vision",
+            ))
+            .expect("create vision part"),
+            16_200_000_000,
+        )
         .expect("size vision part");
         let mut st = a_state();
         st.pid = std::process::id();
