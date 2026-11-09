@@ -4202,3 +4202,25 @@ expected, as it does a toolchain change. `verify.sh` also read its default
 `dist/SHA256SUMS` after `package.sh` had emptied `dist/`, so run without an
 argument it checked the rebuild against its own output and always passed. CI
 was unaffected, because it copies the sums out first; the script now does too.
+
+## Windows CI: what the test harness sees that plank never does
+
+The Windows lib suite failed ~67 tests for reasons that never reach a real
+launch. `HOME`: Windows sets only `USERPROFILE`, and `platform::ensure_home`
+copies it at the top of `main`, which a test binary never runs, so under pwsh
+every `~/.plank` reader saw none ("no plank home"); the CI Test step runs under
+Git Bash, which sets `HOME`. Line endings: Git for Windows checks out CRLF, and
+every `include_str!` prompt, skill and signature fixture changed with it;
+`.gitattributes` pins LF. Sparse files: NTFS allocates on `set_len` unless the
+file is marked sparse, so a `1 << 42` stand-in fails with "not enough space on
+the disk"; `platform::set_len_sparse` sets `FSCTL_SET_SPARSE` first. And the
+console: a Windows test process can read its console's width, so markdown
+wrapped at the window's width instead of the 80-column fallback; under
+`cfg(test)` `markdown_width` uses the fallback. The editor's text buffer
+defaults to CRLF on Windows, which would have sent prompts as `\r\n`; prompt
+mode now pins LF.
+
+Locally on an AzureAD-joined machine, msys `sh.exe` at Low integrity (the
+`lowil` sandbox) can fail creating `\BaseNamedObjects\msys-2.0S5-*`
+(`0xC0000022`, child exit `0xC0000142`), after which even medium-integrity
+`sh` in the same run can fail the same way. Judge the shell-sandbox tests on CI.

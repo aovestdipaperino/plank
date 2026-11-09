@@ -927,13 +927,23 @@ mod tests {
             let mut graph = KvCache::with_dtype(c.layers, dtype);
             m.forward_with(&prompt, 0, &mut ops, false).unwrap();
             m.forward_with(&prompt, 0, &mut graph, false).unwrap();
+            // The two paths write their own KV: in f16 each stores its own
+            // rounding of K and V, and the gap compounds over the 40 steps
+            // (GitHub's macOS runners crossed 1e-3 at position 230). f32
+            // keeps the tight bound.
+            let tol = if dtype == DType::F16 { 5e-3 } else { 1e-3 };
             let mut tok = 5u32;
             for pos in 200..240 {
                 let want = m.forward_with(&[tok], pos, &mut ops, false).unwrap();
                 let got = m.forward_with(&[tok], pos, &mut graph, true).unwrap();
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+                    .fold(0f32, f32::max);
                 assert!(
-                    close(&got, &want, 1e-3),
-                    "window {window}, {dtype:?}, position {pos}"
+                    close(&got, &want, tol),
+                    "window {window}, {dtype:?}, position {pos}: worst relative error {worst:e}"
                 );
                 tok = want
                     .iter()

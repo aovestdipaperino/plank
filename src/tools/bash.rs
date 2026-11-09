@@ -1922,7 +1922,7 @@ mod tests {
     #[test]
     fn immediate_command_captures_streams_and_exit() {
         let out = run_immediate(
-            std::path::Path::new("/tmp"),
+            &std::env::temp_dir(),
             "echo out; echo err >&2; exit 3",
             &mut InterruptOnly(|| false),
         )
@@ -1936,7 +1936,7 @@ mod tests {
     #[test]
     fn an_immediate_command_sees_the_gpu_yield_variable() {
         let out = run_immediate(
-            std::path::Path::new("/tmp"),
+            &std::env::temp_dir(),
             "echo \"yield=$PLANK_GPU_YIELD\"",
             &mut InterruptOnly(|| false),
         )
@@ -1947,12 +1947,7 @@ mod tests {
     #[test]
     fn an_immediate_command_gets_a_fresh_signal_path_and_its_signal_back() {
         let run = |cmd: &str| {
-            run_immediate(
-                std::path::Path::new("/tmp"),
-                cmd,
-                &mut InterruptOnly(|| false),
-            )
-            .unwrap()
+            run_immediate(&std::env::temp_dir(), cmd, &mut InterruptOnly(|| false)).unwrap()
         };
         let a = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
         let b = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
@@ -1992,7 +1987,7 @@ mod tests {
         };
         let start = Instant::now();
         let out = run_immediate(
-            std::path::Path::new("/tmp"),
+            &std::env::temp_dir(),
             "echo first; sleep 1; echo second",
             &mut rec,
         )
@@ -2016,12 +2011,7 @@ mod tests {
             lines: Vec::new(),
             ticks: 0,
         };
-        run_immediate(
-            std::path::Path::new("/tmp"),
-            "echo out; echo err 1>&2",
-            &mut rec,
-        )
-        .unwrap();
+        run_immediate(&std::env::temp_dir(), "echo out; echo err 1>&2", &mut rec).unwrap();
         let by_stream: Vec<(Stream, &str)> =
             rec.lines.iter().map(|(s, t, _)| (*s, t.as_str())).collect();
         assert!(
@@ -2040,12 +2030,7 @@ mod tests {
             lines: Vec::new(),
             ticks: 0,
         };
-        let out = run_immediate(
-            std::path::Path::new("/tmp"),
-            "printf 'no-newline'",
-            &mut rec,
-        )
-        .unwrap();
+        let out = run_immediate(&std::env::temp_dir(), "printf 'no-newline'", &mut rec).unwrap();
         assert_eq!(rec.lines.len(), 1, "{:?}", rec.lines);
         assert_eq!(rec.lines[0].1, "no-newline");
         assert_eq!(out.stdout, "no-newline");
@@ -2057,12 +2042,7 @@ mod tests {
             lines: Vec::new(),
             ticks: 0,
         };
-        run_immediate(
-            std::path::Path::new("/tmp"),
-            "printf 'a\\r\\nb\\n'",
-            &mut rec,
-        )
-        .unwrap();
+        run_immediate(&std::env::temp_dir(), "printf 'a\\r\\nb\\n'", &mut rec).unwrap();
         assert_eq!(rec.lines[0].1, "a");
         assert_eq!(rec.lines[1].1, "b");
     }
@@ -2072,7 +2052,7 @@ mod tests {
         let mut polls = 0;
         let start = Instant::now();
         let out = run_immediate(
-            std::path::Path::new("/tmp"),
+            &std::env::temp_dir(),
             "sleep 30",
             &mut InterruptOnly(|| {
                 polls += 1;
@@ -2177,7 +2157,7 @@ mod tests {
         // Give the shell a few ticks to echo the pid before interrupting.
         let mut polls = 0;
         let out = run_immediate(
-            std::path::Path::new("/tmp"),
+            &std::env::temp_dir(),
             "sleep 30 & echo $!; wait",
             &mut InterruptOnly(|| {
                 polls += 1;

@@ -424,6 +424,9 @@ mod tests {
             "squat.md",
             "---\nname: superpowers:brainstorm\ndescription: x\n---\nbody\n",
         );
+        // Windows file names cannot hold a `:` (NTFS reads it as a stream
+        // name), so only the manifest case can arise there.
+        #[cfg(not(windows))]
         write_template(&root, "a:b.md", "body from a file stem with a colon\n");
         write_template(&root, "fine.md", "---\nname: fine\n---\nbody\n");
         let templates = load_from(std::slice::from_ref(&root));

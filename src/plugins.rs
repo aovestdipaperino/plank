@@ -2669,7 +2669,9 @@ mod tests {
 
     /// The directory-name fallback becomes the namespace prefix, so it has to
     /// clear the same bar the manifest `name` does. `foo:bar` would mint the
-    /// ambiguous alias `foo:bar:greet`.
+    /// ambiguous alias `foo:bar:greet`. Not on Windows, whose file names
+    /// cannot hold a `:` at all.
+    #[cfg(not(windows))]
     #[test]
     fn a_directory_named_with_a_colon_is_dropped() {
         let base = scratch("dirname-colon");
@@ -2718,7 +2720,9 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir");
         let cwd = base.join("proj");
         std::fs::create_dir_all(&cwd).expect("mkdir");
-        let plugin = base.join("foo:bar");
+        // `a__b` rather than `foo:bar`: just as unusable, and Windows can
+        // create it.
+        let plugin = base.join("a__b");
         write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
         let set = load_in_with(Some(&home), &cwd, &[plugin]);
         assert_eq!(set.plugins.len(), 1);

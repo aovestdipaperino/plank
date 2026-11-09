@@ -228,7 +228,11 @@ jobs:
       # `--release`, as in the macOS job, and here also required: tesseract-rs
       # 0.2.0 looks for `leptonica-1.84.1.lib`, but an MSVC Debug build names
       # it `leptonica-1.84.1d.lib`, so a debug test build fails to link.
+      # Under bash on Windows too: Git Bash sets HOME, which plank's binary
+      # sets from USERPROFILE at startup (`platform::ensure_home`) but a test
+      # harness never does, so under pwsh every `~/.plank` reader saw none.
       - name: Test
+        shell: bash
         run: cargo test --release --lib
 
       # The WASM guest scripts under Git Bash (#89 step 6): build, package and

@@ -42127,12 +42127,8 @@ or the user's next message aborts before its first token"
             log: &mut log,
             quiet: false,
         };
-        crate::tools::bash::run_immediate(
-            std::path::Path::new("/tmp"),
-            "echo one; echo two",
-            &mut sink,
-        )
-        .unwrap();
+        crate::tools::bash::run_immediate(&std::env::temp_dir(), "echo one; echo two", &mut sink)
+            .unwrap();
         assert!(panel.text().contains("one"), "{}", panel.text());
         assert!(panel.text().contains("two"), "{}", panel.text());
         assert_eq!(log.line_count(), 0, "lines went to the panel, not the log");
@@ -42143,8 +42139,7 @@ or the user's next message aborts before its first token"
             log: &mut log2,
             quiet: false,
         };
-        crate::tools::bash::run_immediate(std::path::Path::new("/tmp"), "echo three", &mut sink)
-            .unwrap();
+        crate::tools::bash::run_immediate(&std::env::temp_dir(), "echo three", &mut sink).unwrap();
         assert_eq!(log2.line_count(), 1, "no panel: line lands in the log");
     }
 
