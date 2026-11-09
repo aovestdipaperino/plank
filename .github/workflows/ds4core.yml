@@ -1,0 +1,239 @@
+name: ds4 core
+
+# Pre-built ds4 C engine cores (#89): `libds4core.a` per target, backend and
+# GPU architecture, so plank can be built against the engine without make,
+# nvcc or hipcc (`PLANK_DS4_PREBUILT`, see docs/PLATFORMS.md).
+#
+# The packages go to a release named after the ds4 commit `refs/ds4` pins
+# (`ds4core-<first 12 hex>`), not after a plank version: that commit is what
+# decides whether a core fits plank's FFI, and many plank releases share one.
+# Each package is written by the engine crate's own build script
+# (`PLANK_DS4_EXPORT`), so the objects and link flags are exactly those of a
+# source build, then linked back with the sources out of reach and tested
+# before upload. The release carries a `<tag>-SHA256SUMS` over every package,
+# which `PLANK_DS4_PREBUILT=github` checks, and a build provenance attestation
+# for each (`gh attestation verify <file> --repo <owner>/plank`).
+#
+# Runs when `refs/ds4` moves on main and on demand. Packages already in the
+# release are skipped unless `force` is set, so a re-run only fills gaps.
+#
+# Portability: x86-64 host code targets x86-64-v3 (AVX2, every CPU since
+# Haswell/Zen), aarch64 targets ARMv8.2-A with fp16 and dotprod (Graviton2+,
+# Grace, GB10, Ampere), macOS the Apple M1. The Linux packages are built on
+# Ubuntu 22.04 (glibc 2.35), so they link on that and anything newer.
+
+on:
+  push:
+    branches: [main]
+    paths: [refs/ds4]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and replace packages that are already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ds4core
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      tag: ${{ steps.plan.outputs.tag }}
+      existing: ${{ steps.plan.outputs.existing }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the pinned ds4 commit and what is already published
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          COMMIT=$(git ls-tree HEAD refs/ds4 | awk '{print $3}')
+          TAG="ds4core-${COMMIT:0:12}"
+          EXISTING=""
+          if [ "$FORCE" != "true" ]; then
+            EXISTING=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null | tr '\n' ' ' || true)
+          fi
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "existing=$EXISTING" >> "$GITHUB_OUTPUT"
+          echo "ds4 $COMMIT -> $TAG; already published: ${EXISTING:-nothing}"
+
+  macos:
+    name: aarch64-apple-darwin metal
+    needs: plan
+    # The Metal backend needs the macOS 15 SDK (MTLResidencySet).
+    runs-on: macos-15
+    env:
+      TARGET: aarch64-apple-darwin
+      BACKEND: metal
+      VARIANT: ""
+      NATIVE_CPU_FLAG: -mcpu=apple-m1
+    steps:
+      - &skip
+        name: Skip a package that is already published
+        id: skip
+        shell: bash
+        env:
+          EXISTING: ${{ needs.plan.outputs.existing }}
+        run: |
+          ASSET="ds4core-${TARGET}-${BACKEND}${VARIANT:+-$VARIANT}.tar.gz"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          case " $EXISTING " in
+            *" $ASSET "*) echo "skip=true" >> "$GITHUB_OUTPUT"; echo "$ASSET is published" ;;
+            *) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: actions/checkout@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.skip.outputs.skip != 'true'
+
+      - &build
+        name: Build, export, link back and test
+        if: steps.skip.outputs.skip != 'true'
+        shell: bash
+        env:
+          ASSET: ${{ steps.skip.outputs.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          PLANK_DS4_EXPORT="$PWD/dist/pkg" cargo build --release -p local-inference-engine
+          cat dist/pkg/ds4core.json
+          RECORDED=$(sed -n 's/.*"asset": *"\([^"]*\)".*/\1/p' dist/pkg/ds4core.json)
+          if [ "$RECORDED" != "$ASSET" ]; then
+            echo "the build named the package $RECORDED, the workflow expected $ASSET"; exit 1
+          fi
+          tar czf "dist/$ASSET" -C dist/pkg .
+          # The package alone, with no ds4 sources reachable: what a user gets.
+          PLANK_DS4_PREBUILT="$PWD/dist/$ASSET" DS4_SRC=/nonexistent \
+            cargo test --release -p local-inference-engine --lib
+
+      - &upload
+        uses: actions/upload-artifact@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          name: ${{ steps.skip.outputs.asset }}
+          path: dist/${{ steps.skip.outputs.asset }}
+          if-no-files-found: error
+
+  linux:
+    name: ${{ matrix.target }} ${{ matrix.backend }} ${{ matrix.variant }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cpu, variant: "", image: "ubuntu:22.04", cpu: "-march=x86-64-v3" }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, backend: cpu, variant: "", image: "ubuntu:22.04", cpu: "-march=armv8.2-a+fp16+dotprod" }
+          # Keep in step with `CUDA_VARIANTS` in build_support/prebuilt.rs,
+          # which picks among these for the GPU in the user's machine.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cuda, variant: sm_80, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=x86-64-v3" }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cuda, variant: sm_86, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=x86-64-v3" }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cuda, variant: sm_89, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=x86-64-v3" }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cuda, variant: sm_90, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=x86-64-v3" }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: cuda, variant: sm_120, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=x86-64-v3" }
+          # Grace Hopper (GH200) and DGX Spark (GB10).
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, backend: cuda, variant: sm_90, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=armv8.2-a+fp16+dotprod" }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, backend: cuda, variant: sm_121, image: "nvidia/cuda:12.9.1-devel-ubuntu22.04", cpu: "-march=armv8.2-a+fp16+dotprod" }
+          # Strix Halo, the target of the ds4 Makefile's `strix-halo`.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, backend: rocm, variant: gfx1151, image: "rocm/dev-ubuntu-22.04:6.4.1-complete", cpu: "-march=x86-64-v3" }
+    env:
+      TARGET: ${{ matrix.target }}
+      BACKEND: ${{ matrix.backend }}
+      VARIANT: ${{ matrix.variant }}
+      PLANK_DS4_BACKEND: ${{ matrix.backend }}
+      CUDA_ARCH: ${{ matrix.backend == 'cuda' && matrix.variant || '' }}
+      ROCM_ARCH: ${{ matrix.backend == 'rocm' && matrix.variant || '' }}
+      NATIVE_CPU_FLAG: ${{ matrix.cpu }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - *skip
+
+      # The images carry the toolkits, not git or Rust. git must exist before
+      # checkout, or the action falls back to a tarball without submodules.
+      - name: Install build tools
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git pkg-config
+          git config --global --add safe.directory '*'
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          submodules: recursive
+
+      - *build
+
+      - *upload
+
+  publish:
+    name: Publish
+    needs: [plan, macos, linux]
+    # Publish whatever built, so one failing variant never holds back the rest.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the new packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ds4core-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attest build provenance
+        if: hashFiles('dist/*.tar.gz') != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Upload to the release and rewrite its checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          NEW=(dist/*.tar.gz)
+          if [ ${#NEW[@]} -eq 0 ]; then echo "nothing new to publish"; exit 0; fi
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A prerelease that is never "latest", so it never shadows a plank
+            # release; created with GITHUB_TOKEN, so release.yml does not run.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --prerelease --latest=false --title "ds4 core ${COMMIT:0:12}" \
+              --notes "Pre-built ds4 C engine cores for ds4 commit $COMMIT (the commit plank's refs/ds4 pins). Link one with PLANK_DS4_PREBUILT=github; see docs/PLATFORMS.md."
+          fi
+          gh release upload "$TAG" "${NEW[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          # Checksums over every package in the release, old and new.
+          mkdir all
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'ds4core-*.tar.gz' --dir all
+          SUMS="$TAG-SHA256SUMS"
+          (cd all && sha256sum ds4core-*.tar.gz > "../$SUMS")
+          cat "$SUMS"
+          gh release upload "$TAG" "$SUMS" --clobber --repo "$GITHUB_REPOSITORY"

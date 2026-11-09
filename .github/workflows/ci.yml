@@ -252,3 +252,25 @@ jobs:
       - name: Build the ds4 CPU engine (Linux)
         if: runner.os == 'Linux'
         run: env -u PLANK_NO_DS4 cargo test --release -p local-inference-engine
+
+      # The pre-built core path (#89): export the CPU core just built as a
+      # package, then link that archive with the ds4 sources out of reach
+      # (DS4_SRC names nothing) and run the FFI pins against it again. A
+      # tampered archive must be refused before anything links.
+      - name: Round-trip a pre-built ds4 core (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          unset PLANK_NO_DS4
+          export NATIVE_CPU_FLAG=-march=x86-64-v3
+          PLANK_DS4_EXPORT="$PWD/ds4core-pkg" cargo build --release -p local-inference-engine
+          tar czf ds4core.tar.gz -C ds4core-pkg .
+          cat ds4core-pkg/ds4core.json
+          PLANK_DS4_PREBUILT="$PWD/ds4core.tar.gz" DS4_SRC=/nonexistent \
+            cargo test --release -p local-inference-engine --lib
+          printf 'x' >> ds4core-pkg/libds4core.a
+          if PLANK_DS4_PREBUILT="$PWD/ds4core-pkg" DS4_SRC=/nonexistent \
+            cargo build --release -p local-inference-engine 2>build.log; then
+            echo "a tampered core was linked"; exit 1
+          fi
+          grep -q 'does not match the expected' build.log
