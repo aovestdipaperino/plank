@@ -26,14 +26,34 @@ if [ ! -f "$SUMS" ]; then
   echo "no $SUMS; run guests/package.sh first" >&2
   exit 1
 fi
+# package.sh below empties dist/, the default home of $SUMS: read the recorded
+# sums from a copy, or the rebuild would be checked against its own output and
+# always pass.
+RECORDED=$(mktemp)
+trap 'rm -f "$RECORDED"' EXIT
+cp "$SUMS" "$RECORDED"
+SHOWN="$SUMS"
+SUMS="$RECORDED"
 
 recorded_rustc=$(grep '^# rustc' "$SUMS" | sed 's/^# //')
 current_rustc=$(rustc --version)
 if [ "$recorded_rustc" != "$current_rustc" ]; then
-  echo "toolchain differs from the one that produced $SUMS:" >&2
+  echo "toolchain differs from the one that produced $SHOWN:" >&2
   echo "  recorded: $recorded_rustc" >&2
   echo "  current:  $current_rustc" >&2
   echo "a hash mismatch below is expected, not tampering" >&2
+fi
+
+# Sums from before this line was recorded were all built on macOS.
+recorded_family=$(sed -n 's/^# built on: //p' "$SUMS")
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) current_family=windows ;;
+  *) current_family=unix ;;
+esac
+if [ "${recorded_family:-unix}" != "$current_family" ]; then
+  echo "$SHOWN was built on ${recorded_family:-unix}, this is $current_family:" >&2
+  echo "  Windows embeds \\-joined source paths, so a hash mismatch below is" >&2
+  echo "  expected, not tampering; verify on macOS or Linux (WSL2 works)" >&2
 fi
 
 # A clean target for each guest: an incremental rebuild would compare an

@@ -4182,3 +4182,23 @@ Cargo 1.99. So hashes reproduce between Unix builders, not from Windows.
 Git Bash's `sha256sum` also writes `<hash> *<name>` (binary mode), which
 `verify.sh` would read as a file called `*name`; the scripts prefer `shasum` and
 drop the `*`.
+
+The two remaps still left the toolchain's own path in the module on any machine
+with the `rust-src` component, which rust-analyzer installs. std ships its
+locations as `/rustc/<commit>/library/...`, but when `rust-src` is present
+rustc rewrites them to the local
+`<sysroot>/lib/rustlib/src/rust/library/...`. Inlined std code panics there, so
+the module embedded `C:\Users\<user>\.rustup\toolchains\...` and hashed
+differently from a CI runner without `rust-src`. This is not Windows-specific:
+it hits a macOS laptop the same way. A third remap,
+`<sysroot>/lib/rustlib/src/rust=/rustc/<commit-hash>` (from
+`rustc --print sysroot` and `rustc -vV`), maps the paths back. It matches
+nothing where `rust-src` is absent.
+
+With that, a Windows build reproduces itself (`verify.sh` passes on a clean
+rebuild), and only the `\` separators set it apart. `package.sh` records
+`# built on: windows|unix`, and `verify.sh` reports a cross-family comparison as
+expected, as it does a toolchain change. `verify.sh` also read its default
+`dist/SHA256SUMS` after `package.sh` had emptied `dist/`, so run without an
+argument it checked the rebuild against its own output and always passed. CI
+was unaffected, because it copies the sums out first; the script now does too.
