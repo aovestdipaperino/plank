@@ -26,6 +26,11 @@ env:
 jobs:
   channel:
     name: Determine channel
+    # Plank versions only: the `ds4core-*` releases of pre-built engine cores
+    # (ds4core.yml) are created with GITHUB_TOKEN, which raises no event, but
+    # one published by hand must not build and tap a plank release either.
+    # Every other job needs this one, so they skip with it.
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     outputs:
       channel: ${{ steps.detect.outputs.channel }}

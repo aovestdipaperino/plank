@@ -33,7 +33,8 @@ hardware it needs; it is not a promise that it works.
 The release archives for Linux and Windows are added by
 [#95](https://github.com/aovestdipaperino/plank/pull/95) and are built without
 the ds4 engine (`PLANK_NO_DS4=1`); build from source for DeepSeek or Qwen on
-Linux.
+Linux, linking a [pre-built ds4 core](#pre-built-ds4-cores) if you cannot
+compile the C engine.
 
 ## Building
 
@@ -60,6 +61,98 @@ Clone with `--recurse-submodules`.
 
 `PLANK_NO_DS4=1` skips the ds4 engine on any OS.
 
+### Pre-built ds4 cores
+
+The ds4 C engine is the only part of plank that needs `make`, a C compiler for
+its kernels, `nvcc` or `hipcc`; Gemma and Flint are Rust and build with cargo
+alone. A machine that cannot compile the C engine can link a pre-built core
+instead, by setting `PLANK_DS4_PREBUILT` before building. Building from source
+stays the default and needs nothing from this section.
+
+```sh
+# The core for this target from the release of the ds4 commit refs/ds4 pins:
+PLANK_DS4_PREBUILT=github cargo build --release
+# An NVIDIA GPU: the CUDA core for the GPU nvidia-smi reports
+PLANK_DS4_PREBUILT=github PLANK_DS4_BACKEND=cuda cargo build --release
+# A package you already have, as a directory or a .tar.gz:
+PLANK_DS4_PREBUILT=~/Downloads/ds4core-x86_64-unknown-linux-gnu-cpu.tar.gz cargo build --release
+# Any other URL needs its SHA-256:
+PLANK_DS4_PREBUILT=https://example.com/ds4core.tar.gz PLANK_DS4_PREBUILT_SHA256=<hex> cargo build --release
+```
+
+The `ds4 core` workflow (`.github/workflows/ds4core.yml`) publishes the
+packages to a prerelease named after the ds4 commit, `ds4core-<first 12 hex>`,
+each time `refs/ds4` moves. That commit names the release, not plank's version,
+because it decides whether a core fits plank's FFI:
+
+| Package | Host code | For |
+|---|---|---|
+| `aarch64-apple-darwin-metal` | Apple M1 | every Apple Silicon Mac |
+| `x86_64-unknown-linux-gnu-cpu` | x86-64-v3 (AVX2) | Haswell, Zen and later |
+| `aarch64-unknown-linux-gnu-cpu` | ARMv8.2-A + fp16 + dotprod | Graviton2+, Grace, GB10, Ampere |
+| `x86_64-unknown-linux-gnu-cuda-sm_80` / `sm_86` / `sm_89` / `sm_90` / `sm_120` | x86-64-v3 | A100; RTX 30; RTX 40, L40; H100; RTX 50 |
+| `aarch64-unknown-linux-gnu-cuda-sm_90` / `sm_121` | ARMv8.2-A | GH200; DGX Spark |
+| `x86_64-unknown-linux-gnu-rocm-gfx1151` | x86-64-v3 | Strix Halo |
+
+With `PLANK_DS4_BACKEND=cuda`, plank picks the variant from the GPU's compute
+capability. It takes the highest variant of the same major version that does
+not exceed the GPU's, because a cubin runs on later minors of its major. A GPU
+with a newer major than any variant (B200, compute 10.0) gets `sm_90`, whose
+embedded PTX the driver compiles for it at first load. `PLANK_DS4_PREBUILT_ARCH`
+names the variant outright, and is required on a machine without `nvidia-smi`.
+For ROCm it defaults to `ROCM_ARCH`, else `gfx1151`.
+
+**What is checked before anything links.** A package downloaded from a release
+must match that release's `ds4core-<hex>-SHA256SUMS`, and a URL must match
+`PLANK_DS4_PREBUILT_SHA256`. The SHA-256 of `libds4core.a` must match the hash
+in the package's `ds4core.json`. The manifest must also name:
+- this build's target triple,
+- the backend `PLANK_DS4_BACKEND` asks for (always Metal on macOS),
+- the ds4 commit `refs/ds4` pins.
+
+The commit check matters most. plank's `ffi.rs` mirrors the C structs of the
+pinned `ds4.h`, so a core from another commit can corrupt memory rather than
+fail cleanly. The build refuses one unless `PLANK_DS4_PREBUILT_ALLOW_MISMATCH=1`
+is set. The pin is read from the git index (`git ls-files --stage refs/ds4`), so
+the submodule does not need to be checked out. A source tree without git must
+set `DS4_COMMIT`. The package also carries the `ds4.h` it was compiled against,
+so you can diff it against `refs/ds4/ds4.h`.
+
+**Provenance.** Each package has a GitHub build provenance attestation tying it
+to the workflow run that built it:
+
+```sh
+gh attestation verify ds4core-x86_64-unknown-linux-gnu-cpu.tar.gz --repo aovestdipaperino/plank
+```
+
+**Runtime dependencies.** The cores are static archives, so plank carries the
+engine itself. What remains is what a source build links as well:
+- **CPU:** libm only.
+- **CUDA:** a CUDA 12 runtime, libcudart and libcublas, at link time and at run
+  time (`CUDA_HOME`, default `/usr/local/cuda`), plus an NVIDIA driver that
+  supports CUDA 12.9 or later. The packages are built with CUDA 12.9, and the
+  build warns when `CUDA_HOME` holds another major version.
+- **ROCm:** ROCm 6.4 libraries (`amdhip64`, `hipblas`, `hipblaslt`, `rocblas`)
+  under `ROCM_PATH`.
+- **Metal:** the kernel sources ship in the package's `metal/`, and the build
+  points `DS4_METAL_DIR` at its copy in `target/`. A binary moved to another
+  machine looks in `../share/plank/metal`, as a Homebrew bottle does.
+
+The Linux packages are built on Ubuntu 22.04 (glibc 2.35) and link on it and
+anything newer. There are no Windows packages, because the C engine has no
+Windows build ([WSL2](#deepseek-and-qwen-on-windows-wsl2) runs the Linux ones).
+Gemma on CUDA (`--features cuda`) still compiles candle's kernels with `nvcc`;
+no pre-built form of it exists.
+
+**Making a package.** `PLANK_DS4_EXPORT=<dir>` makes a source build also write
+its package to `<dir>`: `libds4core.a`, `ds4core.json`, `ds4.h` and, for
+Metal, `metal/`. Set `NATIVE_CPU_FLAG` to a portable baseline, because the
+default `native` binds the core to the build machine's CPU, and the manifest
+records it. For CUDA, set `CUDA_ARCH` to an `sm_*`. Archive the directory's
+contents with `tar czf <name>.tar.gz -C <dir> .`. CI exports a CPU core this way
+on every push, links it back with the ds4 sources out of reach, and checks that
+a tampered library is refused.
+
 ### `cargo install`
 
 plank is not on crates.io, but `cargo install` builds it from the repository.
@@ -75,7 +168,13 @@ PLANK_DS4_BACKEND=cuda cargo install --locked --git https://github.com/aovestdip
 cargo install --locked --git https://github.com/aovestdipaperino/plank plank --features cuda
 # Without the ds4 engine (much faster to build):
 PLANK_NO_DS4=1 cargo install --locked --git https://github.com/aovestdipaperino/plank plank
+# Linking a pre-built ds4 core instead of compiling it:
+PLANK_DS4_PREBUILT=github PLANK_DS4_BACKEND=cuda cargo install --locked --git https://github.com/aovestdipaperino/plank plank
 ```
+
+If the build reports that it cannot read the `refs/ds4` pin in cargo's checkout,
+set `DS4_COMMIT` to the commit `git ls-tree <tag> refs/ds4` shows for the
+revision being installed.
 
 ## Memory
 
