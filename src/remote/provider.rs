@@ -325,11 +325,23 @@ fn parse_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
         .get("completion_tokens")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
+    let input = i32::try_from(input).unwrap_or(i32::MAX);
+    // `prompt_tokens` counts the cached prefix too (OpenAI, llama.cpp). Split it
+    // out as a cache read, as the Responses and Anthropic paths do, so the
+    // uncached remainder is what prefill speed is measured over; `ctx_used`
+    // sums them back and is unchanged.
+    let cached = value
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0)
+        .clamp(0, input);
     Some(ProviderUsage {
-        input_tokens: i32::try_from(input).unwrap_or(i32::MAX),
+        input_tokens: input - cached,
         output_tokens: i32::try_from(output).unwrap_or(i32::MAX),
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: cached,
     })
 }
 
@@ -894,8 +906,9 @@ fn round2(x: f32) -> serde_json::Value {
 // Retry policy (issue: providers return transient HTTP errors mid-session)
 // ---------------------------------------------------------------------------
 
-/// Maximum request attempts before a provider error is surfaced to the user.
-const MAX_ATTEMPTS: u32 = 5;
+/// Maximum request attempts (the first try plus 20 retries) before a provider
+/// error is surfaced to the user.
+const MAX_ATTEMPTS: u32 = 21;
 
 /// Sub-agent sidechains this engine will serve concurrently
 /// ([`Engine::max_parallel`]).
@@ -927,11 +940,11 @@ fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
 }
 
 /// Exponential backoff for attempt `n` (0-based): 250ms, 500ms, 1s, 2s, 4s,
-/// capped at 4s. Jitter is layered on by [`jittered`].
+/// 8s, 16s, capped at 30s. Jitter is layered on by [`jittered`].
 #[must_use]
 fn backoff_base(attempt: u32) -> std::time::Duration {
-    let ms = 250u64.saturating_mul(1u64 << attempt.min(4));
-    std::time::Duration::from_millis(ms.min(4000))
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(7));
+    std::time::Duration::from_millis(ms.min(30_000))
 }
 
 /// Applies "full jitter" to a backoff delay: a duration in `[base/2, base]`,
@@ -1853,7 +1866,11 @@ impl Engine for ProviderEngine {
             steady_tps,
             generated: usage.output_tokens,
             tps,
-            prefill_tokens: prompt_total,
+            // Only what the server actually processed: a cache read arrives
+            // in no time and would inflate the rate.
+            prefill_tokens: usage
+                .input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
             prefill_secs,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
@@ -1957,9 +1974,10 @@ mod tests {
         assert_eq!(backoff_base(2), Duration::from_secs(1));
         assert_eq!(backoff_base(3), Duration::from_secs(2));
         assert_eq!(backoff_base(4), Duration::from_secs(4));
+        assert_eq!(backoff_base(6), Duration::from_secs(16));
         // Capped, and no overflow on a large attempt count.
-        assert_eq!(backoff_base(9), Duration::from_secs(4));
-        assert_eq!(backoff_base(u32::MAX), Duration::from_secs(4));
+        assert_eq!(backoff_base(7), Duration::from_secs(30));
+        assert_eq!(backoff_base(u32::MAX), Duration::from_secs(30));
     }
 
     #[test]
@@ -2056,6 +2074,21 @@ mod tests {
             .unwrap();
         assert!(!line_arg.is_string);
         assert_eq!(line_arg.value, "42");
+    }
+
+    /// llama.cpp counts its cached prefix inside `prompt_tokens`; it must come
+    /// out as a cache read so prefill speed is measured over processed tokens.
+    #[test]
+    fn openai_usage_splits_cached_prompt_tokens() {
+        let u = parse_usage(&serde_json::json!({
+            "prompt_tokens": 32,
+            "completion_tokens": 16,
+            "prompt_tokens_details": {"cached_tokens": 27}
+        }))
+        .unwrap();
+        assert_eq!(u.input_tokens, 5);
+        assert_eq!(u.cache_read_input_tokens, 27);
+        assert_eq!(u.output_tokens, 16);
     }
 
     #[test]

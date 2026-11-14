@@ -7572,6 +7572,11 @@ impl Agent<'_> {
         let model = self.engine.model_name();
         if stats.prefill_tokens > 0 {
             crate::speeds::note_prefill_pass(&model, stats.prefill_tokens, stats.prefill_secs);
+            // A provider's synthetic prefill event carries no rate, so the
+            // `/toks` prefill chart gets its sample from the finished pass.
+            if stats.prefill_secs > 0.0 {
+                crate::toks::record_prefill(f64::from(stats.prefill_tokens) / stats.prefill_secs);
+            }
         }
         let gen_tps = if stats.steady_tps > 0.0 {
             stats.steady_tps
