@@ -144,6 +144,36 @@ pub fn supports_vision(path: &Path) -> bool {
 /// key holds a non-string value.
 #[must_use]
 pub fn string_value(path: &Path, wanted: &str) -> Option<String> {
+    // Type 8 is STRING. A different type here means the file is not shaped
+    // the way the engine expects, so say nothing rather than coerce it.
+    find_value(path, wanted, |r, ty| {
+        (ty == 8).then(|| read_string(r)).flatten()
+    })
+}
+
+/// Reads one unsigned-integer metadata value out of a GGUF file.
+///
+/// Accepts the four integer widths a converter may write a count in (`u32`,
+/// `i32`, `u64`, `i64`); a negative signed value, like any other type, reads
+/// as `None`.
+#[must_use]
+pub fn uint_value(path: &Path, wanted: &str) -> Option<u64> {
+    find_value(path, wanted, |r, ty| match ty {
+        4 => Some(u64::from(u32::from_le_bytes(read_exact::<4>(r)?))),
+        5 => u64::try_from(i32::from_le_bytes(read_exact::<4>(r)?)).ok(),
+        10 => read_u64(r),
+        11 => u64::try_from(i64::from_le_bytes(read_exact::<8>(r)?)).ok(),
+        _ => None,
+    })
+}
+
+/// Walks the metadata keys up to `wanted` and hands its type and the reader,
+/// positioned at the value, to `read`.
+fn find_value<T>(
+    path: &Path,
+    wanted: &str,
+    read: impl FnOnce(&mut BufReader<File>, u32) -> Option<T>,
+) -> Option<T> {
     let mut r = BufReader::new(File::open(path).ok()?);
     if &read_exact::<4>(&mut r)? != b"GGUF" {
         return None;
@@ -158,14 +188,62 @@ pub fn string_value(path: &Path, wanted: &str) -> Option<String> {
         let key = read_string(&mut r)?;
         let ty = u32::from_le_bytes(read_exact::<4>(&mut r)?);
         if key == wanted {
-            // Type 8 is STRING. A different type here means the file is not
-            // shaped the way the engine expects, so say nothing rather than
-            // coerce it.
-            return (ty == 8).then(|| read_string(&mut r)).flatten();
+            return read(&mut r, ty);
         }
         skip_value(&mut r, ty)?;
     }
     None
+}
+
+/// The context window the model at `path` declares it supports, from its
+/// `<architecture>.context_length` key.
+///
+/// This is the window the model runs at without any extra rope scaling the
+/// user has to opt into: `DeepSeek` V4 declares 1048576 (its `YaRN` is built
+/// into the checkpoint), Qwen3.8 declares its native 262144. `None` when the
+/// file does not say (V4.1 carries the figure only inside its JSON config).
+#[must_use]
+pub fn context_length(path: &Path) -> Option<u64> {
+    let arch = architecture(path)?;
+    uint_value(path, &format!("{arch}.context_length"))
+}
+
+/// The C engine's window when the user did not pass `-c`: the configured
+/// default, capped at the window the model at `path` declares.
+///
+/// Opening Qwen3.8 at the 1048576-token default ran it past its native
+/// 262144 tokens without the `YaRN` that range needs, and planned ~33 GiB of KV
+/// for positions the model cannot use well. `DS4_QWEN4_YARN_FACTOR` is the
+/// user's own opt-in to static `YaRN`, which the C applies for a factor above 1,
+/// so it scales Qwen's cap by the same factor.
+#[must_use]
+pub fn default_ctx_size(path: &Path, configured: i32) -> i32 {
+    let yarn = if family_of(path) == ModelFamily::Qwen {
+        std::env::var("DS4_QWEN4_YARN_FACTOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    } else {
+        None
+    };
+    cap_ctx(configured, context_length(path), yarn)
+}
+
+/// [`default_ctx_size`] without the file and the environment: `configured`,
+/// capped at `native` scaled by a `YaRN` `factor` above 1.
+fn cap_ctx(configured: i32, native: Option<u64>, yarn_factor: Option<f64>) -> i32 {
+    let Some(native) = native.filter(|&n| n > 0) else {
+        return configured;
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let cap = match yarn_factor.filter(|f| f.is_finite() && *f > 1.0) {
+        Some(f) => (native as f64 * f) as u64,
+        None => native,
+    };
+    i32::try_from(cap).map_or(configured, |cap| configured.min(cap))
 }
 
 fn read_exact<const N: usize>(r: &mut impl Read) -> Option<[u8; N]> {
@@ -839,5 +917,50 @@ mod tests {
         assert!(!msg.contains("returned 0"), "{msg}");
         assert!(!msg.contains("DS4_METAL_DIR"), "{msg}");
         let _ = std::fs::remove_file(&model);
+    }
+
+    /// The window is read under the file's own architecture prefix, past keys
+    /// of every width, and the cap uses it.
+    #[test]
+    fn context_length_reads_the_architecture_key() {
+        let path = Gguf::default()
+            .str_val("general.architecture", QWEN_ARCH)
+            .str_array("tokenizer.ggml.tokens", &["a", "b"])
+            .u32_val("deepseek4.context_length", 1_048_576)
+            .u32_val("qwen4exp.context_length", 262_144)
+            .write("ctxlen-qwen");
+        assert_eq!(context_length(&path), Some(262_144));
+        assert_eq!(
+            uint_value(&path, "general.architecture"),
+            None,
+            "a string is not a count"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let none = Gguf::default()
+            .str_val("general.architecture", DS41_ARCH)
+            .write("ctxlen-none");
+        assert_eq!(context_length(&none), None);
+        assert_eq!(default_ctx_size(&none, 1_048_576), 1_048_576);
+        let _ = std::fs::remove_file(&none);
+    }
+
+    #[test]
+    fn the_default_window_stops_at_the_declared_one() {
+        // Qwen: 1M default, native 262144, no YaRN opt-in.
+        assert_eq!(cap_ctx(1_048_576, Some(262_144), None), 262_144);
+        // DeepSeek V4 declares the default itself.
+        assert_eq!(cap_ctx(1_048_576, Some(1_048_576), None), 1_048_576);
+        // A smaller configured window is never raised.
+        assert_eq!(cap_ctx(65_536, Some(262_144), None), 65_536);
+        // No declaration, or a zero one, leaves the configured window alone.
+        assert_eq!(cap_ctx(1_048_576, None, None), 1_048_576);
+        assert_eq!(cap_ctx(1_048_576, Some(0), None), 1_048_576);
+        // The YaRN opt-in scales the cap; a factor of 1 or less is no YaRN,
+        // exactly as the C reads it.
+        assert_eq!(cap_ctx(1_048_576, Some(262_144), Some(2.0)), 524_288);
+        assert_eq!(cap_ctx(1_048_576, Some(262_144), Some(4.0)), 1_048_576);
+        assert_eq!(cap_ctx(1_048_576, Some(262_144), Some(1.0)), 262_144);
+        assert_eq!(cap_ctx(1_048_576, Some(262_144), Some(f64::NAN)), 262_144);
     }
 }

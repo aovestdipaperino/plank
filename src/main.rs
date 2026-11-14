@@ -1517,6 +1517,22 @@ fn make_fake_engine(cfg: &AgentConfig) -> Box<dyn Engine> {
     ))
 }
 
+/// The C engine's context window: `-c` (or a settings `ctx`) when the user
+/// gave one, else the configured default capped at the window the model file
+/// declares ([`plank::gguf::default_ctx_size`]), so Qwen3.8 opens at its
+/// native 262144 tokens rather than past it without `YaRN`.
+#[cfg(ds4_engine)]
+fn ds4_ctx_size(cfg: &AgentConfig, model: &std::path::Path) -> i32 {
+    if cfg.ctx_size_explicit {
+        return cfg.generation.ctx_size;
+    }
+    let ctx = plank::gguf::default_ctx_size(model, cfg.generation.ctx_size);
+    if ctx != cfg.generation.ctx_size {
+        eprintln!("plank: context {ctx} tokens (the model's declared window; -c to change)");
+    }
+    ctx
+}
+
 fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     if cfg.fake_gpu {
         return Ok((make_fake_engine(cfg), None));
@@ -1566,7 +1582,8 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         // into `cfg`: only the engine open needs it. A Qwen model skips both side artifacts, since it opens
         // neither.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
+        let ctx_size = ds4_ctx_size(cfg, &model);
+        plank::download::ensure_side_artifacts(sel, ctx_size, &mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -1581,7 +1598,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
             let first = match Ds4Engine::open(
                 &model,
                 backend,
-                cfg.generation.ctx_size,
+                ctx_size,
                 cfg.n_threads,
                 cfg.power_percent,
                 &tuning,
@@ -1603,7 +1620,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
             Ds4Engine::open(
                 &model,
                 backend,
-                cfg.generation.ctx_size,
+                ctx_size,
                 cfg.n_threads,
                 cfg.power_percent,
                 &solo,
@@ -1628,7 +1645,6 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
         );
         let reopen_path = model;
-        let ctx_size = cfg.generation.ctx_size;
         let (n_threads, power) = (cfg.n_threads, cfg.power_percent);
         let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
             // Everything the C would `exit` on, checked here first so it is an
@@ -1990,7 +2006,8 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // any other DeepSeek checkpoint runs text-only.
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
-        plank::download::ensure_side_artifacts(sel, cfg.generation.ctx_size, &mut tuning)?;
+        let ctx_size = ds4_ctx_size(cfg, &model_path);
+        plank::download::ensure_side_artifacts(sel, ctx_size, &mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -2001,7 +2018,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         let model = Ds4Model::open_shared(
             &model_path,
             backend,
-            cfg.generation.ctx_size,
+            ctx_size,
             cfg.n_threads,
             cfg.power_percent,
             &tuning,
