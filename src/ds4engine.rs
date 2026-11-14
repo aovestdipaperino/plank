@@ -992,15 +992,27 @@ impl Ds4Model {
     }
 
     /// The tokens for a system message, split at `trusted_len` — the delta
-    /// [`Self::append_system_text`] contributes, isolated from any preamble the
-    /// same way [`Self::message_tokens`] isolates a message's.
-    ///
-    /// A system message carries no role wrapper (`ds4_chat_append_message`
-    /// tokenizes its content directly), so this is exactly the content tokens.
-    fn system_message_tokens(&self, system: &str, trusted_len: usize) -> Vec<i32> {
+    /// [`Self::append_system_text`] contributes past `prefix` (or the opening
+    /// preamble for the first message), isolated the same way
+    /// [`Self::message_tokens`] isolates a message's. V4.1 decides whether to
+    /// emit a system marker by inspecting the preceding tokens, so tokenizing in
+    /// an empty buffer inserts a duplicate after the effort prefix.
+    fn system_message_tokens(
+        &self,
+        prefix: Option<&[i32]>,
+        think: ThinkMode,
+        system: &str,
+        trusted_len: usize,
+    ) -> Vec<i32> {
         let mut tokens = Ds4TokensGuard::new();
+        if let Some(prefix) = prefix {
+            tokens.push_all(prefix);
+        } else {
+            tokens.push_all(&self.begin_tokens(think));
+        }
+        let base = usize::try_from(tokens.len()).unwrap_or(0);
         self.append_system_text(&mut tokens, system, trusted_len);
-        tokens.to_vec()
+        tokens.slice_from(base).to_vec()
     }
 
     /// The assistant-prefix tokens for the given think mode (the `<assistant>`
@@ -1700,8 +1712,12 @@ impl Ds4Session {
             // the multimodal branch, empty for every other message.
             let mut vision = Vec::new();
             let mut toks = if span_role == SpanRole::System {
-                self.model
-                    .system_message_tokens(text, self.trusted_system_len)
+                self.model.system_message_tokens(
+                    (!self.transcript.is_empty()).then(|| self.transcript.tokens()),
+                    self.think,
+                    text,
+                    self.trusted_system_len,
+                )
             } else if let Some(images) = self.take_images_for_section(text) {
                 // A section carrying image observations is tokenized with
                 // `ds4_chat_append_multimodal_message` (role "user" for GLM
@@ -2761,13 +2777,10 @@ impl Engine for Ds4Session {
     }
 
     fn warm_append_system(&mut self, text: &str) -> Result<(), EngineError> {
-        // `trusted_len` 0 sends the whole text down the plain path, which is
-        // byte-for-byte the branch `append_system_text` would take for this
-        // same remainder. So `warm_reset(trusted)` followed by this call builds
-        // exactly the buffer `build_system_tokens(whole, trusted_len)` builds,
-        // and the split costs no token movement at all.
-        let msg = self.model.system_message_tokens(text, 0);
-        self.warm_tokens.push_all(&msg);
+        // Append in place so V4.1 sees the existing system marker and does not
+        // insert another one at the trusted/plain boundary.
+        self.model
+            .append_system_text(&mut self.warm_tokens, text, 0);
         Ok(())
     }
 
@@ -3939,10 +3952,16 @@ mod tests {
                 .count()
         };
 
-        let split = engine
-            .model
-            .system_message_tokens(&parts.text, parts.trusted_len);
-        let plain = engine.model.system_message_tokens(&parts.text, 0);
+        let split = engine.model.system_message_tokens(
+            None,
+            crate::engine::ThinkMode::Off,
+            &parts.text,
+            parts.trusted_len,
+        );
+        let plain =
+            engine
+                .model
+                .system_message_tokens(None, crate::engine::ThinkMode::Off, &parts.text, 0);
 
         assert!(
             count_marker_tokens(&split) > 0,
@@ -4064,27 +4083,40 @@ mod tests {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
-        let tuning = crate::config::EngineTuning::default();
-        let engine =
+        // Streaming keeps a >RAM model (V4.1 Q2) openable; this test only tokenizes.
+        let tuning = crate::config::EngineTuning {
+            ssd_streaming: true,
+            ..crate::config::EngineTuning::default()
+        };
+        let mut engine =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
         let parts = crate::sysprompt::build_system_prompt_parts("Be terse.", &[], true);
+        let rendered = format!("[system]\n{}\n", parts.text);
 
         for think in [
             crate::engine::ThinkMode::Off,
             crate::engine::ThinkMode::Medium,
+            crate::engine::ThinkMode::Low,
         ] {
+            use crate::engine::Engine;
+            engine.set_trusted_system_prefix(parts.trusted_len);
+            engine.set_think_mode(think);
             let warm = engine
                 .model
                 .build_system_tokens(&parts.text, parts.trusted_len, think)
                 .to_vec();
+            // The split warm walk the tiers actually run: trusted half, then the
+            // tail as its own system message (`warm_append_system`).
+            let (trusted, tail) = parts.text.split_at(parts.trusted_len);
+            engine.warm_reset(trusted).unwrap();
+            engine.warm_append_system(tail).unwrap();
+            let split = engine.warm_tokens.to_vec();
             // What `reconcile` builds for the first (system) section.
-            let mut turn = engine.model.begin_tokens(think);
-            turn.extend_from_slice(
-                &engine
-                    .model
-                    .system_message_tokens(&parts.text, parts.trusted_len),
-            );
+            engine.transcript = super::TokenTranscript::new();
+            engine.reconcile(&rendered);
+            let turn = engine.transcript.tokens().to_vec();
             assert_eq!(warm, turn, "{think:?}");
+            assert_eq!(split, turn, "{think:?} split");
         }
     }
 
