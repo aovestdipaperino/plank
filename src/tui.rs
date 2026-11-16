@@ -4439,48 +4439,99 @@ fn diff_line_spans(
     spans
 }
 
+/// One checklist row of the launch screen, its label padded to `label_width`.
+fn warm_row_line(r: &crate::warmscreen::Row, label_width: usize) -> Line<'static> {
+    use crate::warmscreen::RowState;
+
+    let pad = " ".repeat(label_width - r.label.chars().count());
+    match r.state {
+        RowState::Done => Line::from(vec![
+            Span::styled("✓ ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{}{pad}", r.label)),
+        ]),
+        RowState::Active { done, total, tps } => {
+            let total = total.max(1);
+            let done = done.clamp(0, total);
+            let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
+            let bar = crate::status::progress_bar(done, total, tps, false);
+            let eta = crate::status::prefill_eta(done, total, tps)
+                .map(|eta| format!("  ~{eta} left"))
+                .unwrap_or_default();
+            Line::from(vec![
+                Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}{pad}", r.label),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {bar}  {pct}%{eta}")),
+            ])
+        }
+        RowState::Waiting => Line::from(vec![
+            Span::styled("· ", Style::default().fg(Color::Indexed(240))),
+            Span::styled(
+                format!("{}{pad}", r.label),
+                Style::default().fg(Color::Indexed(240)),
+            ),
+            Span::styled(
+                format!("  {}  0%", crate::status::progress_bar(0, 1, 0.0, false)),
+                Style::default().fg(Color::Indexed(240)),
+            ),
+        ]),
+    }
+}
+
 /// Minimal pre-UI screen shown while the KV cache is (re)built at launch: a
-/// centered note and a simple progress bar. The full UI is withheld until
-/// warming finishes, so the user sees clear progress instead of an idle screen
-/// during the one slow step. `stage` names the tier currently prefilling (see
-/// [`crate::kvtier::TierKind::warm_label`]) so the note does not claim the
-/// system prompt is being rebuilt while a cheaper context tier is the one
-/// running.
-pub fn draw_warm(
-    frame: &mut Frame,
-    done: i32,
-    total: i32,
-    tps: f64,
-    stage: &str,
-    notice: Option<&str>,
-) {
-    let total = total.max(1);
-    let done = done.clamp(0, total);
-    let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
-    let bar = crate::status::progress_bar(done, total, tps, false);
-    // ETA sits after the percentage so the bar+t/s prefix keeps a stable width;
-    // it is absent until the rate is known, rather than showing a bogus `~0s`.
-    let eta = crate::status::prefill_eta(done, total, tps)
-        .map(|eta| format!("  ~{eta} left"))
-        .unwrap_or_default();
+/// centered checklist with one row per cache tier, all visible from the first
+/// frame. A cached or finished tier shows a checkmark, the tier prefilling
+/// shows its live bar, and a tier still to come shows an empty bar, so the user
+/// can see how many prefills are ahead. The full UI is withheld until warming
+/// finishes. `notice` is the rebuild reason, drawn under the list.
+pub fn draw_warm(frame: &mut Frame, screen: &crate::warmscreen::WarmScreen, notice: Option<&str>) {
+    let label_width = screen
+        .rows()
+        .iter()
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = screen
+        .rows()
+        .iter()
+        .map(|r| warm_row_line(r, label_width))
+        .collect();
+    let count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let width = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0)).unwrap_or(u16::MAX);
     let area = frame.area();
     let rows = Layout::vertical([
-        Constraint::Percentage(45),
+        Constraint::Percentage(40),
         Constraint::Length(2),
+        Constraint::Length(count),
         Constraint::Min(0),
     ])
     .split(area);
-    let text = Text::from(vec![
-        Line::from(Span::styled(
-            format!("{stage}…"),
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Preparing context caches…",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ))
+        )))
         .centered(),
-        Line::from(format!("{bar}  {pct}%{eta}")).centered(),
-    ]);
-    frame.render_widget(Paragraph::new(text), rows[1]);
+        rows[1],
+    );
+    let list = Rect {
+        x: rows[2].x + rows[2].width.saturating_sub(width) / 2,
+        y: rows[2].y,
+        width: width.min(rows[2].width),
+        height: rows[2].height,
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)), list);
     // Reason for the rebuild (cache missing / prompt changed + diff), below the
     // progress bar in the reserved region.
     if let Some(notice) = notice {
@@ -4515,7 +4566,7 @@ pub fn draw_warm(
                 Line::from(Span::styled(l.to_owned(), style))
             })
             .collect();
-        frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);
+        frame.render_widget(Paragraph::new(Text::from(lines)), rows[3]);
     }
 }
 
@@ -6813,6 +6864,59 @@ mod tests {
             4_000,
             "frozen at what it took"
         );
+    }
+
+    #[test]
+    fn draw_warm_lists_every_tier_with_check_bar_or_empty_bar() {
+        use crate::kvtier::{StageEvent, StageState, TierKind, WarmStage};
+        use crate::warmscreen::WarmScreen;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let plan = vec![
+            WarmStage {
+                kind: TierKind::System,
+                state: StageState::Cached,
+            },
+            WarmStage {
+                kind: TierKind::ProjectStable,
+                state: StageState::Pending,
+            },
+            WarmStage {
+                kind: TierKind::SessionVolatile,
+                state: StageState::Pending,
+            },
+        ];
+        let mut screen = WarmScreen::from_plan(&plan);
+        screen.stage(StageEvent::Start(TierKind::ProjectStable));
+        screen.progress(33, 100, 874.0);
+
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        term.draw(|f| draw_warm(f, &screen, None)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}: {lines:#?}"))
+                .clone()
+        };
+        assert!(row("System prompt").contains('✓'));
+        let active = row("Project context");
+        assert!(
+            active.contains("33%") && active.contains("874t/s"),
+            "{active}"
+        );
+        let waiting = row("Session context");
+        assert!(waiting.contains('[') && waiting.contains("0%"), "{waiting}");
+        assert!(!waiting.contains('✓'));
     }
 
     #[test]

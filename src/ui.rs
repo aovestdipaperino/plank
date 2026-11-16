@@ -15400,70 +15400,80 @@ impl Agent<'_> {
         self.alt_engines.insert(EngineKey::Local, engine);
     }
 
+    /// Whether the sub-agent's local tier 1 will need a prefill at this launch,
+    /// for the launch checklist; `None` when there is no local alt engine.
+    fn alt_local_warm_state(&self) -> Option<crate::kvtier::StageState> {
+        let engine = self.alt_engines.get(&EngineKey::Local)?;
+        let tiers = self.kv_tiers_for(&engine.model_name());
+        let system = tiers
+            .first()
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)?;
+        crate::kvtier::warm_plan(Some(&self.store), std::slice::from_ref(system))
+            .first()
+            .map(|s| s.state)
+    }
+
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         if self.skip_warm_after_restore() {
             return Ok(());
         }
         let tiers = self.kv_tiers();
-        // The rebuild reason arrives as a Notice before prefill; keep it and
-        // render it below the bar.
-        let mut notice: Option<String> = None;
-        // Which tier the bar is covering right now. A `Cell` because the stage
-        // and event callbacks both need it and only one of them may hold the
-        // terminal mutably; the stage callback only records the label, and the
-        // prefill events that follow immediately paint it.
+        let mut initial = crate::warmscreen::WarmScreen::from_plan(&crate::kvtier::warm_plan(
+            Some(&self.store),
+            &tiers,
+        ));
+        if let Some(state) = self.alt_local_warm_state() {
+            initial.push_alt("Sub-agent system prompt", state);
+        }
+        // Shared by the event and stage callbacks, which both repaint, so the
+        // screen, the rebuild reason and the terminal sit behind RefCells.
+        let screen = std::cell::RefCell::new(initial);
+        let notice = std::cell::RefCell::new(None::<String>);
+        let term = std::cell::RefCell::new(&mut *terminal);
+        let repaint = || {
+            let screen = screen.borrow();
+            let notice = notice.borrow();
+            let _ = term
+                .borrow_mut()
+                .draw(|f| tui::draw_warm(f, &screen, notice.as_deref()))
+                .map(|done| crate::logo::after_draw(done.buffer));
+        };
+        // First frame: every cache line is visible before any work starts.
+        repaint();
         let labels = self.tier_labels();
-        let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         crate::kvtier::warm(
             &mut *self.engine,
             Some(&self.store),
             &tiers,
-            &mut |ev| match ev {
-                EngineEvent::Notice(msg) => {
-                    notice = Some(msg);
-                    let _ = terminal
-                        .draw(|f| tui::draw_warm(f, 0, 1, 0.0, stage.get(), notice.as_deref()))
-                        .map(|done| crate::logo::after_draw(done.buffer));
+            &mut |ev| {
+                match ev {
+                    EngineEvent::Notice(msg) => *notice.borrow_mut() = Some(msg),
+                    EngineEvent::Prefill(p) => screen.borrow_mut().progress(p.done, p.total, p.tps),
+                    // Warm never speculates, so Spec cannot arrive here.
+                    EngineEvent::Text(_) | EngineEvent::Spec(_) => return,
                 }
-                EngineEvent::Prefill(p) => {
-                    let _ = terminal
-                        .draw(|f| {
-                            tui::draw_warm(
-                                f,
-                                p.done,
-                                p.total,
-                                p.tps,
-                                stage.get(),
-                                notice.as_deref(),
-                            );
-                        })
-                        .map(|done| crate::logo::after_draw(done.buffer));
-                }
-                // Warm never speculates, so Spec cannot arrive here.
-                EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
+                repaint();
             },
             &mut |ev| {
-                if let crate::kvtier::StageEvent::Start(kind) = ev {
-                    stage.set(kind.warm_label());
-                }
+                screen.borrow_mut().stage(ev);
+                repaint();
             },
             &labels,
         )
         .map_err(|e| e.to_string())?;
-        // The sub-agent's local engine gets the same treatment on the same
-        // screen; it is a second engine, so it needs its own walk.
-        let alt_stage = "Caching the system prompt for the local sub-agent";
+        // The sub-agent's local engine is a second engine and needs its own
+        // walk, but it reports into the same checklist.
         self.warm_alt_local_tier1(
             &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
-                    let _ = terminal
-                        .draw(|f| {
-                            tui::draw_warm(f, p.done, p.total, p.tps, alt_stage, None);
-                        })
-                        .map(|done| crate::logo::after_draw(done.buffer));
+                    screen.borrow_mut().progress(p.done, p.total, p.tps);
+                    repaint();
                 }
             },
-            &mut |_| {},
+            &mut |ev| {
+                screen.borrow_mut().alt_stage(ev);
+                repaint();
+            },
         );
         self.gc_kv_tiers(&tiers);
         Ok(())
@@ -15492,6 +15502,25 @@ impl Agent<'_> {
             return Ok(());
         }
         let tiers = self.kv_tiers();
+        // Show the whole plan once when a cacheable tier will rebuild. The
+        // session-context tier prefills every launch, so on its own it is not
+        // worth a block of lines.
+        let plan = crate::kvtier::warm_plan(Some(&self.store), &tiers);
+        if plan.iter().any(|s| {
+            s.state == crate::kvtier::StageState::Pending
+                && s.kind != crate::kvtier::TierKind::SessionVolatile
+        }) {
+            for s in &plan {
+                match s.state {
+                    crate::kvtier::StageState::Cached => {
+                        eprintln!("  ✓ {}", s.kind.short_label());
+                    }
+                    crate::kvtier::StageState::Pending => {
+                        eprintln!("  · {} (will rebuild)", s.kind.short_label());
+                    }
+                }
+            }
+        }
         let color = self.color;
         // Which tier is prefilling, and the label last printed for it: each
         // stage announces itself once, so the note names the work actually
@@ -33973,6 +34002,15 @@ mod tests {
             tiers, trimmed,
             "trailing whitespace keys and warms exactly like the trimmed prompt"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alt_local_warm_state_is_none_without_a_local_alt_engine() {
+        let dir = scratch_dir("alt-warm-state-none");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert_eq!(agent.alt_local_warm_state(), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
