@@ -84,6 +84,78 @@ impl TierKind {
             Self::SessionVolatile => "Updating session context",
         }
     }
+
+    /// A noun phrase for a row in the launch checklist, where the tier is shown
+    /// next to a checkmark or a bar rather than inside a sentence.
+    #[must_use]
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::System => "System prompt",
+            Self::SystemTail => "Tool definitions",
+            Self::ProjectStable => "Project context",
+            Self::SessionVolatile => "Session context",
+        }
+    }
+}
+
+/// What [`warm`] tells a front end about the tier it is working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageEvent {
+    /// This tier is about to prefill (never sent for a restored tier).
+    Start(TierKind),
+    /// This tier finished prefilling and its checkpoint, if any, is written.
+    Finish(TierKind),
+}
+
+/// Whether a tier is expected to need a prefill at this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageState {
+    /// A checkpoint at this tier or a deeper one is on disk: nothing to prefill.
+    Cached,
+    /// This tier will prefill.
+    Pending,
+}
+
+/// One row of the launch plan built by [`warm_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmStage {
+    /// Which tier.
+    pub kind: TierKind,
+    /// Whether it is expected to prefill.
+    pub state: StageState,
+}
+
+/// Predicts which tiers [`warm`] will prefill, so a front end can show every
+/// stage before the first one starts.
+///
+/// Applies `warm`'s own rule: the deepest tier with a checkpoint marks itself
+/// and every tier above it cached; everything below is pending, including a
+/// prefill-only tier (no key). Only file *existence* is checked: loading a
+/// checkpoint reads tens of megabytes. It is a prediction: a file the engine
+/// later refuses makes `warm` fall back, and its [`StageEvent::Start`] then
+/// reports the tier that really rebuilds.
+#[must_use]
+pub fn warm_plan(store: Option<&SessionStore>, tiers: &[TierSpec]) -> Vec<WarmStage> {
+    let resume = store
+        .and_then(|store| {
+            tiers.iter().enumerate().rev().find_map(|(i, t)| {
+                let key = t.key.as_ref()?;
+                store.kv_path(key).is_file().then_some(i + 1)
+            })
+        })
+        .unwrap_or(0);
+    tiers
+        .iter()
+        .enumerate()
+        .map(|(i, t)| WarmStage {
+            kind: t.kind,
+            state: if i < resume {
+                StageState::Cached
+            } else {
+                StageState::Pending
+            },
+        })
+        .collect()
 }
 
 /// One tier of the prefix: the text it contributes, its chained fingerprint,
@@ -549,8 +621,9 @@ pub fn restore(
 /// the walk simply falls back to the previous tier. No corrupt cache file can
 /// abort startup.
 ///
-/// `on_stage` is called with each tier's kind immediately before that tier is
-/// prefilled (never for a restored tier), so a front end can name the stage its
+/// `on_stage` is called with `StageEvent::Start` immediately before a tier
+/// prefills and `StageEvent::Finish` after it (and its checkpoint) completes;
+/// never for a restored tier. A front end can thus name the stage its
 /// progress bar is actually covering — see [`TierKind::warm_label`].
 ///
 /// `labels` supplies the human-readable display material recorded in each
@@ -566,7 +639,7 @@ pub fn warm(
     store: Option<&SessionStore>,
     tiers: &[TierSpec],
     on_event: &mut dyn FnMut(EngineEvent),
-    on_stage: &mut dyn FnMut(TierKind),
+    on_stage: &mut dyn FnMut(StageEvent),
     labels: &TierLabels,
 ) -> Result<bool, EngineError> {
     let Some(system) = tiers.first().filter(|t| t.kind == TierKind::System) else {
@@ -656,7 +729,7 @@ pub fn warm(
             // sync — and do not re-persist a checkpoint we just read.
             continue;
         }
-        on_stage(t.kind);
+        on_stage(StageEvent::Start(t.kind));
         // Warming is where a cold session does its heaviest prefill — the
         // system prompt and project context — so most of a session's prefill
         // time is spent here rather than in a turn's own short suffix.
@@ -698,6 +771,7 @@ pub fn warm(
                 &tier_label(t.kind, labels, split),
             );
         }
+        on_stage(StageEvent::Finish(t.kind));
     }
     // Refresh the sidecar only after a Tier 1 rebuild actually completed: a
     // prefill that fails leaves no new checkpoint, so the *old* text is still
@@ -1264,7 +1338,8 @@ impl crate::engine::Engine for SpyEngine {
 #[cfg(test)]
 mod warm_tests {
     use super::{
-        Restored, TierKind, TierLabels, TierSpec, plan, restore, system_fingerprint, warm,
+        Restored, StageEvent, StageState, TierKind, TierLabels, TierSpec, plan, restore,
+        system_fingerprint, warm, warm_plan,
     };
     use std::path::Path;
 
@@ -1793,7 +1868,11 @@ mod warm_tests {
             Some(&store),
             &tiers,
             &mut |_| {},
-            &mut |k| cold.push(k),
+            &mut |ev| {
+                if let StageEvent::Start(k) = ev {
+                    cold.push(k);
+                }
+            },
             &TierLabels::default(),
         )
         .unwrap();
@@ -1823,7 +1902,11 @@ mod warm_tests {
             Some(&store),
             &tiers,
             &mut |_| {},
-            &mut |k| warm_stages.push(k),
+            &mut |ev| {
+                if let StageEvent::Start(k) = ev {
+                    warm_stages.push(k);
+                }
+            },
             &TierLabels::default(),
         )
         .unwrap();
@@ -1833,6 +1916,105 @@ mod warm_tests {
             TierKind::System.warm_label()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_plan_marks_tiers_below_the_deepest_checkpoint_pending() {
+        let (store, dir) = spy_store("plan");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+
+        // Cold: nothing on disk.
+        let plan = warm_plan(Some(&store), &tiers);
+        assert!(plan.iter().all(|s| s.state == StageState::Pending));
+        assert_eq!(plan.len(), 3);
+
+        // After a cold warm both cacheable tiers exist; only the volatile
+        // tier is still to do.
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |_| {},
+            &TierLabels::default(),
+        )
+        .unwrap();
+        let states: Vec<_> = warm_plan(Some(&store), &tiers)
+            .iter()
+            .map(|s| s.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![StageState::Cached, StageState::Cached, StageState::Pending]
+        );
+
+        // Lose the deeper checkpoint: that tier and everything below rebuild.
+        std::fs::remove_file(store.kv_path(tiers[1].key.as_ref().unwrap())).unwrap();
+        let states: Vec<_> = warm_plan(Some(&store), &tiers)
+            .iter()
+            .map(|s| s.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![StageState::Cached, StageState::Pending, StageState::Pending]
+        );
+
+        // No store: nothing can be cached.
+        assert!(
+            warm_plan(None, &tiers)
+                .iter()
+                .all(|s| s.state == StageState::Pending)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_reports_start_and_finish_for_each_prefilled_tier() {
+        let (store, dir) = spy_store("startfinish");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut events = Vec::new();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers,
+            &mut |_| {},
+            &mut |ev| events.push(ev),
+            &TierLabels::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StageEvent::Start(TierKind::System),
+                StageEvent::Finish(TierKind::System),
+                StageEvent::Start(TierKind::ProjectStable),
+                StageEvent::Finish(TierKind::ProjectStable),
+                StageEvent::Start(TierKind::SessionVolatile),
+                StageEvent::Finish(TierKind::SessionVolatile),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn short_labels_are_distinct_and_noun_phrases() {
+        let all = [
+            TierKind::System,
+            TierKind::SystemTail,
+            TierKind::ProjectStable,
+            TierKind::SessionVolatile,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(|k| k.short_label()).collect();
+        assert_eq!(labels.len(), all.len());
+        assert_eq!(TierKind::System.short_label(), "System prompt");
     }
 
     /// The system prompt is the priciest prefix to rebuild, so a Tier 1 miss

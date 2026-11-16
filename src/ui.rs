@@ -15374,7 +15374,7 @@ impl Agent<'_> {
     fn warm_alt_local_tier1(
         &mut self,
         on_event: &mut dyn FnMut(EngineEvent),
-        on_stage: &mut dyn FnMut(crate::kvtier::TierKind),
+        on_stage: &mut dyn FnMut(crate::kvtier::StageEvent),
     ) {
         let Some(mut engine) = self.alt_engines.remove(&EngineKey::Local) else {
             return;
@@ -15442,7 +15442,11 @@ impl Agent<'_> {
                 // Warm never speculates, so Spec cannot arrive here.
                 EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
-            &mut |kind| stage.set(kind.warm_label()),
+            &mut |ev| {
+                if let crate::kvtier::StageEvent::Start(kind) = ev {
+                    stage.set(kind.warm_label());
+                }
+            },
             &labels,
         )
         .map_err(|e| e.to_string())?;
@@ -15533,7 +15537,11 @@ impl Agent<'_> {
                 // Warm never speculates, so Spec cannot arrive here.
                 EngineEvent::Prefill(_) | EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
-            &mut |kind| stage.set(kind.warm_label()),
+            &mut |ev| {
+                if let crate::kvtier::StageEvent::Start(kind) = ev {
+                    stage.set(kind.warm_label());
+                }
+            },
             &labels,
         )
         .map_err(|e| e.to_string())?;
