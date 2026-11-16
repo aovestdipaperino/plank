@@ -174,6 +174,7 @@ pub mod ui;
 pub mod uiremote;
 pub mod upgrade;
 pub use trace_stream::viz;
+pub mod warmscreen;
 pub mod warp;
 pub mod wasmcaps;
 pub mod wasmevents;
