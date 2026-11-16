@@ -87,12 +87,6 @@ impl WarmScreen {
         &self.rows
     }
 
-    /// Whether any row still has work to do.
-    #[must_use]
-    pub fn any_pending(&self) -> bool {
-        self.rows.iter().any(|r| r.state != RowState::Done)
-    }
-
     /// Applies a stage event from the main engine's warm walk.
     pub fn stage(&mut self, ev: StageEvent) {
         let kind = match ev {
@@ -168,7 +162,6 @@ mod tests {
             vec![RowState::Done, RowState::Waiting, RowState::Waiting]
         );
         assert_eq!(s.rows()[0].label, "System prompt");
-        assert!(s.any_pending());
     }
 
     #[test]
@@ -222,6 +215,11 @@ mod tests {
                 ..w
             })
             .collect();
-        assert!(!WarmScreen::from_plan(&all_cached).any_pending());
+        assert!(
+            WarmScreen::from_plan(&all_cached)
+                .rows()
+                .iter()
+                .all(|r| r.state == RowState::Done)
+        );
     }
 }

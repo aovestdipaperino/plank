@@ -15351,11 +15351,6 @@ impl Agent<'_> {
         );
     }
 
-    /// Warms the KV cache — system prompt and session-start context tiers — in
-    /// one walk before the full TUI is shown. When the cache is already current
-    /// nothing prefills and nothing is drawn; otherwise a minimal centered
-    /// progress bar covers the rebuild, and the caller renders the real UI over
-    /// it.
     /// Warms the alt local engine's Tier 1 at startup: prefilled and persisted
     /// when no checkpoint exists, restored from disk when one does.
     ///
@@ -15413,6 +15408,12 @@ impl Agent<'_> {
             .map(|s| s.state)
     }
 
+    /// Warms the KV cache — system prompt and session-start context tiers — in
+    /// one walk before the full TUI is shown. The first paint waits for the
+    /// first prefill or notice event from either walk, so an engine that never
+    /// prefills (or a cache already current) draws nothing; from then on the
+    /// checklist lists every tier at once, and the caller renders the real UI
+    /// over it.
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         if self.skip_warm_after_restore() {
             return Ok(());
@@ -15430,7 +15431,12 @@ impl Agent<'_> {
         let screen = std::cell::RefCell::new(initial);
         let notice = std::cell::RefCell::new(None::<String>);
         let term = std::cell::RefCell::new(&mut *terminal);
+        // Nothing is drawn until a prefill or notice proves there is work.
+        let painted = std::cell::Cell::new(false);
         let repaint = || {
+            if !painted.get() {
+                return;
+            }
             let screen = screen.borrow();
             let notice = notice.borrow();
             let _ = term
@@ -15438,8 +15444,6 @@ impl Agent<'_> {
                 .draw(|f| tui::draw_warm(f, &screen, notice.as_deref()))
                 .map(|done| crate::logo::after_draw(done.buffer));
         };
-        // First frame: every cache line is visible before any work starts.
-        repaint();
         let labels = self.tier_labels();
         crate::kvtier::warm(
             &mut *self.engine,
@@ -15452,6 +15456,7 @@ impl Agent<'_> {
                     // Warm never speculates, so Spec cannot arrive here.
                     EngineEvent::Text(_) | EngineEvent::Spec(_) => return,
                 }
+                painted.set(true);
                 repaint();
             },
             &mut |ev| {
@@ -15467,6 +15472,7 @@ impl Agent<'_> {
             &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
                     screen.borrow_mut().progress(p.done, p.total, p.tps);
+                    painted.set(true);
                     repaint();
                 }
             },
@@ -15502,25 +15508,17 @@ impl Agent<'_> {
             return Ok(());
         }
         let tiers = self.kv_tiers();
-        // Show the whole plan once when a cacheable tier will rebuild. The
+        // The whole plan is printed once, lazily: just before the first stage
+        // announcement, and only when a cacheable tier will rebuild (the
         // session-context tier prefills every launch, so on its own it is not
-        // worth a block of lines.
+        // worth a block of lines). Engines that never checkpoint predict
+        // "will rebuild" without ever prefilling, and stay silent this way.
         let plan = crate::kvtier::warm_plan(Some(&self.store), &tiers);
-        if plan.iter().any(|s| {
+        let show_plan = plan.iter().any(|s| {
             s.state == crate::kvtier::StageState::Pending
                 && s.kind != crate::kvtier::TierKind::SessionVolatile
-        }) {
-            for s in &plan {
-                match s.state {
-                    crate::kvtier::StageState::Cached => {
-                        eprintln!("  ✓ {}", s.kind.short_label());
-                    }
-                    crate::kvtier::StageState::Pending => {
-                        eprintln!("  · {} (will rebuild)", s.kind.short_label());
-                    }
-                }
-            }
-        }
+        });
+        let mut plan_printed = false;
         let color = self.color;
         // Which tier is prefilling, and the label last printed for it: each
         // stage announces itself once, so the note names the work actually
@@ -15538,6 +15536,19 @@ impl Agent<'_> {
                 EngineEvent::Notice(msg) => notice = Some(msg),
                 EngineEvent::Prefill(_) if shown != Some(stage.get()) => {
                     let label = stage.get();
+                    if show_plan && !plan_printed {
+                        plan_printed = true;
+                        for s in &plan {
+                            match s.state {
+                                crate::kvtier::StageState::Cached => {
+                                    eprintln!("  ✓ {}", s.kind.short_label());
+                                }
+                                crate::kvtier::StageState::Pending => {
+                                    eprintln!("  · {} (will rebuild)", s.kind.short_label());
+                                }
+                            }
+                        }
+                    }
                     shown = Some(label);
                     announced += 1;
                     if color {

@@ -10,8 +10,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Launch shows every KV cache tier at once.** The launch screen now lists
   all tiers up front, a checkmark for a cached one and a bar for a pending
-  one, instead of restarting a single bar per tier. The plain REPL prints the
-  plan when a cacheable tier will rebuild.
+  one, instead of restarting a single bar per tier. It appears with the
+  first prefill, so engines that never prefill stay silent. The plain REPL
+  prints the plan once, before the first stage note, when a cacheable tier
+  will rebuild.
 
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own

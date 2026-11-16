@@ -981,10 +981,11 @@ warms the cache before the first turn:
    or finished tier, a live bar for the one prefilling, an empty bar for the
    ones still to come. `warm` reports `StageEvent::Start`/`Finish` per tier so
    the rows follow the real walk even when a predicted checkpoint is refused.
-   The sub-agent's tier 1 is one more row on the same screen. The TUI always
-   paints the checklist at launch, because the session-context tier is never
-   checkpointed and so is always pending; the plain REPL prints the plan only
-   when a cacheable (non-session-volatile) tier will rebuild. The window title
+   The sub-agent's tier 1 is one more row on the same screen. The checklist
+   appears with the first prefill or notice event (engines that never prefill
+   draw nothing, as before); the plain REPL prints the plan, once, just before
+   the first stage announcement and only when a cacheable (non-session-volatile)
+   tier will rebuild. The window title
    stays `🚀 launching...` until the UI accepts input.
 
 Within a run, the live session then makes each turn reuse the common prefix, so

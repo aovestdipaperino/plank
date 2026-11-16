@@ -828,9 +828,10 @@ existence which tiers will prefill, and the launch screen (`warmscreen::WarmScre
 drawn by `tui::draw_warm`) lists every tier at once: a checkmark for a cached or
 finished tier, a live bar for the one prefilling, an empty bar for those still to
 come. `warm` reports `StageEvent::Start`/`Finish` per tier, so the rows follow the
-real walk even when a predicted checkpoint is refused. The TUI always paints the
-checklist, because the session-context tier is never checkpointed and is always
-pending; the plain REPL prints the plan only when a cacheable tier will rebuild.
+real walk even when a predicted checkpoint is refused. The checklist appears with
+the first prefill or notice event (engines that never prefill draw nothing, as
+before); the plain REPL prints the plan, once, just before the first stage
+announcement and only when a cacheable (non-session-volatile) tier will rebuild.
 
 ```mermaid
 sequenceDiagram
