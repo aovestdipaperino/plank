@@ -823,6 +823,15 @@ material for the token-level reason given in Part 3.
 At startup, plank has a planned tier list and a directory of checkpoints, and has
 to get the engine into the best state it can.
 
+Before the walk starts, `kvtier::warm_plan` predicts from checkpoint file
+existence which tiers will prefill, and the launch screen (`warmscreen::WarmScreen`,
+drawn by `tui::draw_warm`) lists every tier at once: a checkmark for a cached or
+finished tier, a live bar for the one prefilling, an empty bar for those still to
+come. `warm` reports `StageEvent::Start`/`Finish` per tier, so the rows follow the
+real walk even when a predicted checkpoint is refused. The TUI always paints the
+checklist, because the session-context tier is never checkpointed and is always
+pending; the plain REPL prints the plan only when a cacheable tier will rebuild.
+
 ```mermaid
 sequenceDiagram
     participant W as kvtier::warm

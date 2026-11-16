@@ -975,10 +975,17 @@ warms the cache before the first turn:
 2. `kvtier::warm` restores the deepest tier whose checkpoint loads — a disk read,
    no prefill — and prefills only the tiers below it, persisting each at its own
    boundary.
-3. The note above the bar names the tier actually rebuilding
-   (`TierKind::warm_label`, e.g. **"Updating system prompt cache…"** for Tier 1,
-   **"Updating session context…"** when only the volatile tier prefills), and the
-   window title stays `🚀 launching...` until the UI accepts input.
+3. Before the walk, `kvtier::warm_plan` predicts which tiers will prefill from
+   checkpoint file existence, and the launch screen (`warmscreen::WarmScreen`,
+   drawn by `tui::draw_warm`) lists every tier at once: a checkmark for a cached
+   or finished tier, a live bar for the one prefilling, an empty bar for the
+   ones still to come. `warm` reports `StageEvent::Start`/`Finish` per tier so
+   the rows follow the real walk even when a predicted checkpoint is refused.
+   The sub-agent's tier 1 is one more row on the same screen. The TUI always
+   paints the checklist at launch, because the session-context tier is never
+   checkpointed and so is always pending; the plain REPL prints the plan only
+   when a cacheable (non-session-volatile) tier will rebuild. The window title
+   stays `🚀 launching...` until the UI accepts input.
 
 Within a run, the live session then makes each turn reuse the common prefix, so
 only the new user/assistant suffix is evaluated.

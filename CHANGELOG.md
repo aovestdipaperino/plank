@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Launch shows every KV cache tier at once.** The launch screen now lists
+  all tiers up front, a checkmark for a cached one and a bar for a pending
+  one, instead of restarting a single bar per tier. The plain REPL prints the
+  plan when a cacheable tier will rebuild.
+
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
   Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the
