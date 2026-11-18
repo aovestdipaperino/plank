@@ -3,11 +3,15 @@ name: Star History
 # Regenerates the README star history chart in CI. Needed since GitHub's
 # 2026-06-30 stargazers API restriction broke the hosted star-history.com
 # embed; this runs with the repo's own token, which can still read stars.
+# The chart is committed to the unprotected `star-history` branch, because
+# `main` requires pull requests and rejects the bot's direct push (GH006).
+# The README embeds it from that branch by absolute URL.
+# No `watch` trigger: a star-triggered run is attributed to the stargazer,
+# so when the run fails GitHub emails the failure to that third party
+# (tokensave#265). The daily schedule keeps the chart fresh enough.
 on:
   schedule:
     - cron: '17 4 * * *' # daily
-  watch:
-    types: [started] # refresh right after a new star
   workflow_dispatch:
 
 permissions:
@@ -19,11 +23,35 @@ concurrency:
 
 jobs:
   star-history:
+    # Only the upstream repository; forks would otherwise run this daily
+    # with `contents: write`.
+    if: github.repository == 'aovestdipaperino/plank'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Switch to the chart branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth 1 origin star-history; then
+            git switch -c star-history FETCH_HEAD
+          else
+            # First run: create the branch, seeded with the charts `main`
+            # still carries, so the action's pull --rebase has a remote to
+            # rebase onto and the README never shows a broken image.
+            cp -r assets/star-history "$RUNNER_TEMP/star-history"
+            git switch --orphan star-history
+            mkdir -p assets
+            cp -r "$RUNNER_TEMP/star-history" assets/star-history
+            git add assets/star-history
+            git commit -m "chore: start star history branch"
+            git push origin star-history
+          fi
       - uses: narayann7/star-history-action@29310fc87122228fe128d811f14027be3ca99601 # v1.0.3
         with:
+          repos: aovestdipaperino/plank
+          # The README on `main` links to this branch's charts directly.
+          update-readme: false
           # Since ~2026-07-15 GitHub also blocks the Actions installation
           # token from the stargazers endpoint; only an admin/collaborator
           # user token works. Fine-grained PAT, Metadata: Read-only.
