@@ -565,11 +565,12 @@ neither produces a warning any more:
 
 <!-- Chart is rendered in CI by .github/workflows/star-history.yml (the hosted
      star-history.com embed broke with GitHub's 2026-06-30 stargazers API
-     restriction). The action rewrites everything between these markers. -->
+     restriction) and committed to the `star-history` branch, which these
+     absolute links point at. -->
 <!-- star-history:start -->
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
-  <img alt="Star history" src="assets/star-history/star-history-light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/aovestdipaperino/plank/star-history/assets/star-history/star-history-dark.svg">
+  <img alt="Star history" src="https://raw.githubusercontent.com/aovestdipaperino/plank/star-history/assets/star-history/star-history-light.svg">
 </picture>
 <!-- star-history:end -->
 
