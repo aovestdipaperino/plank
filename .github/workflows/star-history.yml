@@ -36,15 +36,10 @@ jobs:
           if git fetch --depth 1 origin star-history; then
             git switch -c star-history FETCH_HEAD
           else
-            # First run: create the branch, seeded with the charts `main`
-            # still carries, so the action's pull --rebase has a remote to
-            # rebase onto and the README never shows a broken image.
-            cp -r assets/star-history "$RUNNER_TEMP/star-history"
+            # First run: create the branch so the action's pull --rebase has
+            # a remote to rebase onto; the action then renders the charts.
             git switch --orphan star-history
-            mkdir -p assets
-            cp -r "$RUNNER_TEMP/star-history" assets/star-history
-            git add assets/star-history
-            git commit -m "chore: start star history branch"
+            git commit --allow-empty -m "chore: start star history branch"
             git push origin star-history
           fi
       - uses: narayann7/star-history-action@29310fc87122228fe128d811f14027be3ca99601 # v1.0.3
