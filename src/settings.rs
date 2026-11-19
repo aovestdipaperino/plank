@@ -62,7 +62,7 @@
 //! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
 //!   startup.
 //! - `tools.recall`, `tools.fanout`, `tools.runCode`, `tools.bashNotify`,
-//!   `tools.remember`, `tools.editUpto`, `git.signCommits` — these
+//!   `tools.remember`, `tools.editUpto`, `tools.shell`, `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
 //!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
@@ -394,6 +394,13 @@ pub struct ToolsSettings {
     /// ([`crate::filehistory`]). Default on: a copy is made only for a file a
     /// tool is about to write, once per change.
     pub file_history: bool,
+    /// `tools.shell`: the shell the `bash` tool and the `!`/`!!` escapes run
+    /// commands in, `"posix"` (the default) or `"powershell"`
+    /// ([`crate::platform::ShellDialect`]). PowerShell adds a note to the
+    /// system prompt telling the model so, which churns the `fp1`
+    /// fingerprint, so it takes effect in a new session. Hooks always run
+    /// POSIX `sh`: their commands are written for it.
+    pub shell: crate::platform::ShellDialect,
 }
 
 impl Default for ToolsSettings {
@@ -413,6 +420,7 @@ impl Default for ToolsSettings {
             edit_upto: None,
             git_guard: crate::gitguard::Mode::Ask,
             file_history: true,
+            shell: crate::platform::ShellDialect::Posix,
         }
     }
 }
@@ -969,6 +977,12 @@ impl Settings {
         if let Some(v) = boolean(tools, "remember") {
             self.tools.remember = v;
             self.note("tools.remember", origin);
+        }
+        if let Some(v) =
+            string(tools, "shell").and_then(|s| crate::platform::ShellDialect::parse(&s))
+        {
+            self.tools.shell = v;
+            self.note("tools.shell", origin);
         }
         if let Some(v) = boolean(tools, "editUpto") {
             self.tools.edit_upto = Some(v);
@@ -1698,6 +1712,7 @@ impl Settings {
                 "gitGuard",
                 Json::Str(self.tools.git_guard.as_str().to_string()),
             );
+            upsert(t, "shell", Json::Str(self.tools.shell.as_str().to_string()));
         }
 
         let mut out = String::new();
@@ -3159,6 +3174,28 @@ mod tests {
         reloaded.overlay(&std::fs::read_to_string(&path).expect("read"));
         assert_eq!(reloaded.tools.git_guard, Mode::Off);
         assert!(!reloaded.tools.file_history);
+    }
+
+    #[test]
+    fn tools_shell_parses_and_defaults_to_posix() {
+        use crate::platform::ShellDialect;
+        assert_eq!(Settings::default().tools.shell, ShellDialect::Posix);
+        let dir = std::env::temp_dir().join(format!("plank-settings-sh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        let load = |json: &str| {
+            std::fs::write(&path, json).expect("write");
+            Settings::load_from_paths(&[], std::slice::from_ref(&path))
+                .tools
+                .shell
+        };
+        assert_eq!(
+            load(r#"{"tools":{"shell":"PowerShell"}}"#),
+            ShellDialect::PowerShell
+        );
+        assert_eq!(load(r#"{"tools":{"shell":"posix"}}"#), ShellDialect::Posix);
+        // An unknown name keeps the default, like every other bad value.
+        assert_eq!(load(r#"{"tools":{"shell":"fish"}}"#), ShellDialect::Posix);
         std::fs::remove_dir_all(&dir).ok();
     }
 

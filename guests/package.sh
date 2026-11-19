@@ -12,6 +12,14 @@
 #
 # Output: dist/<guest>/ (the installable directory) and dist/plank-<guest>.tar.gz.
 set -e
+# SHA-256 of a file as `<hash>  <name>`: `shasum -a 256` where it exists
+# (macOS, Git for Windows), else `sha256sum` (most Linux). Git Bash's
+# `sha256sum` marks binary mode as `<hash> *<name>`; the `*` is dropped so
+# every OS writes the same line.
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi |
+    sed 's/ \*/  /'
+}
 cd "$(dirname "$0")"
 ROOT=$(pwd)
 DIST="$ROOT/dist"
@@ -22,9 +30,14 @@ sh ./build.sh >/dev/null
 
 for guest in screensavers arcades csvedit; do
   # csvedit is the one WASI guest (see build.sh); the others are freestanding.
+  # It is also the plank-tv crate, so its artifact is plank_tv.wasm.
   target=wasm32-unknown-unknown
-  [ "$guest" = csvedit ] && target=wasm32-wasip1
-  built="$ROOT/$guest/target/$target/release/plank_$guest.wasm"
+  crate="plank_$guest"
+  if [ "$guest" = csvedit ]; then
+    target=wasm32-wasip1
+    crate=plank_tv
+  fi
+  built="$ROOT/$guest/target/$target/release/$crate.wasm"
   if [ ! -f "$built" ]; then
     echo "missing build output: $built" >&2
     exit 1
@@ -51,7 +64,7 @@ done
   echo "# plank guest modules"
   echo "# $(rustc --version)"
   for guest in screensavers arcades csvedit; do
-    (cd "$DIST/$guest/wasm" && shasum -a 256 "$guest.wasm")
+    (cd "$DIST/$guest/wasm" && sha256 "$guest.wasm")
   done
 } > "$DIST/SHA256SUMS"
 cat "$DIST/SHA256SUMS"

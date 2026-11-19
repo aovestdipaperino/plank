@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn a_request_needing_a_grant_becomes_pending() {
         let mut p = ControlPolicy::new(true, false);
-        assert!(p.pending().is_empty());
+        assert_eq!(p.pending(), [] as [u64; 0]);
         assert_eq!(p.request(7), RequestOutcome::NeedsLocalGrant);
         assert_eq!(p.pending(), &[7]);
         // Re-asking is idempotent rather than a queue of duplicates.
@@ -1692,7 +1692,7 @@ mod tests {
         assert!(p.remote_can_control(1));
         // One controller, so granting 1 answers 2 with "no" rather than leaving
         // it queued to fire the moment control comes back.
-        assert!(p.pending().is_empty());
+        assert_eq!(p.pending(), [] as [u64; 0]);
         assert!(!p.remote_can_control(2));
     }
 
@@ -1710,7 +1710,7 @@ mod tests {
         p.request(2);
         p.grant(2);
         assert!(p.remote_can_control(2));
-        assert!(p.pending().is_empty());
+        assert_eq!(p.pending(), [] as [u64; 0]);
     }
 
     #[test]
@@ -1741,7 +1741,7 @@ mod tests {
     fn preauthorized_requests_never_become_pending() {
         let mut p = ControlPolicy::new(true, true);
         assert_eq!(p.request(1), RequestOutcome::Granted);
-        assert!(p.pending().is_empty());
+        assert_eq!(p.pending(), [] as [u64; 0]);
     }
 
     #[test]

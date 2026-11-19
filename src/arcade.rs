@@ -1825,8 +1825,8 @@ mod tests {
     #[test]
     fn the_field_fills_whatever_screen_it_is_given() {
         let p = Pelota::new(1);
-        assert!(p.glyphs(MIN_W - 1, MIN_H).is_empty());
-        assert!(p.glyphs(MIN_W, MIN_H - 1).is_empty());
+        assert_eq!(p.glyphs(MIN_W - 1, MIN_H), [] as [crate::arcade::Glyph; 0]);
+        assert_eq!(p.glyphs(MIN_W, MIN_H - 1), [] as [crate::arcade::Glyph; 0]);
         for (w, h) in [(MIN_W, MIN_H), (80, 24), (200, 60), (400, 100)] {
             let g = p.glyphs(w, h);
             assert!(!g.is_empty(), "nothing drawn at {w}x{h}");
@@ -2305,9 +2305,9 @@ mod tests {
     #[test]
     fn a_closed_cabinet_paints_nothing_and_absorbs_nothing() {
         let mut a = Arcade::new();
-        assert!(a.glyphs(80, 24).is_empty());
+        assert_eq!(a.glyphs(80, 24), [] as [crate::arcade::Glyph; 0]);
         assert!(a.banner(80, 24).is_none());
-        assert!(a.footer().is_empty());
+        assert_eq!(a.footer(), "");
         a.step(50);
         assert!(matches!(a.handle_key(key(KeyCode::Esc)), Outcome::Stay));
     }

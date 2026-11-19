@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Image pasting for the TUI prompt (macOS).
+//! Image pasting for the TUI prompt.
 //!
 //! Port of Claude Code's image-paste pipeline (see the vault note
 //! `image-paste-prompt.md`) adapted to plank: an empty bracketed paste means
@@ -12,9 +12,7 @@
 //! content-block path, and no reason to resample away pixel density that an
 //! OCR tool will need).
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// Maximum images kept in the cache (LRU by modification time).
 const MAX_CACHED_IMAGES: usize = 200;
@@ -92,21 +90,11 @@ impl PastedImage {
     /// a failed launch is reported by the returned error, nothing else.
     ///
     /// # Errors
-    /// When the opener (`open` on macOS, `xdg-open` elsewhere) cannot be spawned.
+    /// When the opener (`crate::platform::desktop::open_tool`) cannot be
+    /// spawned.
     pub fn open_externally(&self) -> std::io::Result<()> {
         let path = self.source_path.as_deref().unwrap_or(&self.path);
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(opener)
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(drop)
+        crate::platform::desktop::open_detached(path)
     }
 }
 
@@ -126,27 +114,17 @@ pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// True when the clipboard currently holds image data.
-///
-/// Cheap probe for the status-bar hint: `clipboard info for «class PNGf»`
-/// prints the class and byte count when a PNG representation exists and
-/// nothing otherwise (it exits 0 either way), without reading the bytes.
+/// True when the clipboard currently holds image data, without reading it
+/// (`crate::platform::desktop::clipboard_has_image`).
 #[must_use]
 pub fn clipboard_has_image() -> bool {
-    Command::new("osascript")
-        .args(["-e", "clipboard info for «class PNGf»"])
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
+    crate::platform::desktop::clipboard_has_image()
 }
 
 /// Reads an image off the system clipboard, processes it, and caches it.
-///
-/// Tries `pngpaste` first (fast when installed), then falls back to an
-/// `osascript` that writes the clipboard's PNG data to a temp file.
 #[must_use]
 pub fn from_clipboard() -> Option<PastedImage> {
-    let bytes = pngpaste_clipboard().or_else(osascript_clipboard)?;
+    let bytes = crate::platform::desktop::clipboard_png()?;
     process_and_store(&bytes, None)
 }
 
@@ -174,34 +152,6 @@ pub fn from_path_text(pasted: &str) -> Option<PastedImage> {
     }
     let bytes = std::fs::read(&cleaned).ok()?;
     process_and_store(&bytes, Some(PathBuf::from(cleaned)))
-}
-
-/// `pngpaste -` writes the clipboard image as PNG to stdout.
-fn pngpaste_clipboard() -> Option<Vec<u8>> {
-    let out = Command::new("pngpaste").arg("-").output().ok()?;
-    (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
-}
-
-/// osascript fallback: writes `the clipboard as «class PNGf»` to a temp file.
-fn osascript_clipboard() -> Option<Vec<u8>> {
-    let tmp = std::env::temp_dir().join(format!("plank-clipboard-{}.png", std::process::id()));
-    let tmp_str = tmp.to_str()?.to_owned();
-    let script = format!(
-        "set png to the clipboard as «class PNGf»\n\
-         set f to open for access POSIX file \"{tmp_str}\" with write permission\n\
-         set eof of f to 0\n\
-         write png to f\n\
-         close access f"
-    );
-    let status = Command::new("osascript")
-        .args(["-e", &script])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    let bytes = status.success().then(|| std::fs::read(&tmp).ok()).flatten();
-    let _ = std::fs::remove_file(&tmp);
-    bytes.filter(|b| !b.is_empty())
 }
 
 /// Reads dimensions (PNG only — the sole decoder plank links), dedups by
@@ -245,44 +195,22 @@ fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| crate::home::plank_home_in(h).join("image-cache"))
 }
 
-/// Content hash via the system `shasum` (macOS ships it; avoids a crypto dep).
+/// Lowercase hex SHA-256 of `bytes`. `Option` for the callers that predate
+/// the in-process hash, when `shasum` could be missing; it is always `Some`.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "callers chain it with `?` alongside fallible steps"
+)]
 pub(crate) fn sha256_hex(bytes: &[u8]) -> Option<String> {
-    let mut child = Command::new("shasum")
-        .args(["-a", "256"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.as_mut()?.write_all(bytes).ok()?;
-    drop(child.stdin.take());
-    let out = child.wait_with_output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let hash = text.split_whitespace().next()?.to_owned();
-    (hash.len() == 64).then_some(hash)
+    use sha2::{Digest as _, Sha256};
+    Some(gguf_delta::hex(&Sha256::digest(bytes)))
 }
 
-/// Content hash of a file on disk, without loading it into memory.
-///
-/// [`sha256_hex`] pipes bytes through stdin, which means the caller must first
-/// hold the whole file — fine for a pasted screenshot, wrong for a 60 MB PDF
-/// whose bytes are never wanted in the first place. Handing `shasum` the path
-/// lets it stream.
+/// Content hash of a file on disk, streamed rather than loaded: a 60 MB PDF
+/// whose bytes are never wanted is hashed in fixed-size pieces.
 #[cfg(any(feature = "docparse", test))]
 pub(crate) fn sha256_file_hex(path: &Path) -> Option<String> {
-    let out = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let hash = text.split_whitespace().next()?.to_owned();
-    (hash.len() == 64).then_some(hash)
+    gguf_delta::file_sha256_hex(path).ok()
 }
 
 /// Keeps the newest [`MAX_CACHED_IMAGES`] files, deleting the oldest extras.

@@ -513,7 +513,7 @@ mod tests {
         assert!(t.is_empty());
         assert_eq!(t.active(), None);
         assert_eq!(t.branch_count(), 0);
-        assert!(t.active_path().is_empty());
+        assert_eq!(t.active_path(), [] as [usize; 0]);
     }
 
     #[test]
@@ -543,7 +543,7 @@ mod tests {
     fn fork_at_a_root_empties_the_active_path() {
         let mut t = linear();
         assert_eq!(t.fork_at(0).unwrap(), None);
-        assert!(t.active_path().is_empty());
+        assert_eq!(t.active_path(), [] as [usize; 0]);
         t.append(Message::user("fresh"));
         assert_eq!(texts(&t), ["fresh"]);
         // The original branch is still a root of the tree.
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, 2);
         assert_eq!(out[0].parent, Some(0));
-        assert!(canonicalize(&path, &[]).is_empty());
+        assert_eq!(canonicalize(&path, &[]), [] as [crate::branch::OffNode; 0]);
     }
 
     #[test]

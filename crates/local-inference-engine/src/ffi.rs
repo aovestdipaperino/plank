@@ -6,18 +6,105 @@
 //! Only the subset plank and its tools need is declared: engine open/close,
 //! chat-template tokenization, session create/sync/sample/eval, and token text
 //! lookup. The declarations always compile; calling them links only when the
-//! `ds4_engine` cfg is set (macOS with the C sources built).
+//! `ds4_engine` cfg is set (macOS or Linux with the C sources built).
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Backend selector, mirroring `ds4_backend`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ds4Backend {
     Metal = 0,
     Cuda = 1,
     Cpu = 2,
+}
+
+/// The backend `libds4core.a` was compiled for (`DS4_BUILT_BACKEND`, set by
+/// the build script), or `None` when the engine was not built. A core built
+/// for one backend cannot open another, so this is the default to ask for.
+#[must_use]
+pub fn built_backend() -> Option<Ds4Backend> {
+    backend_named(option_env!("DS4_BUILT_BACKEND")?)
+}
+
+/// A `ROCm` core is the C's CUDA backend built with `DS4_ROCM_BUILD`, so it
+/// opens as [`Ds4Backend::Cuda`].
+fn backend_named(name: &str) -> Option<Ds4Backend> {
+    if name == "rocm" {
+        return Some(Ds4Backend::Cuda);
+    }
+    [Ds4Backend::Metal, Ds4Backend::Cuda, Ds4Backend::Cpu]
+        .into_iter()
+        .find(|b| b.name() == name)
+}
+
+/// Whether the linked core is the `ROCm` build of the CUDA backend.
+fn built_rocm() -> bool {
+    option_env!("DS4_BUILT_BACKEND") == Some("rocm")
+}
+
+impl Ds4Backend {
+    /// The lowercase name the build script and the `--metal`/`--cuda`/`--cpu`
+    /// flags use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    /// The name to show for this backend on the linked core: `rocm` for the
+    /// CUDA backend of a `ROCm` core, else [`Self::name`].
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        if self == Self::Cuda && built_rocm() {
+            "rocm"
+        } else {
+            self.name()
+        }
+    }
+
+    /// Whether a core compiled for `built` can open this backend. A GPU core
+    /// keeps the CPU path beside its one GPU backend; a CPU core is built
+    /// with `DS4_NO_GPU` and has no GPU code at all.
+    #[must_use]
+    pub fn runs_on(self, built: Self) -> bool {
+        self == built || self == Self::Cpu
+    }
+}
+
+/// Refuses a backend the linked core cannot run, before the C is asked to:
+/// a CPU core handed `Metal` or `Cuda` would walk into GPU paths it was
+/// compiled without.
+///
+/// # Errors
+/// Names the backend asked for and the one the core was built for.
+pub fn check_backend(wanted: Ds4Backend) -> Result<(), String> {
+    match built_backend() {
+        Some(built) => backend_refusal(wanted, built, built.label()).map_or(Ok(()), Err),
+        None => Ok(()),
+    }
+}
+
+fn backend_refusal(wanted: Ds4Backend, built: Ds4Backend, built_label: &str) -> Option<String> {
+    if wanted.runs_on(built) {
+        return None;
+    }
+    let hint = match wanted {
+        Ds4Backend::Cuda => {
+            "; rebuild with PLANK_DS4_BACKEND=cuda (CUDA toolkit) or PLANK_DS4_BACKEND=rocm (ROCm)"
+        }
+        Ds4Backend::Metal => "; Metal is built only on macOS",
+        Ds4Backend::Cpu => "",
+    };
+    Some(format!(
+        "--{} is not available: the ds4 engine was built for {}{hint}",
+        wanted.name(),
+        built_label
+    ))
 }
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
@@ -703,10 +790,205 @@ unsafe extern "C" {
     ) -> *mut c_char;
 }
 
+/// `DS4_MAX_GPUS` in `ds4_gpu_mgpu.h`.
+pub const DS4_MAX_GPUS: usize = 16;
+
+/// Multi-GPU layer placement, mirroring `ds4_gpu_config` (`ds4_gpu_mgpu.h`):
+/// the CUDA devices to use and a VRAM budget in bytes for each.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ds4GpuConfig {
+    pub device_indices: [c_int; DS4_MAX_GPUS],
+    pub vram_bytes: [usize; DS4_MAX_GPUS],
+    pub n_gpus: c_int,
+    pub safety_margin_bytes: usize,
+}
+
+impl Default for Ds4GpuConfig {
+    fn default() -> Self {
+        Self {
+            device_indices: [0; DS4_MAX_GPUS],
+            vram_bytes: [0; DS4_MAX_GPUS],
+            n_gpus: 0,
+            safety_margin_bytes: 0,
+        }
+    }
+}
+
+#[cfg(ds4_multi_gpu)]
+unsafe extern "C" {
+    fn parse_gpu_vram_arg(
+        vram_arg: *const c_char,
+        devices_arg: *const c_char,
+        out: *mut Ds4GpuConfig,
+        out_skip_cuda: *mut bool,
+        errbuf: *mut c_char,
+        errbuflen: usize,
+    ) -> c_int;
+    fn format_gpu_layout_line(
+        cfg: *const Ds4GpuConfig,
+        was_auto: bool,
+        out: *mut c_char,
+        outlen: usize,
+    ) -> c_int;
+    fn ds4_engine_create_with_gpu_config(
+        out: *mut *mut Ds4Engine,
+        opt: *const Ds4EngineOptions,
+        gpu_cfg: *const Ds4GpuConfig,
+    ) -> c_int;
+}
+
+/// `ds4_engine_create_with_gpu_config`: [`ds4_engine_open`] with the layers
+/// placed by `config` (from [`gpu_placement`]). On a core without multi-GPU
+/// placement it returns `-1`, which [`gpu_placement`] never lets happen.
+///
+/// # Safety
+/// As [`ds4_engine_open`]: `out` is a valid out-pointer, and `opt` and the
+/// strings it points to outlive the call.
+pub unsafe fn ds4_engine_open_on_gpus(
+    out: *mut *mut Ds4Engine,
+    opt: *const Ds4EngineOptions,
+    config: &Ds4GpuConfig,
+) -> c_int {
+    #[cfg(ds4_multi_gpu)]
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        ds4_engine_create_with_gpu_config(out, opt, config)
+    }
+    #[cfg(not(ds4_multi_gpu))]
+    {
+        let _ = (out, opt, config);
+        -1
+    }
+}
+
+/// Where `--gpu-vram`/`--gpu-devices` put the model's layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuPlacement {
+    /// `--gpu-vram 0`: no GPU at all, the CPU backend.
+    Cpu,
+    /// Layers spread over these GPUs, with the C's one-line description of
+    /// the layout (`ds4: GPU config: ...`).
+    Gpus {
+        config: Box<Ds4GpuConfig>,
+        layout: String,
+    },
+}
+
+/// Resolves `--gpu-vram` and `--gpu-devices` through the C's own parser
+/// (`parse_gpu_vram_arg`), exactly as `ds4-agent` does: `auto` (and devices
+/// alone) asks the CUDA runtime for free VRAM, `N[,N...]` gives budgets in
+/// GiB, `0` means the CPU.
+///
+/// # Errors
+/// The parser's message, or why this core cannot place layers on GPUs.
+pub fn gpu_placement(vram: Option<&str>, devices: Option<&str>) -> Result<GpuPlacement, String> {
+    if vram.is_none() && devices.is_none() {
+        return Err("internal: gpu_placement called without --gpu-vram or --gpu-devices".into());
+    }
+    #[cfg(ds4_multi_gpu)]
+    {
+        use std::ffi::{CStr, CString};
+        let c = |v: Option<&str>| -> Result<Option<CString>, String> {
+            v.map(|v| CString::new(v).map_err(|_| "GPU option contains a NUL byte".to_string()))
+                .transpose()
+        };
+        let (c_vram, c_devices) = (c(vram)?, c(devices)?);
+        let ptr = |v: &Option<CString>| v.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let mut config = Box::<Ds4GpuConfig>::default();
+        let mut skip = false;
+        let mut err = [0 as c_char; 256];
+        // SAFETY: the strings outlive the call, and every out-pointer is valid
+        // for the size passed with it.
+        let rc = unsafe {
+            parse_gpu_vram_arg(
+                ptr(&c_vram),
+                ptr(&c_devices),
+                &raw mut *config,
+                &raw mut skip,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            // SAFETY: the parser NUL-terminates what it writes into `err`.
+            let msg = unsafe { CStr::from_ptr(err.as_ptr()) };
+            return Err(msg.to_string_lossy().into_owned());
+        }
+        if skip {
+            return Ok(GpuPlacement::Cpu);
+        }
+        let was_auto = vram.is_none_or(|v| v == "auto");
+        let mut line = [0 as c_char; 256];
+        // SAFETY: `config` is initialised and `line` is valid for its length.
+        let n = unsafe {
+            format_gpu_layout_line(&raw const *config, was_auto, line.as_mut_ptr(), line.len())
+        };
+        let layout = if n > 0 {
+            // SAFETY: a positive return means a NUL-terminated line was written.
+            unsafe { CStr::from_ptr(line.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::new()
+        };
+        Ok(GpuPlacement::Gpus { config, layout })
+    }
+    #[cfg(not(ds4_multi_gpu))]
+    {
+        if vram == Some("0") && devices.is_none() {
+            return Ok(GpuPlacement::Cpu);
+        }
+        Err(format!(
+            "--gpu-vram/--gpu-devices place layers on CUDA GPUs, and the ds4 engine was built for {}; \
+             rebuild with PLANK_DS4_BACKEND=cuda or PLANK_DS4_BACKEND=rocm",
+            built_backend().map_or("no backend", Ds4Backend::label)
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+
+    /// The build script's names map onto the C enum; a build without the
+    /// engine reports none.
+    #[test]
+    fn built_backend_names_the_compiled_core() {
+        assert_eq!(backend_named("metal"), Some(Ds4Backend::Metal));
+        assert_eq!(backend_named("cuda"), Some(Ds4Backend::Cuda));
+        assert_eq!(backend_named("cpu"), Some(Ds4Backend::Cpu));
+        assert_eq!(backend_named("rocm"), Some(Ds4Backend::Cuda));
+        assert_eq!(backend_named("vulkan"), None);
+        assert_eq!(
+            built_backend().is_some(),
+            option_env!("DS4_BUILT_BACKEND").is_some()
+        );
+    }
+
+    /// A GPU core also runs on the CPU; a CPU core runs nothing else, and no
+    /// core runs another GPU backend.
+    #[test]
+    fn a_core_runs_its_own_backend_and_the_cpu() {
+        use Ds4Backend::{Cpu, Cuda, Metal};
+        assert!(Metal.runs_on(Metal) && Cpu.runs_on(Metal));
+        assert!(Cuda.runs_on(Cuda) && Cpu.runs_on(Cuda));
+        assert!(Cpu.runs_on(Cpu));
+        assert!(!Cuda.runs_on(Metal) && !Metal.runs_on(Cuda));
+        assert!(!Metal.runs_on(Cpu) && !Cuda.runs_on(Cpu));
+        assert_eq!(backend_refusal(Cpu, Cuda, "cuda"), None);
+        let msg = backend_refusal(Cuda, Cpu, "cpu").unwrap();
+        assert!(
+            msg.starts_with("--cuda is not available: the ds4 engine was built for cpu"),
+            "{msg}"
+        );
+        assert!(msg.contains("PLANK_DS4_BACKEND=cuda"), "{msg}");
+        assert!(msg.contains("PLANK_DS4_BACKEND=rocm"), "{msg}");
+        // A ROCm core is named as such, though it opens as CUDA.
+        let msg = backend_refusal(Metal, Cuda, "rocm").unwrap();
+        assert!(msg.contains("built for rocm"), "{msg}");
+    }
 
     /// Pins every field of [`Ds4EngineOptions`] to the byte offset the C
     /// `ds4_engine_options` puts it at.
@@ -992,6 +1274,36 @@ mod tests {
         assert_eq!(size_of::<Ds4VisionSpan>(), 80, "struct size");
         assert_eq!(offset_of!(Ds4VisionSpan, token_start), 0);
         assert_eq!(offset_of!(Ds4VisionSpan, embedding), 8);
+    }
+
+    #[test]
+    fn gpu_config_matches_the_c_layout() {
+        // `ds4_gpu_config` in refs/ds4/ds4_gpu_mgpu.h: int[16], size_t[16],
+        // int, then size_t after four bytes of padding (LP64).
+        assert_eq!(offset_of!(Ds4GpuConfig, device_indices), 0);
+        assert_eq!(offset_of!(Ds4GpuConfig, vram_bytes), 64);
+        assert_eq!(offset_of!(Ds4GpuConfig, n_gpus), 192);
+        assert_eq!(offset_of!(Ds4GpuConfig, safety_margin_bytes), 200);
+        assert_eq!(size_of::<Ds4GpuConfig>(), 208);
+    }
+
+    /// `--gpu-vram 0` means the CPU on every core; GPU placement on a core
+    /// without it is refused with the rebuild to make.
+    #[test]
+    fn gpu_placement_zero_is_the_cpu() {
+        assert_eq!(gpu_placement(Some("0"), None), Ok(GpuPlacement::Cpu));
+        assert!(gpu_placement(None, None).is_err());
+        let explicit = gpu_placement(Some("40,12"), Some("0,1"));
+        if cfg!(ds4_multi_gpu) {
+            let Ok(GpuPlacement::Gpus { config, .. }) = explicit else {
+                panic!("{explicit:?}");
+            };
+            assert_eq!(config.n_gpus, 2);
+            assert_eq!(config.vram_bytes[1], 12 << 30);
+        } else {
+            let err = explicit.unwrap_err();
+            assert!(err.contains("PLANK_DS4_BACKEND=cuda"), "{err}");
+        }
     }
 
     #[test]

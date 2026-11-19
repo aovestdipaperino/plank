@@ -255,8 +255,8 @@ mod tests {
         assert!(l.wants_anchor(10, 25_000));
         // A cut in front of everything empties the ladder; nothing to cut is a no-op.
         assert_eq!(l.truncate_to(1).len(), 2);
-        assert!(l.rungs().is_empty());
-        assert!(l.truncate_to(0).is_empty());
+        assert_eq!(l.rungs(), []);
+        assert_eq!(l.truncate_to(0), [] as [crate::kvladder::Rung; 0]);
     }
 
     #[test]

@@ -4007,3 +4007,178 @@ in, so they see it without the bump. The next catalog bump must wait until
 the 7.0.x clients have aged out, or the old fit rule has to be reckoned with
 (`enginefit.rs` in v7.0.8, `raw_str(entry, "family") == Some("gemma")`).
 
+
+## Write containment on Windows: canonical roots against a lexical target
+
+`Sandbox::write_roots` canonicalizes its roots, and on Windows
+`canonicalize` returns verbatim paths (`\\?\C:\work`). A write target whose
+parent did not exist yet was normalised lexically instead (`C:\work\a\b.txt`),
+so `starts_with` never matched and the write was refused as escaping the
+workspace; macOS has the same mismatch through `/tmp` -> `/private/tmp`.
+`realpath_for_write` now canonicalizes the deepest existing ancestor and folds
+`.`/`..` in the components re-attached after it (they do not exist, so they
+cannot be symlinks, and a `new/../../x` climb is still seen). Roots go through
+the same function, so a configured root that does not exist yet compares like
+a target. `platform::path_starts_with` ignores case and the verbatim prefix on
+Windows. Folding `..` *before* canonicalizing would be wrong: `link/../x`
+through a symlink lands beside the link's target, not beside the link.
+
+## Landlock for the bash sandbox: what the raw ABI needs
+
+`landlock_path_beneath_attr` is `__attribute__((packed))` (12 bytes); the
+Rust mirror is `#[repr(C, packed)]` to match the header, though the field
+offsets are the same either way since the padding would trail `parent_fd`.
+A rule on a regular file may only grant file
+rights (`WRITE_FILE`, `TRUNCATE`); the directory rights make it `EINVAL`, so
+a `writablePaths` entry naming a file is masked. Rights are handled per ABI
+(`REFER` from 2, `TRUNCATE` from 3): on ABI 1 a rename into another
+directory is always refused, even between two writable roots. A refused write
+reports `EACCES` ("Permission denied"), not Seatbelt's `EPERM`, so the
+`[sandbox blocked: ...]` hint matches on `Sandbox::denial_text()`. The ruleset
+is built in the parent and only `prctl(PR_SET_NO_NEW_PRIVS)` plus
+`landlock_restrict_self` run in `pre_exec`, the two syscalls safe between
+`fork` and `exec` in a multithreaded process. WSL2's 6.x kernel has Landlock
+(ABI 7), so the end-to-end tests run there.
+
+## Windows `bash` sandbox: msys cannot run under a write-restricted token
+
+A write-restricted token (`CreateRestrictedToken(WRITE_RESTRICTED, ...)`) would
+have confined writes without touching any label: reads stay open, and a write
+succeeds only where an ACE names one of the token's restricting SIDs.
+Swapping it into a suspended child with `NtSetInformationProcess(ProcessAccessToken)`
+needs no privilege, since it is a restricted copy of plank's own token. But Git
+Bash dies under it. msys sets the token's default DACL (fixable by granting the
+restricted token object to its own SIDs), then creates
+`\BaseNamedObjects\msys-2.0S5-*` (passes only with Everyone among the
+restricting SIDs) and finally its signal pipe, whose security descriptor names
+only the user SID. A write-restricted check never accepts that, and adding the
+user SID to the restricting set cancels the confinement. Windows PowerShell 5.1
+hangs under the same token.
+
+A Low-integrity token runs Git Bash correctly: writes into a directory
+labelled `S:(ML;OICI;NW;;;LW)` succeed, writes elsewhere get `Permission
+denied`, and everything stays readable. Windows PowerShell 5.1 crashes at Low
+integrity (a .NET fail-fast, `0x80131623`), so the PowerShell dialect cannot be
+confined this way.
+Labelling `%TEMP%` would let every Low process write the user's temp files, so
+confined commands get `%TEMP%\plank-low` instead (`lowil::temp_dir`). A
+`std::process::Command` cannot carry a token, so `sandbox.rs` marks the command
+with `PLANK_SANDBOX=low-integrity` and `platform::CommandExt::spawn_tree` starts
+it with `CREATE_SUSPENDED`. Since `spawn_tree` sets `creation_flags` itself,
+the suspend flag has to be added there; a flag set by the caller would be
+overwritten.
+
+## The ds4 CPU core: what it refuses, and the RAM figure that was never read
+
+A Linux build without CUDA links a `DS4_NO_GPU` core (`ds4_cpu.o`), and the C
+does not check the backend it is handed against what it was compiled with: the
+CLI's `--metal`/`--cuda` set `e->backend` unconditionally, so a `Metal` or
+`Cuda` open on that core walks into GPU paths compiled out of it. A GPU core
+keeps the CPU path beside its one GPU backend, so the rule is "your own
+backend, or the CPU" (`Ds4Backend::runs_on`), and `ffi::check_backend` refuses
+anything else before `ds4_engine_open`, in plank, the shared host and the
+crate's `Model::open` alike.
+
+Two things a GPU backend takes for granted fail outright on the CPU, both as an
+open failure rather than a degraded run: any `vision_path` ("GLM-5.3 vision
+requires --metal, --cuda, or --rocm", printed for DeepSeek's encoder too), and
+`ssd_streaming` ("supported only with --metal/--cuda/--rocm"). So
+`ensure_side_artifacts` takes the backend and, on the CPU, neither fetches the
+encoder nor auto-enables streaming, and `Ds4Model::open` drops the encoder as
+well for any other caller.
+
+The streaming auto-enable had never fired off macOS for another reason:
+`download::total_ram_bytes` returned `None` everywhere else, which also
+silently passed the 96 GB `require_min_ram` floor and left `enginefit` unable to
+dim the ds4 engines. It now falls back to `platform::physical_memory`.
+
+The `ffi.rs` offset pins were recorded on arm64 macOS; on x86-64 Linux
+`gcc`'s `offsetof` gives the same values (`ds4_engine_options` 280 bytes,
+`tp` at 216, `ds4_vision_embedding` 72, `ds4_vision_span` 80), as LP64 on both.
+
+## The ds4 ROCm core opens as CUDA, and shares objects with the CUDA build
+
+ds4 has no `DS4_BACKEND_ROCM`: `make strix-halo` compiles the host sources with
+`-DDS4_ROCM_BUILD` and links `ds4_rocm.o` where the CUDA build links
+`ds4_cuda.o`, and the C's own `--rocm` flag sets `DS4_BACKEND_CUDA`. So a
+`PLANK_DS4_BACKEND=rocm` core reports `Ds4Backend::Cuda` from
+`ffi::built_backend`, `--cuda` is the flag that selects it, and only
+`Ds4Backend::label` (the ready line, the refusal message) says `rocm`. On that
+core Qwen's GPU path is compiled out (`DS4_HAS_QWEN4_GPU` excludes
+`DS4_ROCM_BUILD`).
+
+The Makefile sets those host flags by re-invoking itself with
+`CFLAGS="$(CFLAGS) ..."`. From outside, a command-line `CFLAGS=` would replace
+the Makefile's defaults *and* its later `CFLAGS +=` line (command-line values
+override makefile assignments), so the build script runs make with a two-line
+wrapper (`include Makefile` then `CFLAGS += $(ROCM_HOST_CFLAGS)
+-DDS4_ROCM_BUILD`) given by `-f`. `--eval` does not work: it runs before the
+Makefile is read, so its `CFLAGS ?=` default is then skipped.
+
+The objects live in the source tree, and make compares timestamps, not flags:
+`ds4.o` (CUDA vs ROCm) and `ds4_tp.o` (which reads `DS4_ROCM_BUILD`) are the
+same filenames with different contents per backend. After switching
+`PLANK_DS4_BACKEND`, make would link the previous backend's copies. The build
+script keeps `.plank-backend.o` in the ds4 tree (the `.o` suffix puts it under
+the submodule's `*.o` ignore rule) and deletes those two objects when it names
+another backend. Recompiling `ds4.o` unconditionally is not an option: it is
+~88k lines at `-O3`.
+
+## ds4 on discrete GPUs: placement is opt-in, and the RAM floor counted only RAM
+
+A plain `ds4_engine_open` on CUDA never spreads layers over several GPUs.
+That takes `ds4_engine_create_with_gpu_config` with a `ds4_gpu_config` (devices
+plus a byte budget each), which the C front ends fill from `--gpu-vram` and
+`--gpu-devices` through `parse_gpu_vram_arg` (`ds4_gpu_args.c`). plank takes the
+same two flags and calls the same parser (`ffi::gpu_placement`), so `auto`, `0`
+and the CSV budgets mean exactly what they mean to `ds4-agent`, and like the C
+it forces CUDA for a placement and the CPU for `0`
+(`EngineTuning::placement_backend`).
+
+`ds4_gpu_args.o` is linked only into CUDA and ROCm cores (cfg `ds4_multi_gpu`
+inside the engine crate): it is built without `DS4_NO_GPU`, so its `auto` branch
+references `ds4_gpu_args_probe_auto_cuda`, which only `ds4_cuda.o` and
+`ds4_rocm_compat.o` define. A CPU core that linked it would fail to link as soon
+as plank called the parser.
+
+The 96 GB floor read only host RAM, which refused exactly the machines
+multi-GPU placement is for (four 48 GB L40S cards in a 64 GB host).
+`enginefit::ds4_memory_verdict` now also accepts the GPUs' summed VRAM
+(`nvidia-smi --query-gpu=memory.total`, or `rocm-smi --showmeminfo vram --csv`
+on a ROCm core), and when RAM is short but VRAM is not, the launch places
+layers with `--gpu-vram auto` instead of refusing. An explicit placement skips
+the floor: the C refuses a layout that would need unsupported CPU execution.
+Unified-memory GPUs need no special case. GB10 reports `[N/A]` to the
+`nvidia-smi` query (skipped), and its RAM figure already counts what the GPU can
+use. SSD streaming is not auto-enabled under a placement, because host RAM is
+not what holds the layers.
+
+`ds4_engine_close` runs `ds4_gpu_cleanup`, which resets `g_n_gpus`, so the GPU
+yield's close-and-reopen gets a clean multi-GPU state. The reopen passes the
+same `EngineTuning`, placement included.
+## Windows test runs need `HOME`, which only `main` sets
+
+plank reads `HOME` directly in many places (the document cache, `~/.plank`),
+and on Windows `platform::ensure_home` fills it from `USERPROFILE` at the top
+of `main`. The test harness never runs `main`, so `cargo test` started from
+`cmd` or PowerShell fails wherever a test writes under `~/.plank`:
+`read_pdf_as_markdown_and_continue` reports "cannot write the document
+cache". CI's Windows job runs under `shell: bash` (Git Bash), which exports
+`HOME`, so it passes. From PowerShell, set `$env:HOME = $env:USERPROFILE` first.
+## WASM guest hashes depended on the builder's home directory
+
+`guests/verify.sh` and the release `SHA256SUMS` compare guest modules by hash,
+but every panic location embeds an absolute source path
+(`/home/<user>/.cargo/registry/src/...`, the guest's own `src/`), so no build on
+another machine could match. `guests/build.sh` and `spike/build-guest.sh` now
+pass `--remap-path-prefix` for the Cargo home (`/cargo`) and the source tree
+(`/src`), converted with `cygpath -m` under Git Bash, since rustc on Windows
+needs a native path. That removes the home directory from Linux and macOS
+builds. A Windows build still differs, because rustc remaps only the prefix and
+keeps `\` in the rest of each path, local crate paths included (`src\minions.rs`).
+Cargo's `profile.release.trim-paths` would fix that, but is still unstable in
+Cargo 1.99. So hashes reproduce between Unix builders, not from Windows.
+
+Git Bash's `sha256sum` also writes `<hash> *<name>` (binary mode), which
+`verify.sh` would read as a file called `*name`; the scripts prefer `shasum` and
+drop the `*`.

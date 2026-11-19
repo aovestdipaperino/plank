@@ -4041,7 +4041,7 @@ mod tests {
                 .join("guests")
                 .join(guest)
                 .join("plugin.json");
-            // csvedit is the plank-csvedit submodule, absent from a checkout
+            // csvedit is the plank-tv submodule, absent from a checkout
             // that never initialised it; the other two live in this tree.
             if guest == "csvedit" && !path.exists() {
                 eprintln!("skipping csvedit: guests/csvedit submodule not checked out");
@@ -4121,7 +4121,7 @@ mod tests {
         let root = temp_dir("missing-module");
         let p = plugin_dir(&root, "demo", FULL, &[]);
         let set = discover(&set_of(vec![p]));
-        assert!(set.components.is_empty());
+        assert_eq!(set.components, [] as [crate::wasmreg::WasmComponent; 0]);
         assert!(
             set.warnings.iter().any(|w| w.contains("missing module")),
             "{:?}",

@@ -1051,7 +1051,27 @@ fn migrate_engine_layout_unconditionally() {
     }
 }
 
+/// Removes this plank's Low labels when dropped at the end of `main`.
+#[cfg(windows)]
+struct LowLabels;
+
+#[cfg(windows)]
+impl Drop for LowLabels {
+    fn drop(&mut self) {
+        plank::lowil::release_mine();
+    }
+}
+
 fn main() -> ExitCode {
+    plank::platform::ensure_home();
+    // SAFETY: first thing in `main`, before plank starts a thread.
+    unsafe { plank::doc::locate_pdfium() };
+    // The Windows sandbox's Low labels: a crashed plank's are removed now,
+    // this one's when `main` returns (`lowil.rs`).
+    #[cfg(windows)]
+    plank::lowil::sweep_stale();
+    #[cfg(windows)]
+    let _labels = LowLabels;
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Before anything can move the process: `/edit-profile`'s restart re-runs
     // these arguments from this directory.
@@ -1315,22 +1335,60 @@ fn acquire_model_lock() -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses to run when the machine has less than [`plank::enginefit::MIN_RAM_BYTES`] of RAM.
+/// Refuses to run when neither RAM nor, on a CUDA or `ROCm` core, the GPUs'
+/// summed VRAM reaches [`plank::enginefit::MIN_RAM_BYTES`]. Returns `true` when
+/// RAM is short but the GPUs hold the model, so the open places its layers
+/// on them (`--gpu-vram auto`); `--gpu-vram`/`--gpu-devices` skip the check,
+/// leaving the layout to the C, which refuses one that does not fit.
 ///
 /// # Errors
-/// Returns an explanatory message when physical RAM is below the minimum.
+/// Returns an explanatory message when the machine cannot hold the model.
 #[cfg(ds4_engine)]
-fn require_min_ram() -> Result<(), String> {
-    if let Some(bytes) = plank::download::total_ram_bytes()
-        && bytes < plank::enginefit::MIN_RAM_BYTES
-    {
-        #[allow(clippy::cast_precision_loss)]
-        let have = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        return Err(format!(
-            "plank needs at least 96 GB of RAM to run DeepSeek V4 Flash; this machine has {have:.0} GB"
-        ));
+fn require_min_ram(
+    backend: plank::ffi::Ds4Backend,
+    tuning: &plank::config::EngineTuning,
+) -> Result<bool, String> {
+    use plank::enginefit::{Ds4Memory, ds4_memory_verdict, gpu_memory_total};
+    let gpus = (backend == plank::ffi::Ds4Backend::Cuda)
+        .then(gpu_memory_total)
+        .flatten();
+    match ds4_memory_verdict(
+        plank::download::total_ram_bytes(),
+        gpus,
+        tuning.gpu_placement_requested(),
+    ) {
+        Ds4Memory::Open => Ok(false),
+        Ds4Memory::PlaceOnGpus => {
+            eprintln!(
+                "plank: RAM is below 96 GB but the GPUs hold the model; placing layers across them (--gpu-vram auto)"
+            );
+            Ok(true)
+        }
+        Ds4Memory::Refuse(msg) => Err(msg),
     }
-    Ok(())
+}
+
+/// The ds4 backend `--metal`/`--cuda`/`--cpu` ask for (or `--gpu-vram`/
+/// `--gpu-devices` imply), else the one the core was compiled for (Metal on
+/// macOS, the CPU, CUDA or `ROCm` on Linux).
+///
+/// # Errors
+/// When the core cannot run the backend asked for ([`plank::ffi::check_backend`]).
+#[cfg(ds4_engine)]
+fn ds4_backend(
+    choice: Option<plank::config::Backend>,
+    tuning: &plank::config::EngineTuning,
+) -> Result<plank::ffi::Ds4Backend, String> {
+    use plank::config::Backend;
+    use plank::ffi::Ds4Backend;
+    let backend = match tuning.placement_backend(choice)? {
+        Some(Backend::Cuda) => Ds4Backend::Cuda,
+        Some(Backend::Cpu) => Ds4Backend::Cpu,
+        Some(Backend::Metal) => Ds4Backend::Metal,
+        None => plank::ffi::built_backend().unwrap_or(Ds4Backend::Metal),
+    };
+    plank::ffi::check_backend(backend)?;
+    Ok(backend)
 }
 
 /// Builds the inference engine: the real ds4 engine on macOS (the engine or
@@ -1545,11 +1603,14 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
     }
     #[cfg(ds4_engine)]
     {
-        use plank::{config::Backend, ds4engine::Ds4Engine, ffi::Ds4Backend};
+        use plank::ds4engine::Ds4Engine;
 
+        // A backend the core was not built for is refused before anything
+        // else, downloads included.
+        let backend = ds4_backend(cfg.backend, &cfg.engine)?;
         // The default quant needs ~82 GB resident; refuse on machines that
         // cannot hold it, before downloading or loading anything.
-        require_min_ram()?;
+        let place_on_gpus = require_min_ram(backend, &cfg.engine)?;
 
         // Only one instance can hold the ~82 GB model at a time — a second
         // would fail deep in the engine while mapping model views, with a
@@ -1583,14 +1644,10 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         // neither.
         let mut tuning = cfg.engine.clone();
         let ctx_size = ds4_ctx_size(cfg, &model);
-        plank::download::ensure_side_artifacts(sel, ctx_size, &mut tuning)?;
-
-        let backend = match cfg.backend {
-            Some(Backend::Cuda) => Ds4Backend::Cuda,
-            Some(Backend::Cpu) => Ds4Backend::Cpu,
-            // Metal is the platform default where the engine is built.
-            Some(Backend::Metal) | None => Ds4Backend::Metal,
-        };
+        if place_on_gpus {
+            tuning.gpu_vram = Some("auto".to_string());
+        }
+        plank::download::ensure_side_artifacts(sel, ctx_size, backend, &mut tuning)?;
         eprintln!("plank: loading model {}...", model.display());
         // Render the C engine's noisy startup log in place on one row.
         let replacer = plank::stderrline::StderrLineReplacer::start();
@@ -1638,8 +1695,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<LocalEngine, String> {
         drop(replacer);
         let (engine, opened_with) = opened?;
         eprintln!(
-            "plank: model ready: {}{}",
+            "plank: model ready: {} ({}){}",
             engine.model_name(),
+            backend.label(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))
@@ -1767,8 +1825,13 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     } else {
         0
     };
-    let engine = NativeEngine::<F>::open(&model, ctx).map_err(|e| e.to_string())?;
-    eprintln!("plank: model ready: {}", engine.model_name());
+    let backend = cfg.backend;
+    let engine = NativeEngine::<F>::open(&model, ctx, backend).map_err(|e| e.to_string())?;
+    eprintln!(
+        "plank: model ready: {} ({})",
+        engine.model_name(),
+        engine.device_name()
+    );
     if ctx == 0 {
         #[allow(clippy::cast_precision_loss)]
         let kv_gb = engine.kv_bytes_at_ctx() as f64 / f64::from(1u32 << 30);
@@ -1779,7 +1842,7 @@ fn make_native_engine<F: plank::nativeengine::NativeFamily>(
     }
     let reopen: plank::gpuyield::ReopenFn = Box::new(move || {
         plank::gpuyield::check_model_files(vec![("model", model.as_path())])?;
-        NativeEngine::<F>::open(&model, ctx)
+        NativeEngine::<F>::open(&model, ctx, backend)
             .map(|e| Box::new(e) as Box<dyn Engine>)
             .map_err(|e| e.to_string())
     });
@@ -1984,11 +2047,10 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     }
     #[cfg(ds4_engine)]
     {
-        use plank::config::Backend;
         use plank::ds4engine::Ds4Model;
-        use plank::ffi::Ds4Backend;
 
-        require_min_ram()?;
+        let backend = ds4_backend(cfg.backend, &cfg.engine)?;
+        let place_on_gpus = require_min_ram(backend, &cfg.engine)?;
         acquire_model_lock()?;
         let model_path = cfg.model_path.clone().expect("resolved by parse_config");
         let sel = cfg.selection.as_ref().expect("resolved by parse_config");
@@ -2007,12 +2069,10 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
         let ctx_size = ds4_ctx_size(cfg, &model_path);
-        plank::download::ensure_side_artifacts(sel, ctx_size, &mut tuning)?;
-        let backend = match cfg.backend {
-            Some(Backend::Cuda) => Ds4Backend::Cuda,
-            Some(Backend::Cpu) => Ds4Backend::Cpu,
-            Some(Backend::Metal) | None => Ds4Backend::Metal,
-        };
+        if place_on_gpus {
+            tuning.gpu_vram = Some("auto".to_string());
+        }
+        plank::download::ensure_side_artifacts(sel, ctx_size, backend, &mut tuning)?;
         eprintln!("plank: loading shared model {}...", model_path.display());
         let replacer = plank::stderrline::StderrLineReplacer::start();
         let model = Ds4Model::open_shared(
@@ -2027,8 +2087,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         .map_err(|e| e.to_string())?;
         drop(replacer);
         eprintln!(
-            "plank: shared model ready: {}{}",
+            "plank: shared model ready: {} ({}){}",
             model.model_name(),
+            backend.label(),
             cfg.model_delta
                 .as_ref()
                 .map_or_else(String::new, |d| format!(" ({})", d.describe()))

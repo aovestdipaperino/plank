@@ -1,17 +1,22 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! macOS Seatbelt sandbox for model-initiated shell commands (issue #17).
+//! Write sandbox for model-initiated shell commands and file tools (issue #17).
 //!
-//! On by default on macOS: a model-chosen command should not be able to write
-//! outside the project it was pointed at. `--no-sandbox` (or `"enabled": false`)
-//! turns it off.
+//! On by default: a model-chosen command should not be able to write outside
+//! the project it was pointed at. `--no-sandbox` (or `"enabled": false`) turns
+//! it off.
 //!
-//! When enabled, `bash` tool commands run under `/usr/bin/sandbox-exec` with
-//! a generated profile: read everywhere, write only under the working
-//! directory, temp dirs, and any configured extra roots. User-typed `!` and
-//! `!!` commands are never sandboxed — the user typing the command is the
-//! authorization.
+//! When enabled, `bash` tool commands run confined to the same write roots the
+//! file tools are held to: read everywhere, write only under the working
+//! directory, temp dirs, and any configured extra roots. What enforces that on
+//! `bash` depends on the OS ([`enforcement`]): `/usr/bin/sandbox-exec` with a
+//! generated Seatbelt profile on macOS, a Landlock ruleset on Linux
+//! (`landlock.rs`), and on Windows a Low-integrity token with the write roots
+//! labelled Low while plank runs (`lowil.rs`). Where none applies, only the
+//! file tools' check ([`Sandbox::contains_write_target`]) does, and the
+//! startup notice ([`Sandbox::startup_notice`]) says so. User-typed `!` and `!!` commands are
+//! never sandboxed — the user typing the command is the authorization.
 //!
 //! Configured via `~/.plank/sandbox.json` overlaid by `./.plank/sandbox.json`:
 //!
@@ -58,6 +63,53 @@
 //!
 //! `sandbox-exec` is deprecated by Apple but remains functional and is what
 //! the reference agents use on macOS.
+
+/// What confines a sandboxed `bash` command on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enforcement {
+    /// macOS: `sandbox-exec` with a generated profile.
+    Seatbelt,
+    /// Linux: a Landlock ruleset of this ABI version.
+    Landlock(i64),
+    /// Windows: a Low-integrity token, with the write roots labelled Low
+    /// while plank runs (`lowil.rs`).
+    LowIntegrity,
+    /// No backend; the reason, for the startup notice.
+    Unavailable(String),
+}
+
+impl Enforcement {
+    /// True when `bash` commands can actually be confined.
+    #[must_use]
+    pub fn confines_bash(&self) -> bool {
+        !matches!(self, Self::Unavailable(_))
+    }
+}
+
+/// This machine's [`Enforcement`], probed once.
+#[must_use]
+pub fn enforcement() -> &'static Enforcement {
+    static PROBED: std::sync::OnceLock<Enforcement> = std::sync::OnceLock::new();
+    PROBED.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            Enforcement::Seatbelt
+        }
+        #[cfg(target_os = "linux")]
+        {
+            crate::landlock::abi_version()
+                .map_or_else(Enforcement::Unavailable, Enforcement::Landlock)
+        }
+        #[cfg(windows)]
+        {
+            Enforcement::LowIntegrity
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            Enforcement::Unavailable("this OS has no sandbox plank can use yet".to_string())
+        }
+    })
+}
 
 use crate::tools::mcp::{Json, json_parse};
 use std::collections::BTreeSet;
@@ -253,7 +305,8 @@ fn toolchain_cache_roots(user_home: Option<&Path>) -> Vec<PathBuf> {
 /// Sandbox policy for model-initiated bash commands.
 #[derive(Debug, Clone)]
 pub struct Sandbox {
-    /// Master switch; on by default wherever `sandbox-exec` exists (macOS).
+    /// Master switch, on by default. Gates both the file tools' containment
+    /// check and, where [`enforcement`] has a backend, the `bash` confinement.
     pub enabled: bool,
     /// Extra roots writable in addition to cwd and temp dirs.
     pub writable_paths: Vec<PathBuf>,
@@ -266,12 +319,12 @@ pub struct Sandbox {
 }
 
 impl Default for Sandbox {
-    /// On where Seatbelt exists, off elsewhere: `sandbox-exec` is macOS-only,
-    /// and wrapping a command in a binary that is not there would fail every
-    /// model-initiated command on other platforms.
+    /// On everywhere: the file tools' containment is portable, and `bash` is
+    /// confined only where [`enforcement`] found a backend, so an OS without
+    /// one still runs commands, unconfined.
     fn default() -> Self {
         Self {
-            enabled: cfg!(target_os = "macos"),
+            enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
             granted: BTreeSet::new(),
@@ -280,10 +333,12 @@ impl Default for Sandbox {
 }
 
 impl Sandbox {
-    /// True when this command should run under `sandbox-exec`.
+    /// True when this command should run confined: the sandbox is on, this
+    /// machine can confine `bash` ([`enforcement`]), and no
+    /// `excludedCommands` pattern skips it.
     #[must_use]
     pub fn should_sandbox(&self, cmd: &str) -> bool {
-        if !self.enabled {
+        if !self.enabled || !enforcement().confines_bash() {
             return false;
         }
         let cmd = cmd.trim();
@@ -291,6 +346,86 @@ impl Sandbox {
             .excluded_commands
             .iter()
             .any(|pat| glob_match(pat.trim(), cmd))
+    }
+
+    /// `shell`, the complete command line to run (program, flags and script),
+    /// confined to [`write_roots`](Self::write_roots) under this machine's
+    /// [`enforcement`].
+    ///
+    /// On Windows the write roots are labelled Low first, and the command is
+    /// marked ([`crate::lowil::MARKER_VAR`]) so that `spawn_tree` starts it at
+    /// Low integrity, with its own Low temp directory.
+    ///
+    /// # Errors
+    /// Building the Landlock ruleset failed, or the working directory could
+    /// not be labelled.
+    pub fn shell_command(
+        &self,
+        cwd: &Path,
+        shell: std::process::Command,
+    ) -> std::io::Result<std::process::Command> {
+        match enforcement() {
+            Enforcement::Seatbelt => {
+                let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+                c.arg("-p")
+                    .arg(self.profile(cwd))
+                    .arg(shell.get_program())
+                    .args(shell.get_args());
+                Ok(c)
+            }
+            #[cfg(target_os = "linux")]
+            Enforcement::Landlock(abi) => {
+                use std::os::unix::process::CommandExt as _;
+                let ruleset = crate::landlock::Ruleset::for_roots(*abi, &self.write_roots(cwd))?;
+                let mut c = shell;
+                // SAFETY: `apply_in_child` makes only async-signal-safe
+                // syscalls and allocates nothing.
+                unsafe {
+                    c.pre_exec(move || ruleset.apply_in_child());
+                }
+                Ok(c)
+            }
+            #[cfg(not(target_os = "linux"))]
+            Enforcement::Landlock(_) => Ok(shell),
+            #[cfg(windows)]
+            Enforcement::LowIntegrity => {
+                let roots = self.write_roots(cwd);
+                crate::lowil::ensure_labelled(&roots, Some(&realpath_for_write(cwd)))?;
+                let temp = crate::lowil::temp_dir()?;
+                let mut c = shell;
+                c.env(crate::lowil::MARKER_VAR, crate::lowil::MARKER_VALUE)
+                    .env("TEMP", &temp)
+                    .env("TMP", &temp)
+                    .env("TMPDIR", &temp);
+                Ok(c)
+            }
+            #[cfg(not(windows))]
+            Enforcement::LowIntegrity => Ok(shell),
+            Enforcement::Unavailable(_) => Ok(shell),
+        }
+    }
+
+    /// The line a confined command's failure carries when a write was refused:
+    /// Seatbelt reports `EPERM`, Landlock `EACCES`.
+    #[must_use]
+    pub fn denial_text() -> &'static str {
+        match enforcement() {
+            Enforcement::Landlock(_) | Enforcement::LowIntegrity => "Permission denied",
+            _ => "Operation not permitted",
+        }
+    }
+
+    /// A startup line when the sandbox is on but cannot confine `bash` here;
+    /// `None` when it can, or when the user turned it off.
+    #[must_use]
+    pub fn startup_notice(&self) -> Option<String> {
+        match enforcement() {
+            Enforcement::Unavailable(reason) if self.enabled => Some(format!(
+                "Sandbox: bash commands run unconfined ({reason}); file tools still write \
+                 only inside the workspace."
+            )),
+            _ => None,
+        }
     }
 
     /// Builds the Seatbelt (SBPL) profile: allow everything, deny all file
@@ -380,11 +515,9 @@ impl Sandbox {
         }
         // Resolve symlinks where possible: Seatbelt matches the real path,
         // and macOS cwds are often under the /tmp -> /private/tmp or
-        // /var -> /private/var symlinks.
-        roots
-            .into_iter()
-            .map(|root| root.canonicalize().unwrap_or(root))
-            .collect()
+        // /var -> /private/var symlinks. A root that does not exist yet
+        // resolves as a write target does, so the two stay comparable.
+        roots.iter().map(|root| realpath_for_write(root)).collect()
     }
 
     /// True when a file tool may write `target` (already resolved against
@@ -399,7 +532,9 @@ impl Sandbox {
             return true;
         }
         let real = realpath_for_write(target);
-        self.write_roots(cwd).iter().any(|r| real.starts_with(r))
+        self.write_roots(cwd)
+            .iter()
+            .any(|r| crate::platform::path_starts_with(&real, r))
     }
 }
 
@@ -434,21 +569,28 @@ fn worktree_git_roots(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The real location a write to `target` would land at. An existing target
-/// canonicalizes directly; a file about to be created canonicalizes its
-/// parent and re-attaches the file name; when even the parent is missing the
-/// path is normalised lexically (`.` and `..` folded) so a `..` escape is still
-/// visible to the containment check.
+/// The real location a write to `target` would land at: its deepest existing
+/// ancestor canonicalized, with the components that do not exist yet
+/// re-attached and their `.` and `..` folded. Those components cannot be
+/// symlinks, so folding them lexically is exact, and a `..` escape out of a
+/// directory about to be created is still visible to the containment check.
+/// [`Sandbox::write_roots`] resolves its roots the same way, so both sides of
+/// the containment check carry the `\\?\` prefix `canonicalize` adds on
+/// Windows, or neither does.
 fn realpath_for_write(target: &Path) -> PathBuf {
-    if let Ok(real) = target.canonicalize() {
-        return real;
+    let mut base = target;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(real) = base.canonicalize() {
+            return lexical_normalize(&missing.iter().rev().fold(real, |p, name| p.join(name)));
+        }
+        // Not `file_name`, which is `None` for a trailing `..`.
+        let (Some(parent), Some(last)) = (base.parent(), base.components().next_back()) else {
+            return lexical_normalize(target);
+        };
+        missing.push(last.as_os_str());
+        base = parent;
     }
-    if let (Some(parent), Some(name)) = (target.parent(), target.file_name())
-        && let Ok(real_parent) = parent.canonicalize()
-    {
-        return real_parent.join(name);
-    }
-    lexical_normalize(target)
 }
 
 /// Folds `.` and `..` components without touching the filesystem.
@@ -746,9 +888,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enabled_by_default_on_macos_only() {
+    fn enabled_by_default_and_confines_bash_where_a_backend_exists() {
         let sb = Sandbox::default();
-        assert_eq!(sb.should_sandbox("rm -rf /"), cfg!(target_os = "macos"));
+        assert!(sb.enabled);
+        assert_eq!(sb.should_sandbox("rm -rf /"), enforcement().confines_bash());
+        assert_eq!(
+            sb.startup_notice().is_some(),
+            !enforcement().confines_bash()
+        );
+        let off = Sandbox {
+            enabled: false,
+            ..sb
+        };
+        assert!(!off.should_sandbox("rm -rf /"));
+        assert!(off.startup_notice().is_none());
     }
 
     #[test]
@@ -790,7 +943,7 @@ mod tests {
         );
         assert!(roots.contains(&real(&repo.join(".git"))), "{roots:?}");
         // A normal clone keeps `.git` inside the cwd and needs no extra root.
-        assert!(worktree_git_roots(&repo).is_empty());
+        assert_eq!(worktree_git_roots(&repo), [] as [std::path::PathBuf; 0]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -819,6 +972,10 @@ mod tests {
         assert!(!sb.should_sandbox("  git push  "));
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn profile_contains_cwd_and_escapes() {
         let sb = Sandbox {
@@ -839,6 +996,7 @@ mod tests {
     const FAKE_HOME: &str = "/nonexistent/home";
     const FAKE_PLANK_HOME: &str = "/nonexistent/home/.plank";
 
+    #[cfg(unix)]
     fn test_sandbox() -> Sandbox {
         Sandbox {
             enabled: true,
@@ -848,6 +1006,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    /// A `(subpath "…")` profile entry for `path`.
+    fn subpath(path: &Path) -> String {
+        format!("(subpath \"{}\")", path.display())
+    }
+
+    #[cfg(unix)]
+    /// The fake home's cargo home. `CARGO_HOME` overrides `~/.cargo`, and
+    /// rustup sets it for every cargo it runs, `cargo test` included, so the
+    /// tests resolve it the way the code does rather than assume `~/.cargo`.
+    fn fake_cargo_home() -> PathBuf {
+        cargo_home(Path::new(FAKE_HOME))
+    }
+
+    #[cfg(unix)]
     fn profile_for(sb: &Sandbox, granted: &[Protected]) -> String {
         sb.profile_at(
             Path::new("/nonexistent/work"),
@@ -857,11 +1030,15 @@ mod tests {
         )
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn protected_roots_are_not_writable_until_granted() {
         let mut sb = test_sandbox();
         let plank = format!("(subpath \"{FAKE_PLANK_HOME}\")");
-        let cargo_bin = format!("(subpath \"{FAKE_HOME}/.cargo/bin\")");
+        let cargo_bin = subpath(&fake_cargo_home().join("bin"));
 
         // Denied (and the default): no grant reaches the profile at all.
         let none = profile_for(&sb, &[]);
@@ -894,37 +1071,53 @@ mod tests {
     /// writes `~/.cargo/registry`, which must be allowed, while
     /// `cargo install` writes `~/.cargo/bin`, which must not — so the grant
     /// cannot simply name `~/.cargo`.
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn toolchain_caches_are_writable_but_path_bins_are_not() {
         let sb = test_sandbox();
         let p = profile_for(&sb, &[]);
+        let home = Path::new(FAKE_HOME);
+        let cargo = fake_cargo_home();
+        // RUSTUP_HOME and GOMODCACHE/GOPATH override the defaults the same
+        // way CARGO_HOME does, and rustup sets RUSTUP_HOME under cargo test.
+        let rustup = env_dir("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
+        let gomod = env_dir("GOMODCACHE").unwrap_or_else(|| {
+            env_dir("GOPATH")
+                .unwrap_or_else(|| home.join("go"))
+                .join("pkg/mod")
+        });
         for cache in [
-            ".cargo/registry",
-            ".cargo/git",
-            ".rustup/downloads",
-            ".rustup/tmp",
-            ".npm/_cacache",
-            ".cache",
-            "Library/Caches",
-            "go/pkg/mod",
+            cargo.join("registry"),
+            cargo.join("git"),
+            rustup.join("downloads"),
+            rustup.join("tmp"),
+            home.join(".npm/_cacache"),
+            home.join(".cache"),
+            home.join("Library/Caches"),
+            gomod,
         ] {
             assert!(
-                p.contains(&format!("(subpath \"{FAKE_HOME}/{cache}\")")),
-                "{cache} should be writable by default"
+                p.contains(&subpath(&cache)),
+                "{} should be writable by default",
+                cache.display()
             );
         }
         // Never the whole of ~/.cargo, which would carry bin with it.
-        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo\")")));
-        assert!(!p.contains(&format!("(subpath \"{FAKE_HOME}/.cargo/bin\")")));
+        assert!(!p.contains(&subpath(&cargo)));
+        assert!(!p.contains(&subpath(&cargo.join("bin"))));
 
         // And the containment check the file tools use agrees with the profile.
         let cwd = Path::new("/nonexistent/work");
         let granted = BTreeSet::new();
         let roots = sb.write_roots_at(cwd, Some(Path::new(FAKE_HOME)), None, &granted);
         let under = |p: &str| roots.iter().any(|r| Path::new(p).starts_with(r));
-        assert!(under("/nonexistent/home/.cargo/registry/cache/x"));
-        assert!(!under("/nonexistent/home/.cargo/bin/plank-replay"));
-        assert!(!under("/nonexistent/home/.cargo/config.toml"));
+        let under_cargo = |rel: &str| under(&cargo.join(rel).to_string_lossy());
+        assert!(under_cargo("registry/cache/x"));
+        assert!(!under_cargo("bin/plank-replay"));
+        assert!(!under_cargo("config.toml"));
     }
 
     #[test]
@@ -958,6 +1151,10 @@ mod tests {
         ));
     }
 
+    // Seatbelt profile and POSIX home layout: on Windows `canonicalize`
+    // resolves the fake roots through `C:\` and `Path::join` writes `\`, and
+    // there is no Seatbelt to build a profile for (#89 step 4).
+    #[cfg(unix)]
     #[test]
     fn path_bin_mentions_include_cargo_install() {
         let m = |cmd: &str| {
@@ -1080,6 +1277,42 @@ mod tests {
     }
 
     #[test]
+    fn write_containment_resolves_new_directories_against_a_real_cwd() {
+        let base = std::env::temp_dir().join(format!("plank-contain-{}", std::process::id()));
+        let cwd = base.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sb = Sandbox {
+            enabled: true,
+            writable_paths: vec![base.join("later")],
+            excluded_commands: Vec::new(),
+            granted: BTreeSet::new(),
+        };
+        let real_cwd = cwd.canonicalize().unwrap();
+        // `real_cwd` carries the `\\?\` prefix on Windows; a target several
+        // directories below it that do not exist yet must still match.
+        assert!(sb.contains_write_target(&cwd, &cwd.join("a/b/c.txt")));
+        assert!(sb.contains_write_target(&real_cwd, &cwd.join("a/b/c.txt")));
+        assert!(sb.contains_write_target(&cwd, &real_cwd.join("a/b/c.txt")));
+        // `..` out of a directory about to be created climbs out of cwd (the
+        // temp dir around it is itself a root, so this asserts the resolved
+        // location rather than the verdict).
+        let climb = cwd.join("new").join("..").join("..").join("outside.txt");
+        assert_eq!(
+            realpath_for_write(&climb),
+            base.canonicalize().unwrap().join("outside.txt")
+        );
+        assert!(sb.contains_write_target(&cwd, &cwd.join("new/../kept.txt")));
+        // A configured root that does not exist yet still admits its files.
+        assert!(sb.contains_write_target(&cwd, &base.join("later/x/y")));
+        #[cfg(windows)]
+        {
+            let upper = PathBuf::from(cwd.to_string_lossy().to_uppercase()).join("f.txt");
+            assert!(sb.contains_write_target(&cwd, &upper));
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn config_merge_appends_lists() {
         let mut sb = Sandbox::default();
         apply_config(
@@ -1112,8 +1345,8 @@ mod tests {
             ConfigSource::Project,
         );
         assert!(sb.enabled, "a checkout must not switch the sandbox off");
-        assert!(sb.writable_paths.is_empty());
-        assert!(sb.excluded_commands.is_empty());
+        assert_eq!(sb.writable_paths, [] as [std::path::PathBuf; 0]);
+        assert_eq!(sb.excluded_commands, [] as [std::string::String; 0]);
         assert!(sb.should_sandbox("rm -rf /"));
 
         // Turning it on from the project file is tightening, so it is honoured

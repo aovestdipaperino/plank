@@ -53,7 +53,87 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
-use turbo_debug_client::StreamKind;
+#[cfg(unix)]
+use turbo_debug_client as tdc;
+
+use tdc::StreamKind;
+
+/// Windows stand-in for `turbo-debug-client`, whose 0.2.1 release is Unix-only
+/// (see `Cargo.toml`) only because its liveness probe calls `flock`. The same
+/// protocol over `std`: a shared, non-blocking lock on the console's
+/// `tdk.lock` (`LockFileEx` here) fails exactly while the console holds its
+/// exclusive one, and the handshake is plain TCP.
+#[cfg(windows)]
+mod tdc {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpStream;
+
+    /// The console's well-known control port.
+    pub const CONTROL_PORT: u16 = 7878;
+
+    /// The handshake version the crate speaks.
+    const PROTOCOL_VERSION: u32 = 1;
+
+    /// What the console should make of the bytes sent.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StreamKind {
+        /// A model's token stream.
+        Tokens,
+    }
+
+    /// Whether a console holds its liveness lock in the temp directory.
+    #[must_use]
+    pub fn is_console_running() -> bool {
+        is_console_running_at(&std::env::temp_dir().join("tdk.lock"))
+    }
+
+    pub(super) fn is_console_running_at(path: &std::path::Path) -> bool {
+        // Read-only, never create: only the console creates the file.
+        std::fs::File::open(path)
+            .is_ok_and(|f| matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)))
+    }
+
+    /// Sends `HELLO <version> tokens <name>` to the control port and connects
+    /// to the data port the console replies with, as the crate does.
+    ///
+    /// # Errors
+    /// The I/O error, or `InvalidData` carrying the console's refusal.
+    pub fn connect_on(port: u16, _kind: StreamKind, name: &str) -> std::io::Result<TcpStream> {
+        let mut control = TcpStream::connect(("127.0.0.1", port))?;
+        writeln!(control, "HELLO {PROTOCOL_VERSION} tokens {name}")?;
+        control.flush()?;
+        let mut reply = String::new();
+        BufReader::new(control.try_clone()?).read_line(&mut reply)?;
+        let data: u16 = reply
+            .trim()
+            .strip_prefix("PORT ")
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("handshake refused: {}", reply.trim()),
+                )
+            })?;
+        TcpStream::connect(("127.0.0.1", data))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_liveness_lock_reads_as_the_crate_reads_flock() {
+            let path =
+                std::env::temp_dir().join(format!("plank-tdk-test-{}.lock", std::process::id()));
+            assert!(!super::is_console_running_at(&path), "no file: no console");
+            let holder = std::fs::File::create(&path).unwrap();
+            holder.lock().unwrap();
+            assert!(super::is_console_running_at(&path), "exclusive lock held");
+            holder.unlock().unwrap();
+            assert!(!super::is_console_running_at(&path), "released");
+            drop(holder);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 /// Identifies one console connection. [`MirrorId::PARENT`] is the main
 /// session's window; every sub-agent gets a fresh id from `NEXT_ORDINAL`.
@@ -141,11 +221,7 @@ static NEXT_ORDINAL: AtomicUsize = AtomicUsize::new(1);
 // `run_subagent_loop`) would open junk windows in that live console on every
 // `cargo test` run. Tests that *want* a connection point this at their own
 // `fake_console` listener.
-static CONTROL_PORT: AtomicU16 = AtomicU16::new(if cfg!(test) {
-    0
-} else {
-    turbo_debug_client::CONTROL_PORT
-});
+static CONTROL_PORT: AtomicU16 = AtomicU16::new(if cfg!(test) { 0 } else { tdc::CONTROL_PORT });
 
 /// The thread that installed a stand-in console via
 /// [`test_support::use_console`]. The suite runs tests in parallel while this
@@ -359,9 +435,7 @@ pub fn reconcile() -> Reconciled {
         return out;
     };
     if let std::collections::btree_map::Entry::Vacant(e) = reg.entry(MirrorId::PARENT) {
-        if let Ok(stream) =
-            turbo_debug_client::connect_on(port, StreamKind::Tokens, &session_name())
-        {
+        if let Ok(stream) = tdc::connect_on(port, StreamKind::Tokens, &session_name()) {
             e.insert(stream);
             out.parent_new = true;
         } else {
@@ -377,7 +451,7 @@ pub fn reconcile() -> Reconciled {
         if reg.contains_key(id) {
             continue;
         }
-        if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, name) {
+        if let Ok(stream) = tdc::connect_on(port, StreamKind::Tokens, name) {
             reg.insert(*id, stream);
             out.subagents_new.push(*id);
         }
@@ -397,8 +471,8 @@ fn console_port() -> Option<u16> {
         return None;
     }
     let port = CONTROL_PORT.load(Ordering::Relaxed);
-    let marker_applies = port == turbo_debug_client::CONTROL_PORT;
-    (!marker_applies || turbo_debug_client::is_console_running()).then_some(port)
+    let marker_applies = port == tdc::CONTROL_PORT;
+    (!marker_applies || tdc::is_console_running()).then_some(port)
 }
 
 /// Mirrors a synthetic opening `<think>` tag so the console's own
@@ -675,7 +749,7 @@ pub fn open_subagent(label: &str) -> SubagentMirror {
     let Some(port) = console_port() else {
         return SubagentMirror { id };
     };
-    if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &name) {
+    if let Ok(stream) = tdc::connect_on(port, StreamKind::Tokens, &name) {
         MIRRORS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -696,7 +770,7 @@ pub fn replay_finished_subagent(label: &str, ordinal: usize, payload: &str) {
         return;
     };
     let name = subagent_name(&raw_session_name(), label, ordinal);
-    if let Ok(mut stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &name) {
+    if let Ok(mut stream) = tdc::connect_on(port, StreamKind::Tokens, &name) {
         let _ = stream.write_all(payload.as_bytes());
         let _ = stream.flush();
     }
@@ -1605,7 +1679,10 @@ mod tests {
 
         // Dropping the mirror retires it from the live set too.
         drop(sub);
-        assert!(reconcile().subagents_new.is_empty());
+        assert_eq!(
+            reconcile().subagents_new,
+            [] as [crate::debugmirror::MirrorId; 0]
+        );
         reset();
     }
 

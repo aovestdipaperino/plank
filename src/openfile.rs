@@ -182,16 +182,8 @@ pub fn is_browser_target(path: &Path) -> bool {
 /// without actually launching anything.
 #[must_use]
 fn browser_command(path: &Path) -> (&'static str, Vec<std::ffi::OsString>) {
-    let p = path.as_os_str().to_os_string();
-    if cfg!(target_os = "macos") {
-        ("open", vec![p])
-    } else if cfg!(target_os = "windows") {
-        // `start` is a cmd builtin, not an executable; the empty string is the
-        // window title `start` would otherwise eat the path as.
-        ("cmd", vec!["/C".into(), "start".into(), "".into(), p])
-    } else {
-        ("xdg-open", vec![p])
-    }
+    let tool = crate::platform::desktop::open_tool(path);
+    (tool.program, tool.args)
 }
 
 /// Opens `path` in the default browser.
@@ -460,7 +452,7 @@ mod tests {
         // directly instead of going through `sh -c`.
         let path = Path::new("/work/my report.html");
         let (program, args) = browser_command(path);
-        assert!(!program.is_empty());
+        assert_ne!(program, "");
         assert_eq!(
             args.last().map(std::ffi::OsString::as_os_str),
             Some(path.as_os_str())

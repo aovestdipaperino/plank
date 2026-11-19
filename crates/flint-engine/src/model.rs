@@ -353,6 +353,10 @@ impl Model {
 
     /// Token `token`'s embedding row, widened from BF16 into `out`
     /// (`hidden` values).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read by the Metal decode path only")
+    )]
     pub(crate) fn embed_row(&self, token: u32, out: &mut [f32]) -> Result<()> {
         let d = self.config.hidden;
         let i = token as usize;
@@ -586,6 +590,7 @@ mod tests {
     use super::*;
     use crate::config::test_config;
     use crate::testgguf::tiny_flint;
+    #[cfg(target_os = "macos")]
     use candle_core::DType;
     use gemma_engine::session::Session;
 
@@ -800,6 +805,7 @@ mod tests {
     }
 
     /// One prefill of `long_prompt(40)` and eight steps, every step's logits.
+    #[cfg(target_os = "macos")]
     fn prefill_and_steps(m: &Arc<Model>) -> Vec<Vec<f32>> {
         let mut s = Session::new(m.clone(), 256);
         let mut out = vec![s.prefill(&long_prompt(40), &|| false).unwrap().unwrap()];

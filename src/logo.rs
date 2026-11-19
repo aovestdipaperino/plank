@@ -90,16 +90,11 @@ fn kitty_mode() -> Option<crate::buddy::Mode> {
 /// A terminal cell's size in pixels `(width, height)`, from `TIOCGWINSZ`;
 /// `None` when the terminal does not report its pixel size.
 fn cell_pixels() -> Option<(u32, u32)> {
-    // SAFETY: winsize is plain-old-data; zeroed is valid and ioctl overwrites.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: stdout fd is valid and `ws` is a writable winsize buffer.
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) };
-    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
-        return None;
-    }
+    let (cols, rows) = crate::platform::stdout_size()?;
+    let (width, height) = crate::platform::stdout_pixels()?;
     Some((
-        u32::from(ws.ws_xpixel) / u32::from(ws.ws_col),
-        u32::from(ws.ws_ypixel) / u32::from(ws.ws_row),
+        u32::from(width) / u32::from(cols),
+        u32::from(height) / u32::from(rows),
     ))
 }
 
@@ -356,8 +351,32 @@ pub fn cell() -> logo_art::Cell {
             .ok()
             .as_deref()
             .and_then(parse_cell)
-            .unwrap_or_else(logo_art::Cell::best_supported)
+            .unwrap_or_else(|| {
+                detected_cell(
+                    cfg!(windows),
+                    std::env::var_os("WT_SESSION").is_some(),
+                    logo_art::Cell::best_supported(),
+                )
+            })
     })
+}
+
+/// The terminal's cell mode when `PLANK_LOGO_CELL` names none: `logo-art`'s
+/// own detection, except in the classic Windows console. That is any Windows
+/// console without `WT_SESSION`, the variable Windows Terminal sets. conhost
+/// draws block glyphs from its font, and its usual Consolas has the half
+/// blocks but not the quadrants `logo-art` falls back to, so it gets half
+/// blocks. Windows Terminal draws the block elements itself.
+fn detected_cell(
+    windows: bool,
+    windows_terminal: bool,
+    detected: logo_art::Cell,
+) -> logo_art::Cell {
+    if windows && !windows_terminal && detected == logo_art::Cell::Quadrant {
+        logo_art::Cell::HalfBlock
+    } else {
+        detected
+    }
 }
 
 /// Parses a `PLANK_LOGO_CELL` value; `None` for anything unrecognized, so a
@@ -492,6 +511,25 @@ fn banner_label(profile_name: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_classic_windows_console_gets_half_blocks() {
+        use super::detected_cell;
+        use logo_art::Cell::{HalfBlock, Octant, Quadrant};
+        assert_eq!(detected_cell(true, false, Quadrant), HalfBlock);
+        assert_eq!(
+            detected_cell(true, true, Quadrant),
+            Quadrant,
+            "Windows Terminal"
+        );
+        assert_eq!(
+            detected_cell(false, false, Quadrant),
+            Quadrant,
+            "not Windows"
+        );
+        // A terminal logo-art recognised keeps its pick.
+        assert_eq!(detected_cell(true, false, Octant), Octant);
+    }
+
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -542,7 +580,7 @@ mod tests {
     fn version_line_has_version_and_commit() {
         let line = super::version_line();
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
-        assert!(!super::commit_id().is_empty());
+        assert_ne!(super::commit_id(), "");
         assert!(line.contains(super::commit_id()), "{line}");
     }
 

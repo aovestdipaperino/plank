@@ -1390,7 +1390,7 @@ fn sound_with_clip() {
 /// stops one once the buddy is no longer being drawn.
 mod voice {
     use std::path::Path;
-    use std::process::{Child, Command, Stdio};
+    use std::process::Child;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1407,14 +1407,6 @@ mod voice {
     /// When [`super::render`] last drew the buddy.
     static DRAWN: Mutex<Option<Instant>> = Mutex::new(None);
 
-    /// Players tried in order, each with its arguments before the file.
-    const PLAYERS: &[(&str, &[&str])] = &[
-        ("afplay", &[]),
-        ("paplay", &[]),
-        ("aplay", &["-q"]),
-        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-    ];
-
     /// Notes that the buddy was drawn now.
     pub(super) fn drawn() {
         if let Ok(mut at) = DRAWN.lock() {
@@ -1426,16 +1418,7 @@ mod voice {
     /// is installed.
     pub(super) fn speak(wav: &Path) {
         hush();
-        let child = PLAYERS.iter().find_map(|(cmd, args)| {
-            Command::new(cmd)
-                .args(*args)
-                .arg(wav)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()
-        });
+        let child = crate::platform::desktop::play_sound(wav);
         if let (Some(child), Ok(mut playing)) = (child, PLAYING.lock()) {
             *playing = Some(child);
             watch();

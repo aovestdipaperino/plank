@@ -133,21 +133,22 @@ fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = libc::time_t::try_from(now.as_secs()).unwrap_or_default();
     let millis = now.subsec_millis();
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `secs` and `tm` are valid, distinct pointers for the call.
-    unsafe {
-        libc::localtime_r(&raw const secs, &raw mut tm);
-    }
+    let tm = i64::try_from(now.as_secs())
+        .ok()
+        .and_then(crate::platform::local_time)
+        .unwrap_or(crate::platform::LocalTime {
+            year: 1900,
+            month: 1,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            utc_offset: 0,
+        });
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{millis:03}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
+        tm.year, tm.month, tm.day, tm.hour, tm.minute, tm.second,
     )
 }
 

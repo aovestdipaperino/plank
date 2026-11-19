@@ -287,7 +287,7 @@ mod tests {
         let mut p = Provenance::new(Origin::UserSettings);
         p.note(Origin::UserSettings);
         assert_eq!(p.origin, Origin::UserSettings);
-        assert!(p.shadowed.is_empty());
+        assert_eq!(p.shadowed, [] as [crate::provenance::Origin; 0]);
     }
 
     #[test]

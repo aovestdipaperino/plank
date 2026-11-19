@@ -6,6 +6,15 @@ candle-based `crates/gemma-engine`. The engine needs neither the `refs/ds4`
 submodule nor macOS: it runs on Metal on macOS and on the CPU elsewhere.
 The tree compiles no C for it.
 
+The device follows `--metal` / `--cuda` / `--cpu` (or `engine.backend`):
+an explicit choice is used or the engine fails to open, never quietly
+swapped; with none, the engine takes Metal on macOS, then the first CUDA
+device in a build with the `cuda` feature, then the CPU
+(`nativeengine::device_order`). `cargo build --features cuda` needs the
+CUDA toolkit (`nvcc`). The startup line names the device it opened
+(`plank: model ready: <name> (cuda)`). The default context is still sized
+from system RAM, not from the GPU's memory.
+
 ## How to run
 
 ```sh

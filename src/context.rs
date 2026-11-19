@@ -434,25 +434,10 @@ pub fn format_local_time(secs: u64) -> String {
 }
 
 fn format_local_time_impl(secs: u64) -> Result<String, ()> {
-    let t: libc::time_t = i64::try_from(secs).map_err(|_| ())?;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return Err(());
-    }
-    let mut buf = [0u8; 32];
-    let fmt = c"%Y-%m-%d %H:%M:%S";
-    let n = unsafe {
-        libc::strftime(
-            buf.as_mut_ptr().cast::<libc::c_char>(),
-            buf.len(),
-            fmt.as_ptr(),
-            &raw const tm,
-        )
-    };
-    if n == 0 {
-        return Err(());
-    }
-    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+    let secs = i64::try_from(secs).map_err(|_| ())?;
+    crate::platform::local_time(secs)
+        .map(|t| t.date_time())
+        .ok_or(())
 }
 
 /// Formats the current date as local ISO format (YYYY-MM-DD).
@@ -461,30 +446,10 @@ fn format_local_date() -> Result<String, ()> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?
         .as_secs();
-    let t: libc::time_t = i64::try_from(secs).map_err(|_| ())?;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return Err(());
-    }
-
-    let mut buf = [0u8; 16];
-    let fmt = c"%Y-%m-%d";
-
-    let n = unsafe {
-        libc::strftime(
-            buf.as_mut_ptr().cast::<libc::c_char>(),
-            buf.len(),
-            fmt.as_ptr(),
-            &raw const tm,
-        )
-    };
-
-    if n == 0 {
-        return Err(());
-    }
-
-    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+    let secs = i64::try_from(secs).map_err(|_| ())?;
+    crate::platform::local_time(secs)
+        .map(|t| t.date())
+        .ok_or(())
 }
 
 /// Renders the model-visible sub-agent roster for the session context, or `None`

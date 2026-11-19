@@ -8,6 +8,9 @@ Flint's tokenizer, template and stream rules plugged in. The weights run on
 `crates/flint-engine`, which adds NVFP4 kernels for Metal and the CPU on top
 of gemma-engine's session, KV cache and sampler. Like Gemma, it needs neither
 the `refs/ds4` submodule nor any C.
+It has no CUDA kernels: with no backend flag it opens on Metal on macOS and
+on the CPU elsewhere, even in a `cuda` build, and `--cuda` refuses to open
+it rather than falling back (`NativeFamily::SUPPORTS_CUDA`).
 
 ## How to run
 

@@ -12,6 +12,8 @@ repository.workspace = true
 default = []
 candle = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:sha2", "dep:half"]
 testgguf = ["candle"]
+# candle's CUDA backend (needs the CUDA toolkit to build).
+cuda = ["candle", "candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
 candle-core = { version = "0.9", optional = true }

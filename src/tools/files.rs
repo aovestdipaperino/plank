@@ -447,6 +447,27 @@ fn glob_rec(pat: &[String], path: &[&str]) -> bool {
     }
 }
 
+/// A glob pattern's `/`-separated segments, case-folded by [`fold_case`].
+/// On Windows `\\` separates them too, since a model there writes either;
+/// elsewhere a backslash is an ordinary filename character.
+fn glob_segments(pattern: &str) -> Vec<String> {
+    pattern
+        .split(|c| c == '/' || (cfg!(windows) && c == '\\'))
+        .filter(|s| !s.is_empty())
+        .map(fold_case)
+        .collect()
+}
+
+/// `s` lowercased on Windows, whose filesystems ignore case, so `*.RS` finds
+/// `main.rs` there as `dir` would; unchanged elsewhere.
+fn fold_case(s: &str) -> String {
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.to_owned()
+    }
+}
+
 /// Whether the pattern can only match inside a fixed leading directory, and
 /// that directory, so the walk can start there instead of at the root.
 ///
@@ -482,7 +503,7 @@ fn glob_walk(dir: &Path, search_root: &Path, pattern_segs: &[String], out: &mut 
             && let Ok(rel) = entry.path().strip_prefix(search_root)
         {
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if glob_matches(pattern_segs, &rel) {
+            if glob_matches(pattern_segs, &fold_case(&rel)) {
                 out.push(rel);
             }
         }
@@ -511,16 +532,12 @@ pub fn tool_glob(ctx: &mut ToolContext, call: &ToolCall) -> String {
     // Same containment rule as the other file tools: the resolved root must
     // stay under the sandbox cwd.
     if let Ok(cwd) = ctx.cwd.canonicalize()
-        && !canon_root.starts_with(&cwd)
+        && !crate::platform::path_starts_with(&canon_root, &cwd)
     {
         return format!("Tool error: glob path escapes workspace: {base}\n");
     }
 
-    let pattern_segs: Vec<String> = pattern
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let pattern_segs = glob_segments(pattern);
     let walk_start = canon_root.join(glob_walk_root(&pattern_segs));
     let mut matches = Vec::new();
     glob_walk(&walk_start, &canon_root, &pattern_segs, &mut matches);
@@ -675,8 +692,20 @@ mod tests {
     }
 
     #[test]
+    fn backslash_separates_and_case_folds_only_on_windows() {
+        let segs = glob_segments(r"src\**\*.RS");
+        if cfg!(windows) {
+            assert_eq!(segs, ["src", "**", "*.rs"]);
+            assert!(glob_matches(&segs, &fold_case("src/deep/Main.rs")));
+        } else {
+            assert_eq!(segs, [r"src\**\*.RS"]);
+            assert!(!glob_matches(&glob_segments("*.RS"), "main.rs"));
+        }
+    }
+
+    #[test]
     fn star_stays_within_a_component_but_doublestar_crosses() {
-        let segs = |p: &str| p.split('/').map(ToString::to_string).collect::<Vec<_>>();
+        let segs = glob_segments;
         assert!(glob_matches(&segs("*.rs"), "main.rs"));
         assert!(
             !glob_matches(&segs("*.rs"), "src/main.rs"),

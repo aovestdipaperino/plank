@@ -47,6 +47,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   prints the plan once, before the first stage note, when a cacheable tier
   will rebuild.
 
+- **PowerShell as a shell dialect** (#89, step 3). `tools.shell: "powershell"`
+  runs the `bash` tool's commands and the `!`/`!!` escapes in PowerShell
+  (`pwsh` when it is on `PATH`, else Windows PowerShell 5.1) with UTF-8 output,
+  and adds a short note to the system prompt saying so, which changes the
+  prompt fingerprint and so takes effect in a new session. The default stays
+  `"posix"`, so the prompt and the C parity fixtures are unchanged. Hooks
+  always run POSIX `sh`.
+
+- **Linux and Windows builds** (#89, phases 1 and 2). plank builds, lints and
+  tests on Linux and Windows with the echo stub, Gemma and Flint on the CPU. Desktop integrations (clipboard
+  text and images, open, sound, notifications, memory pressure) go through
+  `platform::desktop` with a tool list per OS. On Windows the bash tool and
+  hooks run a POSIX shell found on `PATH` or under Git for Windows
+  (`PLANK_SHELL` overrides it, and a missing one is named as such), every
+  spawned tree lives in a Job Object so a stop or timeout ends all of it, and
+  worktree build directories are linked with a junction when a directory
+  symlink needs privileges the account lacks.
+
+- **Windows `bash` sandbox** (#89, step 4). Model `bash` commands run at
+  Low integrity: plank starts the shell suspended, swaps in a Low copy of its
+  own token, and resumes it, so it can read as before but write only where a
+  Low label allows. At the first confined command the write roots (the
+  workspace, toolchain caches, `writablePaths`) get a Low label, recorded in
+  `~/.plank/sandbox/low-labels` and removed when plank exits, or at the next
+  launch after a crash, unless another live plank still uses the root.
+  Confined commands get their own `%TEMP%\plank-low`. A command that cannot
+  be lowered fails to start. While a root is labelled, other Low-integrity
+  processes can write there too; a one-command grant of a protected root
+  lasts until plank exits.
+
+- **Linux write sandbox, and containment on every OS** (#89, step 4). On
+  Linux 5.13+ model `bash` commands run under a Landlock ruleset holding
+  writes to the same roots as on macOS (the working directory, temp dirs,
+  toolchain caches and `writablePaths`; reads stay open), built with the raw
+  syscalls and applied in the child before `exec`, so a command that cannot
+  be confined fails to start rather than running loose. The sandbox is now on
+  by default everywhere, which also turns on the `write`/`edit` workspace
+  check on Linux and Windows. Where `bash` cannot be confined (Windows, or a
+  kernel without Landlock) both front ends say so at startup.
+
+- **`--cpu` / `--cuda` / `--metal` pick the native engines' device, and Gemma
+  runs on CUDA** (#89, step 5). Gemma and Flint used to take Metal when there
+  was one and the CPU otherwise, whatever the flag said. An explicit backend
+  is now used or the engine fails to open with a reason, and with none they
+  try Metal, then CUDA, then the CPU. A new `cuda` cargo feature builds Gemma
+  on candle's CUDA backend (it needs the CUDA toolkit); Flint has no CUDA
+  kernels and stays on the CPU off macOS. The startup line names the device.
+  CI now runs the native engine crates' tests on Linux and Windows.
+
+- **The ds4 C engine builds on Linux** (#89, step 5). With `refs/ds4`
+  present, the build compiles ds4's CPU backend on Linux, or its CUDA backend
+  with `PLANK_DS4_BACKEND=cuda` (`CUDA_ARCH`, `CUDA_HOME`) or its ROCm
+  backend with `PLANK_DS4_BACKEND=rocm` (`ROCM_ARCH`, `ROCM_PATH`; `--cuda`
+  selects it, since the C runs ROCm as its CUDA backend), neither yet tested
+  on a GPU, and plank defaults to the backend that was built. A backend the core
+  was not compiled with is refused before any download or open. On the CPU
+  the vision encoder and SSD streaming are skipped, since the C refuses both
+  there. The 96 GB RAM floor now holds off macOS too. CI builds the CPU core
+  on Linux and checks the FFI layout pins against it.
+
+- **`--gpu-vram` / `--gpu-devices` place the ds4 engine's layers across GPUs**
+  (#89, step 5), as `ds4-agent` does, on a CUDA or ROCm build: `auto` uses the
+  free VRAM, `N[,N...]` gives per-device budgets in GiB, and `0` runs on the
+  CPU. The 96 GB floor now also counts the GPUs' total VRAM (`nvidia-smi`,
+  `rocm-smi`). When RAM is short but the GPUs hold the model, plank places the
+  layers with `--gpu-vram auto` instead of refusing, and the engine menu no
+  longer greys DeepSeek out on such a machine.
+
 - **Flint, a native engine.** `plank --model flint` downloads and runs
   Recursive's Flint (40B mixture-of-experts, NVFP4, ~22.9 GB) on plank's own
   Rust engine, `crates/flint-engine`, with NVFP4 kernels for Metal and the
@@ -150,6 +218,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **CI cached PDFium at the wrong place on macOS and Windows** (#89, step 6).
+  The download lands in `~/Library/Caches/pdfium-rs` and
+  `%LOCALAPPDATA%\pdfium-rs` there, not `~/.cache/pdfium-rs`, so those jobs
+  re-downloaded it on every run. Each job now caches all three locations and
+  checks the one its OS uses.
+- **WASM guest hashes no longer depend on the builder's home directory**
+  (#89, step 6): the guest build scripts remap the Cargo home and source paths.
+  Hashes reproduce between Linux and macOS builders; a Windows build still
+  differs (FINDINGS.md). The scripts also work where only `sha256sum` exists,
+  and with Git Bash's `*`-marked output.
+- **The logo in the classic Windows console** (#89, step 6) uses half blocks:
+  conhost's usual font lacks the quadrant glyphs `logo-art` picks for an
+  unknown terminal. Windows Terminal keeps quadrants.
+
+- **`read` on a PDF outside the build machine** (#89, step 6). liteparse
+  loads PDFium at runtime and looks only in the builder's download cache and
+  beside `current_exe`, so a released binary could not find it. plank now
+  points `PDFIUM_LIB_PATH` at a PDFium shipped beside the real binary or in
+  `../lib` (a Homebrew keg), unless the variable is already set. The release
+  archives must ship the library for this to find it.
+- **`--debug` reaches the console on Windows** (#89, step 6). The stand-in for
+  the Unix-only `turbo-debug-client` now speaks its protocol: a shared,
+  non-blocking lock probe of `tdk.lock` and the TCP handshake.
+
+- **`glob` on Windows** (#89, step 3) accepts `\` as a separator, matches
+  names case-insensitively as the filesystem does, and checks containment
+  with the case- and prefix-insensitive comparison the write tools use.
+
+- **Writes into new directories pass the workspace check on every OS.** A
+  file tool writing several directories below the workspace that did not
+  exist yet was judged by a lexical path, which on Windows lacked the `\\?\`
+  prefix the canonical roots carry (on macOS, in a workspace under `/tmp`,
+  the `/private` one), and so
+  was refused. The deepest existing ancestor is now canonicalized for both the
+  target and the roots, and on Windows the comparison ignores case.
+
 - **Flint edits that repeat `path` are accepted.** Flint often gives `path`
   again at the end of an `edit` call; a key repeated with the same value is
   now dropped instead of rejecting the call. Two different values are still
@@ -224,6 +328,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile builds its prompt cache once more on the next launch.
 
 ### Changed
+
+- **Platform docs** (#89, step 9). `docs/PLATFORMS.md` has the support matrix
+  (engines, backends, sandbox and desktop features on each OS), the build
+  requirements per OS including the CUDA and ROCm builds, the memory floor,
+  the WSL2 route for DeepSeek and Qwen on Windows, and what is not done yet.
+  The README and the crate's description no longer say macOS only.
+
+- **Notifications on Linux and Windows borrow the host terminal's identity**
+  (#89, step 7), as they already did on macOS. `notify-send` gets a
+  `desktop-entry` hint for kitty, GNOME Terminal, Konsole, Alacritty, Tilix,
+  WezTerm, Ghostty or VS Code. Inside Windows Terminal the toast is shown
+  under its installed package's app id, falling back to Windows PowerShell's.
 
 - **A native engine opens the model's own context by default.** With no
   `-c`, Gemma and Flint open the file's whole trained window when its KV fits

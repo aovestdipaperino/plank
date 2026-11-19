@@ -12,6 +12,14 @@
 # after a toolchain bump is expected and is not evidence of tampering; a
 # mismatch on the same toolchain is.
 set -e
+# SHA-256 of a file as `<hash>  <name>`: `shasum -a 256` where it exists
+# (macOS, Git for Windows), else `sha256sum` (most Linux). Git Bash's
+# `sha256sum` marks binary mode as `<hash> *<name>`; the `*` is dropped so
+# every OS writes the same line.
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi |
+    sed 's/ \*/  /'
+}
 cd "$(dirname "$0")"
 SUMS="${1:-dist/SHA256SUMS}"
 if [ ! -f "$SUMS" ]; then
@@ -41,7 +49,7 @@ while read -r expected name; do
   case "$expected" in \#*) continue ;; esac
   [ -n "$name" ] || continue
   guest=$(echo "$name" | sed 's/\.wasm$//')
-  actual=$(cd "dist/$guest/wasm" && shasum -a 256 "$name" | cut -d' ' -f1)
+  actual=$(cd "dist/$guest/wasm" && sha256 "$name" | cut -d' ' -f1)
   if [ "$actual" = "$expected" ]; then
     echo "ok       $name"
   else

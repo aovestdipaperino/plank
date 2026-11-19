@@ -12,11 +12,12 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::platform::CommandExt as _;
 
 use crate::dsml::ToolCall;
 use crate::sandbox::Protected;
@@ -144,8 +145,16 @@ fn make_output_file(id: u64) -> Result<(PathBuf, std::fs::File), String> {
 fn status_code(status: std::process::ExitStatus) -> i64 {
     status.code().map_or_else(
         || {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal().map_or(-1, |sig| 128 + i64::from(sig))
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map_or(-1, |sig| 128 + i64::from(sig))
+            }
+            // Every Windows exit has a code; this branch is never taken there.
+            #[cfg(not(unix))]
+            {
+                -1
+            }
         },
         i64::from,
     )
@@ -164,14 +173,16 @@ fn export_gpu_yield(command: &mut Command) -> Option<PathBuf> {
 }
 
 /// How long a process group gets to exit after SIGTERM before SIGKILL.
+#[cfg(unix)]
 const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Terminates `child` together with every process in its process group and
 /// reaps it.
 ///
-/// Only meaningful for children spawned with `process_group(0)`, which makes
-/// the child the leader of a group of its own (its pgid equals its pid, and
-/// `sandbox-exec` keeps that pid because it execs the shell in place). A plain
+/// Only meaningful for children started by `platform::CommandExt::spawn_tree`,
+/// which on Unix makes the child the leader of a group of its own (its pgid
+/// equals its pid, and `sandbox-exec` keeps that pid because it execs the
+/// shell in place) and on Windows puts it in a Job Object. A plain
 /// `Child::kill` reaches only the shell, orphaning `sleep 9999 & wait` or
 /// `cmd | tee` pipelines, which then outlive plank. SIGTERM goes first so
 /// well-behaved tools can clean up; after [`GROUP_KILL_GRACE`] the group gets
@@ -189,6 +200,21 @@ pub(crate) fn kill_process_group(child: &mut Child) -> Option<std::process::Exit
     if let Ok(Some(status)) = child.try_wait() {
         return Some(status);
     }
+    #[cfg(windows)]
+    {
+        // No process groups to signal: end the whole tree, then reap.
+        crate::platform::kill_tree(child.id());
+        child.wait().ok()
+    }
+    #[cfg(unix)]
+    {
+        signal_group(child)
+    }
+}
+
+/// SIGTERM, a grace period, then SIGKILL to `child`'s process group.
+#[cfg(unix)]
+fn signal_group(child: &mut Child) -> Option<std::process::ExitStatus> {
     #[allow(clippy::cast_possible_wrap)]
     let pgid = child.id() as libc::pid_t;
     if pgid <= 0 {
@@ -426,7 +452,7 @@ impl BashJob {
             && self.exit_status != 0
             && self
                 .read_tail_lines(BASH_FINAL_TAIL_LINES)
-                .contains("Operation not permitted")
+                .contains(crate::sandbox::Sandbox::denial_text())
         {
             let _ = writeln!(
                 out,
@@ -530,17 +556,20 @@ impl BashJobs {
         }
         let id = self.next_id;
         let (path, file) = make_output_file(u64::try_from(id).unwrap_or(0))?;
-        // When a sandbox policy applies, wrap the shell in sandbox-exec with
-        // a generated Seatbelt profile (read everywhere, write only under
-        // cwd/temp/configured roots). See src/sandbox.rs.
+        // When a sandbox policy applies, the shell runs confined (read
+        // everywhere, write only under cwd/temp/configured roots): Seatbelt
+        // on macOS, Landlock on Linux. See src/sandbox.rs.
+        // The shell is `tools.shell`'s: `sh -c`, or PowerShell.
+        let shell = crate::platform::ShellDialect::active().command(cmd);
         let mut command = if let Some(sb) = sandbox {
-            let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.arg("-p").arg(sb.profile(ctx_cwd)).arg("/bin/sh");
-            c
+            sb.shell_command(ctx_cwd, shell).map_err(|e| {
+                std::fs::remove_file(&path).ok();
+                format!("failed to build the sandbox: {e}")
+            })?
         } else {
-            Command::new("/bin/sh")
+            shell
         };
-        command.arg("-c").arg(cmd).current_dir(ctx_cwd);
+        command.current_dir(ctx_cwd);
         // Tells a GPU-bound tool that plank can unload its model on request:
         // a line in the signal file, or exit 75 plus the marker line.
         let signal = export_gpu_yield(&mut command);
@@ -550,8 +579,7 @@ impl BashJobs {
             .stderr(Stdio::piped())
             // Own process group: stop/timeout/Drop kill every descendant, and
             // the terminal's Ctrl-C reaches plank alone (see refresh_for).
-            .process_group(0)
-            .spawn()
+            .spawn_tree()
             .map_err(|e| {
                 std::fs::remove_file(&path).ok();
                 format!("failed to fork: {e}")
@@ -1244,8 +1272,8 @@ pub fn run_immediate(
         })
     }
 
-    let mut command = Command::new("/bin/sh");
-    command.arg("-c").arg(cmd).current_dir(cwd);
+    let mut command = crate::platform::ShellDialect::active().command(cmd);
+    command.current_dir(cwd);
     // The same promise the bash tool's jobs get: a `!` or `!!` that writes
     // its signal file, or exits 75 with the marker line, gets the model
     // unloaded for a second run.
@@ -1256,8 +1284,7 @@ pub fn run_immediate(
         .stderr(Stdio::piped())
         // Own group so an interrupt kills pipelines and backgrounded
         // grandchildren, not just the shell.
-        .process_group(0)
-        .spawn()
+        .spawn_tree()
         .map_err(|e| format!("failed to start: {e}"))?;
 
     let (tx, rx) = channel::<(Stream, Vec<u8>)>();
@@ -1325,7 +1352,9 @@ pub fn run_immediate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{home_writable, test_call, test_ctx};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::tools::home_writable;
+    use crate::tools::{test_call, test_ctx};
 
     #[test]
     fn bash_echo_round_trip() {
@@ -1699,7 +1728,7 @@ mod tests {
         let (mut ctx, dir) = test_ctx();
         let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo now")]));
         assert!(out.contains(" status=done "));
-        assert!(ctx.bash.take_finished().is_empty());
+        assert_eq!(ctx.bash.take_finished(), [] as [std::string::String; 0]);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1903,18 +1932,19 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// End-to-end Seatbelt check: with the sandbox on, a write inside cwd
-    /// succeeds while a write outside it is denied with EPERM and the
-    /// observation carries the `[sandbox blocked: ...]` hint. Requires
-    /// /usr/bin/sandbox-exec, so macOS only.
-    #[cfg(target_os = "macos")]
+    /// End-to-end sandbox check: with the sandbox on, a write inside cwd
+    /// succeeds while a write outside it is denied (EPERM under Seatbelt,
+    /// EACCES under Landlock) and the observation carries the
+    /// `[sandbox blocked: ...]` hint. Needs /usr/bin/sandbox-exec on macOS or
+    /// a kernel with Landlock on Linux.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn bash_sandbox_blocks_writes_outside_cwd() {
         let _interrupt_guard = crate::interrupt::test_guard();
         // The escape target lives under `$HOME` (outside cwd and temp), and
         // `sandbox-exec` itself can't apply a profile from inside a nested
         // sandbox — so skip both when `$HOME` isn't writable.
-        if !home_writable() {
+        if !home_writable() || !crate::sandbox::enforcement().confines_bash() {
             return;
         }
         let (mut ctx, dir) = test_ctx();
@@ -2113,7 +2143,7 @@ mod tests {
         };
         let a = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
         let b = run("printf %s \"$PLANK_GPU_YIELD_FILE\"");
-        assert!(!a.stdout.is_empty());
+        assert_ne!(a.stdout, "");
         assert_ne!(a.stdout, b.stdout);
         assert!(a.gpu_signal.is_none());
         let asked = run("printf %s \"$PLANK_GPU_YIELD_FILE\"; \
@@ -2243,6 +2273,7 @@ mod tests {
 
     /// Extracts the first all-digit line from an observation: the pid a test
     /// command echoed with `$!`.
+    #[cfg(unix)]
     fn echoed_pid(obs: &str) -> libc::pid_t {
         obs.lines()
             .find_map(|l| l.trim().parse::<libc::pid_t>().ok())
@@ -2250,6 +2281,7 @@ mod tests {
     }
 
     /// Waits up to two seconds for `pid` to disappear (kill(pid, 0) fails).
+    #[cfg(unix)]
     fn wait_gone(pid: libc::pid_t) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -2262,6 +2294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stopping_a_job_kills_its_grandchildren() {
         let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
@@ -2293,6 +2326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unpolled_timed_out_job_is_swept_by_the_next_bash_call() {
         let _interrupt_guard = crate::interrupt::test_guard();
         let (mut ctx, dir) = test_ctx();
@@ -2325,6 +2359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn interrupting_an_immediate_command_kills_its_grandchildren() {
         // Give the shell a few ticks to echo the pid before interrupting.
         let mut polls = 0;

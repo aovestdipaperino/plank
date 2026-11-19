@@ -550,14 +550,10 @@ pub fn local_utc_offset() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let Ok(t) = libc::time_t::try_from(now) else {
-        return 0;
-    };
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return 0;
-    }
-    tm.tm_gmtoff
+    i64::try_from(now)
+        .ok()
+        .and_then(crate::platform::local_time)
+        .map_or(0, |t| t.utc_offset)
 }
 
 /// Root of the report's working files, `~/.plank/usage-data`.
@@ -4139,7 +4135,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
         // A report regenerated with nothing new shows no strip at all.
         let same = delta(&state, &before, 0);
         assert!(same.is_empty());
-        assert!(delta_html(&same, 0).is_empty());
+        assert_eq!(delta_html(&same, 0), "");
     }
 
     #[test]

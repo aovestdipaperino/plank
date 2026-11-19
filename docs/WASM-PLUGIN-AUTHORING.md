@@ -432,7 +432,7 @@ buffers sized to the `w`/`h` you were handed rather than to a worst case.
   [`plank-guest-support`](https://github.com/aovestdipaperino/plank-guest-support)
   (pinned by git rev) for the RNG and glyph packing.
 - `guests/csvedit`, a submodule of its own repository,
-  [`plank-csvedit`](https://github.com/aovestdipaperino/plank-csvedit): a
+  [`plank-tv`](https://github.com/aovestdipaperino/plank-tv): a
   full-screen Turbo Vision CSV editor (`/csvedit:new`,
   `/csvedit:open <name.csv>`) that saves to the `fs` RAM disk. It is the one
   guest built for `wasm32-wasip1` rather than `wasm32-unknown-unknown`, because

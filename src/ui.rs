@@ -1774,11 +1774,7 @@ fn restore_terminal() {
     // input the moment it prints its prompt. Only on a real terminal — a
     // pipe's pending bytes are someone's data, not stale reports.
     if std::io::stdin().is_terminal() {
-        // SAFETY: `tcflush` takes a descriptor and a queue selector and touches
-        // no memory; stdin is open for the life of the process.
-        unsafe {
-            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
-        }
+        crate::platform::flush_terminal_input();
     }
 }
 
@@ -14021,8 +14017,9 @@ impl Agent<'_> {
         }
         // Capture the mouse so wheel events scroll the output buffer instead
         // of being translated by the terminal into arrow keys (history moves),
-        // and drags select text for copying. Bracketed paste makes Cmd-V
-        // arrive as a single Paste event instead of a burst of key presses.
+        // and drags select text for copying. Bracketed paste makes the
+        // terminal's paste key arrive as a single Paste event instead of a
+        // burst of key presses.
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             EnableMouseCapture,
@@ -14142,6 +14139,14 @@ impl Agent<'_> {
         if let Some(notice) = crate::upgrade::update_notice() {
             log.push_spans(vec![ratatui::text::Span::styled(
                 notice.to_string(),
+                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+            )]);
+        }
+        // What the sandbox cannot enforce on this OS (#89); absent where it
+        // confines bash, or when it is off.
+        if let Some(notice) = self.tool_ctx.sandbox.startup_notice() {
+            log.push_spans(vec![ratatui::text::Span::styled(
+                notice,
                 ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
             )]);
         }
@@ -14328,7 +14333,8 @@ impl Agent<'_> {
         // read. Always empty while IMAGES_ENABLED is off.
         let mut attachments: Vec<crate::imagepaste::PastedImage> = Vec::new();
         // Clipboard-image hint, re-probed every few seconds (the probe shells
-        // out to osascript, so it must not run on every 200ms poll tick).
+        // out to osascript or xclip, so it must not run on every 200ms poll
+        // tick).
         let mut clip_has_image = IMAGES_ENABLED && crate::imagepaste::clipboard_has_image();
         let mut clip_checked = Instant::now();
         // Only rasterize the frame when the CRT-off power-down will actually run;
@@ -14423,7 +14429,9 @@ impl Agent<'_> {
             self.refresh_jobs_report(&mut report);
             let mut status = self.idle_status_text(cols);
             if clip_has_image {
-                status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
+                status.push_str(" | 📷 image in clipboard (");
+                status.push_str(crate::platform::desktop::PASTE_KEY);
+                status.push_str(" attaches)");
             }
             let task_view =
                 tui::TaskView::with_goal(&self.session.tasks, self.session.goal.as_ref());
@@ -15024,8 +15032,8 @@ impl Agent<'_> {
             if let Event::Paste(pasted) = &ev {
                 input.hist_idx = None;
                 // An empty bracketed paste means the clipboard holds an image
-                // (macOS pastes no text for image content); pasted text that is
-                // an image file path attaches that file.
+                // (terminals paste no text for image content); pasted text
+                // that is an image file path attaches that file.
                 if IMAGES_ENABLED {
                     if pasted.trim().is_empty() {
                         match crate::imagepaste::from_clipboard() {
@@ -22563,22 +22571,23 @@ fn busy_ui_loop(
                     toggle_tasks_report(&mut report, task_view.report());
                     selection.cancel();
                 }
-                // A click on a roster row selects it and opens its output.
-                MouseEventKind::Down(MouseButton::Left)
-                    if let Some(run) = tui::roster_click(m.column, m.row) =>
-                {
-                    sub.click_run(run);
-                    selection.cancel();
-                }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    input_drag = tui::last_input_rect()
-                        .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
-                    // A press outside the prompt starts an output-pane
-                    // selection instead, exactly as at idle.
-                    if input_drag {
+                    // A click on a roster row selects it and opens its output.
+                    // (Not an `if let` match guard: those are unstable on our
+                    // MSRV, Rust 1.93.)
+                    if let Some(run) = tui::roster_click(m.column, m.row) {
+                        sub.click_run(run);
                         selection.cancel();
                     } else {
-                        selection.press(sub.active_view(view).top, m.column, m.row);
+                        input_drag = tui::last_input_rect()
+                            .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
+                        // A press outside the prompt starts an output-pane
+                        // selection instead, exactly as at idle.
+                        if input_drag {
+                            selection.cancel();
+                        } else {
+                            selection.press(sub.active_view(view).top, m.column, m.row);
+                        }
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) if input_drag => {
@@ -23177,6 +23186,10 @@ fn run_plain_flow(
     // reading a line from stdin (issue #34).
     agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
     agent.warm_plain()?;
+    // The plain mirror of the TUI banner's sandbox notice.
+    if let Some(notice) = agent.tool_ctx.sandbox.startup_notice() {
+        println!("plank: {notice}");
+    }
     // The plain REPL is up and accepting input.
     crate::title::set(crate::title::State::Idle);
     if let Some(history) = agent.resumed_history() {
@@ -24376,10 +24389,19 @@ fn total_time_line(d: std::time::Duration) -> String {
 /// `open` returning `None` (no `/dev/null`, no spare descriptor) means the run
 /// simply prints its turn as `--ui console` would; it is not worth failing over.
 struct SilencedStdout {
-    saved: std::os::fd::RawFd,
+    saved: crate::platform::Fd,
 }
 
 impl SilencedStdout {
+    /// Windows: `None`. Rust's stdout there writes to the console handle, not
+    /// to the C runtime's fd 1, so a `dup2` over fd 1 would silence nothing;
+    /// the run prints its turn as `--ui console` would, as documented above.
+    #[cfg(windows)]
+    fn open() -> Option<Self> {
+        None
+    }
+
+    #[cfg(unix)]
     fn open() -> Option<Self> {
         let devnull = std::fs::OpenOptions::new()
             .write(true)
@@ -24416,7 +24438,8 @@ impl Drop for SilencedStdout {
         // chart that is about to be written.
         let _ = std::io::stdout().flush();
         // SAFETY: `self.saved` is the descriptor `open` duplicated and nobody
-        // else holds it.
+        // else holds it. (Never reached on Windows, where `open` is `None`.)
+        #[cfg(unix)]
         unsafe {
             libc::dup2(self.saved, libc::STDOUT_FILENO);
             libc::close(self.saved);
@@ -24460,12 +24483,11 @@ impl QuietLive {
     /// between a long prefill and the first token.
     const TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
-    fn start(fd: std::os::fd::RawFd) -> Self {
+    fn start(fd: crate::platform::Fd) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A redirected stdout has nothing to backspace over: it gets the three
         // notes and no clock, so a captured run stays one clean line.
-        // SAFETY: `isatty` only inspects the descriptor.
-        let tty = unsafe { libc::isatty(fd) } == 1;
+        let tty = crate::platform::isatty(fd);
         let handle = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
@@ -24540,12 +24562,11 @@ impl ChartLive {
     /// Spinner frames for the pre-sample note, as elsewhere in plank.
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
-    fn start(fd: std::os::fd::RawFd, color: bool) -> Self {
+    fn start(fd: crate::platform::Fd, color: bool) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A piped stdout has no cursor to move: it gets the final frame only,
         // so a redirected run captures one report rather than a flipbook.
-        // SAFETY: `isatty` only inspects the descriptor.
-        let tty = unsafe { libc::isatty(fd) } == 1;
+        let tty = crate::platform::isatty(fd);
         let handle = {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
@@ -24667,7 +24688,7 @@ impl InlineClock {
 /// [`TOKS_CHART_HEIGHT`], because the painter switches between the one-line
 /// prefill note and the full report mid-run.
 struct ChartPainter {
-    fd: std::os::fd::RawFd,
+    fd: crate::platform::Fd,
     tty: bool,
     /// Lines the previous frame occupied, 0 before the first one.
     lines: usize,
@@ -24699,12 +24720,10 @@ impl ChartPainter {
 /// Writes `text` to a raw descriptor, retrying short writes and giving up on
 /// error. Used for the descriptor [`SilencedStdout`] saved, which is
 /// deliberately owned by nothing that would close or buffer it.
-fn write_fd(fd: std::os::fd::RawFd, text: &str) {
+fn write_fd(fd: crate::platform::Fd, text: &str) {
     let mut buf = text.as_bytes();
     while !buf.is_empty() {
-        // SAFETY: writing `buf.len()` bytes from a live slice to a descriptor
-        // the caller keeps open for the duration of the call.
-        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        let n = crate::platform::write_fd(fd, buf);
         if n <= 0 {
             return;
         }
@@ -24731,7 +24750,7 @@ fn headless_quit_repro(agent: &mut Agent<'_>) {
 /// elapsed with nothing buffered and `eof` still clear; sets `eof` once stdin
 /// closes. `-1` waits for input indefinitely.
 fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<String>> {
-    read_batched_from(libc::STDIN_FILENO, eof, idle_ms)
+    read_batched_from(crate::platform::STDIN_FD, eof, idle_ms)
 }
 
 /// Reads one batch from `fd`: bytes accumulated until a 200 ms quiet window.
@@ -24740,8 +24759,9 @@ fn read_quiet_batched(eof: &mut bool, idle_ms: i32) -> std::io::Result<Option<St
 /// without spawning a subprocess. `idle_ms` bounds the wait for the first
 /// byte (`-1` = forever); a bounded wait that expires returns `Ok(None)`
 /// without setting `eof`.
+#[cfg(unix)]
 fn read_batched_from(
-    fd: std::os::fd::RawFd,
+    fd: crate::platform::Fd,
     eof: &mut bool,
     idle_ms: i32,
 ) -> std::io::Result<Option<String>> {
@@ -24783,6 +24803,66 @@ fn read_batched_from(
             break;
         }
         buf.extend_from_slice(&chunk[..n.cast_unsigned()]);
+    }
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Windows: the same batching over stdin, read by a background thread.
+///
+/// There is no `poll` for a console or pipe handle, so one thread owns stdin
+/// for the life of the process and hands over each chunk through a channel;
+/// `recv_timeout` stands in for the poll timeout. Only stdin is supported,
+/// which is the one descriptor headless mode reads.
+#[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the Unix version, whose reads can fail"
+)]
+fn read_batched_from(
+    fd: crate::platform::Fd,
+    eof: &mut bool,
+    idle_ms: i32,
+) -> std::io::Result<Option<String>> {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+    use std::time::Duration;
+    const QUIET_MS: i32 = 200;
+    static CHUNKS: std::sync::OnceLock<std::sync::Mutex<Receiver<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    debug_assert_eq!(fd, crate::platform::STDIN_FD);
+    let rx = CHUNKS.get_or_init(|| {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin().lock();
+            let mut chunk = [0_u8; 4096];
+            // An empty chunk is the EOF marker; a send error means nobody
+            // is listening any more.
+            loop {
+                let n = stdin.read(&mut chunk).unwrap_or(0);
+                if tx.send(chunk[..n].to_vec()).is_err() || n == 0 {
+                    break;
+                }
+            }
+        });
+        std::sync::Mutex::new(rx)
+    });
+    let rx = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut buf = Vec::new();
+    while !*eof {
+        let timeout = if buf.is_empty() { idle_ms } else { QUIET_MS };
+        let got = match u64::try_from(timeout) {
+            Ok(ms) => rx.recv_timeout(Duration::from_millis(ms)),
+            Err(_) => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match got {
+            Ok(chunk) if chunk.is_empty() => *eof = true,
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => *eof = true,
+        }
     }
     if buf.is_empty() {
         return Ok(None);
@@ -27651,7 +27731,7 @@ mod tests {
         );
         assert!(input.ghost.is_none(), "and the ghost with it");
         // Nothing was submitted: the text is sitting in the prompt.
-        assert!(agent.session.transcript.is_empty());
+        assert_eq!(agent.session.transcript, [] as [crate::session::Message; 0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -28895,7 +28975,7 @@ mod tests {
         agent.payload_dirty = true;
         agent.flush_kv_end_of_turn();
         agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
-        assert!(agent.ladder.rungs().is_empty());
+        assert_eq!(agent.ladder.rungs(), []);
     }
 
     /// A rung whose `spans` already reaches the edit index contains the span
@@ -30719,7 +30799,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
-        assert!(!token.is_empty());
+        assert_ne!(token, "");
         agent.remote_off();
     }
 
@@ -30822,7 +30902,7 @@ mod tests {
         // `off` when already off says so rather than erroring.
         let noop = agent.remote_toggle_lines("/rc", "off");
         assert!(!agent.remote_is_on());
-        assert!(!noop.is_empty());
+        assert_ne!(noop, [] as [std::string::String; 0]);
 
         // "ON" (uppercase) works the same as "on" — case-insensitive argument.
         let upper = agent.remote_toggle_lines("/rc", "ON");
@@ -33000,7 +33080,7 @@ mod tests {
         // stamps the session id so a resume can find it.
         agent.session.push(Message::user("hello there"));
         let (id, path) = agent.save_for_exit().expect("used session should save");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         assert!(path.exists(), "session file written: {}", path.display());
         assert_eq!(agent.session.id, id);
         // The id resolves through the store, which is what `/resume <id>` uses.
@@ -33368,7 +33448,7 @@ mod tests {
         // Nothing at all: no scaffolding message is invented.
         let mut session = Session::new();
         push_session_context(&mut session, &ContextContent::default());
-        assert!(session.transcript.is_empty());
+        assert_eq!(session.transcript, [] as [crate::session::Message; 0]);
     }
 
     #[test]
@@ -35224,7 +35304,7 @@ mod tests {
         let mut never = |_q: &str| -> bool { panic!("nothing to overwrite") };
         agent.rename_session("renamed-one", &mut never).unwrap();
         assert_eq!(agent.session.id, "renamed-one");
-        assert!(agent.ladder.rungs().is_empty());
+        assert_eq!(agent.ladder.rungs(), []);
         assert!(rung_files(&agent).is_empty(), "nothing under the new id");
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -36254,6 +36334,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
+        // The interrupt flag is process-wide: a test raising it mid-turn would
+        // cut this turn short (see `interrupt::test_guard`).
+        let _interrupt_guard = crate::interrupt::test_guard();
         // Opt this thread into in-think dispatch; the shipped default is off.
         let mut settings = crate::settings::Settings::default();
         settings.engine.thinking_tool_calls = true;
@@ -37029,7 +37112,7 @@ mod tests {
         assert_eq!(last.role, crate::session::Role::Assistant);
         assert_eq!(last.text, "half a thought about the");
         // And the parent's own transcript is still exactly as it was.
-        assert!(agent.session.transcript.is_empty());
+        assert_eq!(agent.session.transcript, [] as [crate::session::Message; 0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -37847,7 +37930,7 @@ mod tests {
             "{}",
             pass.assistant_text
         );
-        assert!(pass.calls.is_empty());
+        assert_eq!(pass.calls, [] as [trace_stream::dsml::ToolCall; 0]);
         assert!(pass.tool_error.is_none());
     }
 
@@ -40380,7 +40463,7 @@ or the user's next message aborts before its first token"
         };
         let model = crate::ds4engine::Ds4Model::open_shared(
             &model_path,
-            crate::ffi::Ds4Backend::Metal,
+            crate::ffi::built_backend().unwrap(),
             8192,
             0,
             100,
@@ -40422,7 +40505,7 @@ or the user's next message aborts before its first token"
              PLANK_SUGGEST_DEBUG=1 and fix the PROMPT, not the sanitizer"
         );
         let text = agent.suggestion.as_ref().unwrap().text.clone();
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
         assert!(
             !text.starts_with('/') && !text.starts_with('!'),
             "a command must never reach the input line: {text:?}"
@@ -41006,6 +41089,9 @@ or the user's next message aborts before its first token"
     #[test]
     #[allow(clippy::too_many_lines)] // spells out a whole `Agent` literal
     fn turn_loop_executes_tool_calls_and_finishes() {
+        // The interrupt flag is process-wide: a test raising it mid-turn would
+        // cut this turn short (see `interrupt::test_guard`).
+        let _interrupt_guard = crate::interrupt::test_guard();
         let dir = scratch_dir("test");
         let stanza = concat!(
             "I'll run a command.\n",
@@ -41156,7 +41242,7 @@ or the user's next message aborts before its first token"
         );
         assert_eq!(agent.session.transcript[3].text, "also check the docs");
         assert!(agent.session.transcript[4].text.contains("Done."));
-        assert!(shared.take_queued().is_empty());
+        assert_eq!(shared.take_queued(), [] as [std::string::String; 0]);
 
         // The UI channel saw rendered text, the drain join, and status
         // snapshots from generation.
@@ -41249,7 +41335,10 @@ or the user's next message aborts before its first token"
         assert!(note.contains("background-done\n"));
         assert!(texts[4].contains("Done."));
         // Announced once: the table forgot the job.
-        assert!(agent.tool_ctx.bash.take_finished().is_empty());
+        assert_eq!(
+            agent.tool_ctx.bash.take_finished(),
+            [] as [std::string::String; 0]
+        );
 
         let events: Vec<UiEvent> = rx.try_iter().collect();
         assert!(
@@ -41547,8 +41636,8 @@ or the user's next message aborts before its first token"
         let f = r.captured.as_ref().unwrap();
         assert_eq!(f.cols, 10);
         assert_eq!(f.rows, 3);
-        assert!(!f.ansi.is_empty());
-        assert!(!f.tree.is_empty());
+        assert_ne!(f.ansi, "");
+        assert_ne!(f.tree, "");
     }
 
     #[test]
@@ -41676,6 +41765,7 @@ or the user's next message aborts before its first token"
     /// window, and a prompt over 4096 bytes was submitted truncated. Reading the
     /// fd directly with `libc::read` collects every byte.
     #[test]
+    #[cfg(unix)]
     fn read_batched_from_collects_a_prompt_larger_than_one_read_chunk() {
         use std::io::Write as _;
         use std::os::fd::FromRawFd as _;

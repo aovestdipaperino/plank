@@ -15,7 +15,7 @@ const ID: &str = "dev.plank.csvedit";
 fn guest() -> Option<Vec<u8>> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/guests/csvedit/target/wasm32-wasip1/release/plank_csvedit.wasm"
+        "/guests/csvedit/target/wasm32-wasip1/release/plank_tv.wasm"
     );
     std::fs::read(path).ok()
 }

@@ -465,6 +465,34 @@ fn wants_empty_system(model_name: &str, trusted: &str) -> bool {
             == crate::sysprompt::ToolSyntax::Dsml41
 }
 
+/// Opens the engine, through `ds4_engine_create_with_gpu_config` when
+/// `--gpu-vram`/`--gpu-devices` asked for multi-GPU placement (after printing
+/// the C's layout line, as `ds4-agent` does), else `ds4_engine_open`.
+///
+/// # Errors
+/// When the GPU options do not parse, or this core cannot place layers.
+fn open_engine(
+    engine: &mut *mut ffi::Ds4Engine,
+    opts: &ffi::Ds4EngineOptions,
+    tuning: &crate::config::EngineTuning,
+) -> Result<i32, EngineError> {
+    if tuning.gpu_placement_requested() {
+        let placement =
+            ffi::gpu_placement(tuning.gpu_vram.as_deref(), tuning.gpu_devices.as_deref())
+                .map_err(EngineError::new)?;
+        if let ffi::GpuPlacement::Gpus { config, layout } = placement {
+            if !layout.is_empty() {
+                eprintln!("plank: {layout}");
+            }
+            // SAFETY: opts, its CStrings and config outlive the call; engine
+            // is a valid out-pointer.
+            return Ok(unsafe { ffi::ds4_engine_open_on_gpus(engine, opts, &config) });
+        }
+    }
+    // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
+    Ok(unsafe { ffi::ds4_engine_open(engine, opts) })
+}
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -480,6 +508,7 @@ impl Ds4Model {
         power_percent: i32,
         tuning: &crate::config::EngineTuning,
     ) -> Result<Self, EngineError> {
+        ffi::check_backend(backend).map_err(EngineError::new)?;
         local_inference_engine::metal::set_source_env();
         let path = model_path.as_ref();
         let c_path = CString::new(path.to_string_lossy().as_bytes())
@@ -499,8 +528,10 @@ impl Ds4Model {
         let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
         // The encoder the selected engine declares, passed only to a model
         // that can take one: the engine refuses to open any other checkpoint
-        // with an encoder attached.
-        let model_supports_vision = model_supports_vision(family, path);
+        // with an encoder attached, and only on a GPU backend: the CPU path
+        // has no encoder and refuses one ("vision requires --metal, --cuda").
+        let model_supports_vision =
+            backend != ffi::Ds4Backend::Cpu && model_supports_vision(family, path);
         let vision_path = tuning
             .vision_path
             .as_deref()
@@ -576,8 +607,7 @@ impl Ds4Model {
             tp: ffi::Ds4TpOptions::default(),
         };
         let mut engine: *mut ffi::Ds4Engine = std::ptr::null_mut();
-        // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
-        let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
+        let rc = open_engine(&mut engine, &opts, tuning)?;
         if rc != 0 || engine.is_null() {
             // Everything the message can establish without the engine lives in
             // `gguf`, which is always compiled and so CI-tested; this side
@@ -3627,6 +3657,13 @@ mod tests {
         wants_empty_system,
     };
 
+    /// The backend the linked core was built for, which the model-gated
+    /// tests below open on.
+    #[cfg(ds4_engine)]
+    fn backend() -> crate::ffi::Ds4Backend {
+        crate::ffi::built_backend().expect("a ds4_engine build links a core")
+    }
+
     #[test]
     fn an_inert_steering_setup_keys_like_no_steering_at_all() {
         // Both scales at zero edit nothing, so such a run must keep sharing
@@ -3934,15 +3971,12 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn trusted_system_prefix_emits_the_native_dsml_token() {
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let parts = crate::sysprompt::build_system_prompt_parts("", &[], true);
 
         let marker = "｜DSML｜".as_bytes();
@@ -4001,7 +4035,7 @@ mod tests {
     #[test]
     fn resume_mid_thinking_reuses_the_whole_kv() {
         use crate::engine::{Engine, ThinkMode};
-        use crate::ffi::{self, Ds4Backend};
+        use crate::ffi;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
@@ -4021,7 +4055,7 @@ mod tests {
         // session over the same weights, which is also what keeps this test from
         // mmapping ~87 GB twice.
         let weights = std::sync::Arc::new(
-            super::Ds4Model::open(&model, Ds4Backend::Metal, 8192, 0, 100, &tuning).unwrap(),
+            super::Ds4Model::open(&model, backend(), 8192, 0, 100, &tuning).unwrap(),
         );
         let mut a = super::Ds4Session::from_model(std::sync::Arc::clone(&weights));
         a.set_trusted_system_prefix(parts.trusted_len);
@@ -4077,8 +4111,6 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn warm_and_reconcile_tokenize_the_system_prompt_identically() {
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
@@ -4088,8 +4120,7 @@ mod tests {
             ssd_streaming: true,
             ..crate::config::EngineTuning::default()
         };
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let parts = crate::sysprompt::build_system_prompt_parts("Be terse.", &[], true);
         let rendered = format!("[system]\n{}\n", parts.text);
 
@@ -4124,7 +4155,6 @@ mod tests {
     #[test]
     fn aside_snapshot_roundtrip_lossless() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use crate::snapshot::SessionSnapshot;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
@@ -4132,8 +4162,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
 
         let opts = GenerationOptions {
             seed: 42,
@@ -4194,7 +4223,6 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn attach_restores_warm_prefix() {
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -4206,7 +4234,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -4239,7 +4267,6 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn attach_sized_honors_smaller_ctx() {
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -4251,7 +4278,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -4292,8 +4319,6 @@ mod tests {
     /// for tests that call `Engine` methods directly on it.
     #[cfg(ds4_engine)]
     fn open_test_session(model_path: &std::ffi::OsStr) -> super::Ds4Session {
-        use crate::ffi::Ds4Backend;
-
         // `mtp` defaults to true, and on a DeepSeek model with no companion
         // the C refuses to open at all ("--dspark requires --mtp-model
         // FILE"), so the default tuning cannot load a plain ds4 GGUF.
@@ -4313,7 +4338,7 @@ mod tests {
         };
         let model = super::Ds4Model::open_shared(
             model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -4433,7 +4458,6 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn two_sessions_no_cross_contamination() {
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -4445,7 +4469,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -4494,7 +4518,6 @@ mod tests {
     #[cfg(ds4_engine)]
     #[test]
     fn idle_reclaim_restores_on_metal() {
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -4507,7 +4530,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -4635,15 +4658,12 @@ mod tests {
     #[test]
     fn rollback_checkpoint_zero_reprefill() {
         use crate::engine::{Engine, GenerationOptions};
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 42,
             n_predict: 16,
@@ -4717,8 +4737,6 @@ mod tests {
     #[test]
     fn switch_payload_resume_suffix_only() {
         use crate::engine::{Engine, GenerationOptions};
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
@@ -4734,8 +4752,7 @@ mod tests {
         // Only ONE live engine per process: each engine lives in its own scope
         // so its Metal model is fully dropped before the next one opens.
         let (payload, reply) = {
-            let mut a =
-                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let mut a = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
             let (_, reply) = gen_capture_reply(&mut a, transcript, &opts);
             (a.get_kv().expect("get_kv yields a payload"), reply)
         };
@@ -4750,15 +4767,13 @@ mod tests {
         // Cold-baseline control: a fresh engine with an empty KV must prefill
         // the whole prompt (nothing reused). This calibrates "full re-prefill".
         let cold = {
-            let mut c =
-                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let mut c = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
             gen_capture_prefill(&mut c, &resumed, &opts)
         };
 
         // Fresh engine: restore the payload and continue. It must reuse the
         // restored prefix instead of re-prefilling it.
-        let mut b =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut b = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         b.set_kv(&payload).unwrap();
         let resumed_remaining = gen_capture_prefill(&mut b, &resumed, &opts);
         // Same prompt, two starting states: the resumed session evaluates only
@@ -4795,8 +4810,6 @@ mod tests {
     #[test]
     fn a_pressure_yield_resumes_to_the_same_continuation() {
         use crate::engine::{Engine, GenerationOptions};
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
@@ -4814,8 +4827,7 @@ mod tests {
 
         // Baseline: two turns, uninterrupted.
         let (baseline, resumed_transcript) = {
-            let mut a =
-                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let mut a = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
             let (_, reply1) = gen_capture_reply(&mut a, transcript, &opts);
             let second = format!(
                 "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
@@ -4832,8 +4844,7 @@ mod tests {
         // flag on entry anyway, so a reason raised between passes would be
         // dropped if the free did not already consume it.
         let resumed = {
-            let mut b =
-                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let mut b = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
             let (_, reply1) = gen_capture_reply(&mut b, transcript, &opts);
             assert_eq!(
                 resumed_transcript,
@@ -5062,15 +5073,12 @@ mod tests {
     #[test]
     fn fork_is_a_local_clone_without_a_host() {
         use crate::engine::GenerationOptions;
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut a =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut a = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 21,
             n_predict: 16,
@@ -5140,7 +5148,6 @@ mod tests {
     #[test]
     fn forked_aside_reuses_the_main_prefix() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use std::fmt::Write as _;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
@@ -5148,8 +5155,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 41,
             n_predict: 16,
@@ -5201,15 +5207,12 @@ mod tests {
     #[test]
     fn multiplexed_aside_keeps_the_main_task_moving() {
         use crate::engine::{AsideStream, Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 81,
             n_predict: 40,
@@ -5284,7 +5287,6 @@ mod tests {
     #[test]
     fn forks_interleave_through_the_slice_runner() {
         use crate::engine::{EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use crate::slice::{JobId, SliceRunner};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -5295,8 +5297,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 71,
             n_predict: 24,
@@ -5393,7 +5394,6 @@ mod tests {
     #[test]
     fn a_second_aside_still_reuses_the_prefix() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use std::cell::Cell;
         use std::fmt::Write as _;
 
@@ -5402,8 +5402,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 91,
             n_predict: 64,
@@ -5494,7 +5493,6 @@ mod tests {
     #[test]
     fn aside_during_a_frozen_pass_reuses_the_prefix() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use std::cell::Cell;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
@@ -5512,7 +5510,7 @@ mod tests {
         // One model, two fresh sessions over it — opening a second Ds4Model in
         // the same process is not supported.
         let shared = std::sync::Arc::new(
-            super::Ds4Model::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap(),
+            super::Ds4Model::open(&model, backend(), 4096, 0, 100, &tuning).unwrap(),
         );
 
         // `forked` selects the tier. `freeze` decides whether the preceding
@@ -5592,7 +5590,6 @@ mod tests {
     #[test]
     fn forked_aside_does_not_cost_the_resume_its_cache() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use std::cell::Cell;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
@@ -5600,8 +5597,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 51,
             n_predict: 64,
@@ -5678,15 +5674,12 @@ mod tests {
     #[test]
     fn forked_aside_leaves_the_main_session_clean() {
         use crate::engine::{Engine, GenerationOptions};
-        use crate::ffi::Ds4Backend;
-
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let mut engine =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut engine = super::Ds4Session::open(&model, backend(), 4096, 0, 100, &tuning).unwrap();
         let opts = GenerationOptions {
             seed: 31,
             n_predict: 16,
@@ -5827,7 +5820,6 @@ mod tests {
     /// test model is configured. Metal-only; see the module note above.
     #[cfg(ds4_engine)]
     fn clone_test_host(max_sessions: usize) -> Option<crate::host::EngineHost> {
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
 
         let model_path = std::env::var_os("PLANK_TEST_MODEL").or_else(|| {
@@ -5837,7 +5829,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,
@@ -5867,7 +5859,6 @@ mod tests {
     #[test]
     fn idle_reclaim_restore_no_cold_reprefill() {
         use crate::engine::{EngineEvent, GenerationOptions};
-        use crate::ffi::Ds4Backend;
         use crate::host::{EngineHost, HostConfig};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -5880,7 +5871,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let model = super::Ds4Model::open_shared(
             &model_path,
-            Ds4Backend::Metal,
+            backend(),
             4096,
             0,
             100,

@@ -1716,6 +1716,7 @@ mod tests {
     /// tree or targets a directory, so this test plants an escaping target to
     /// keep pinning the case it always meant to pin.
     #[test]
+    #[cfg(unix)]
     fn an_escaping_symlink_in_the_extracted_tree_is_refused() {
         let root = std::env::temp_dir().join(format!("plank-url-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1743,6 +1744,7 @@ mod tests {
     /// ordinary "same file under two names" idiom a real plugin uses, and the
     /// case the old blanket refusal wrongly rejected.
     #[test]
+    #[cfg(unix)]
     fn a_contained_symlink_in_the_extracted_tree_is_accepted() {
         let root = std::env::temp_dir().join(format!("plank-url-contained-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1840,6 +1842,7 @@ mod tests {
     /// all, so a `key -> ~/.ssh/id_rsa` entry installed the private key's
     /// *contents* as a plain file, readable by anything that reads plugins.
     #[test]
+    #[cfg(unix)]
     fn install_refuses_a_source_directory_with_an_escaping_symlink() {
         let root =
             std::env::temp_dir().join(format!("plank-install-escape-{}", std::process::id()));
@@ -1898,6 +1901,7 @@ mod tests {
     /// names" idiom a real plugin uses, same as the archive and Claude-plugin
     /// paths.
     #[test]
+    #[cfg(unix)]
     fn install_accepts_a_source_directory_with_a_contained_symlink() {
         let root =
             std::env::temp_dir().join(format!("plank-install-contained-{}", std::process::id()));
@@ -2174,10 +2178,10 @@ mod tests {
             true,
         );
         assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].winner.as_deref(), Some("demo"));
-        assert!(claims[0].shadowed.is_empty());
+        assert_eq!(claims[0].shadowed, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2276,7 +2280,7 @@ mod tests {
         assert_eq!(names(&merged), vec!["demo:greet"]);
         assert!(!merged.iter().any(|i| i.name == "greet"));
         // No collision warnings: there is no bare name to collide on.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         // No plugin wins the bare name.
         assert_eq!(claims.len(), 1);
         assert!(claims[0].winner.is_none());
@@ -2302,7 +2306,7 @@ mod tests {
             "user"
         );
         // No warning: the plugin skill was never going to take the bare name.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
         assert_eq!(claims.len(), 1);
         assert!(claims[0].winner.is_none());
         assert_eq!(claims[0].shadowed, vec!["demo".to_string()]);
@@ -2399,7 +2403,7 @@ mod tests {
         // Plugin skills are namespaced only: the bare name is never registered.
         assert!(!skills.iter().any(|s| s.name == "greet"));
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2430,7 +2434,7 @@ mod tests {
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
         // Plugin skills are namespaced only, so a local skill with the same
         // bare name is the expected case — no collision warning.
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2532,7 +2536,7 @@ mod tests {
         let (servers, warnings) = mcp_servers(&set);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "weather");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]

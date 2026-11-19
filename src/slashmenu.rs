@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_query_matching_nothing_ranks_empty() {
-        assert!(rank("zzzz", &entries()).is_empty());
+        assert_eq!(rank("zzzz", &entries()), [] as [usize; 0]);
         assert!(SlashMenu::new(entries(), "zzzz").is_empty());
     }
 

@@ -62,6 +62,10 @@ Everything below is read from `src/ds4engine.rs`, `src/ffi.rs`, and
   (`ds4_session_pos`); stopping loses nothing (BTW-SUSPEND-DESIGN §2). This is what
   makes *cooperative* interleaving at token granularity possible.
 - **One Metal command queue means concurrency is time-sliced, not parallel.**
+  The same holds on CUDA and ROCm: the C keeps one stream per device and
+  global per-device state (`g_gpu`, `g_n_gpus`), so multi-GPU placement
+  splits *layers* across devices, never sessions, and the one-GPU-thread
+  decision below stands unchanged.
   Two sessions calling `ds4_session_eval`/`sample` concurrently on separate threads
   is almost certainly unsound as written; and even if made safe, one queue buys no
   parallel throughput (BTW-SUSPEND-DESIGN §2, §8.1 req 2). This is the single most
