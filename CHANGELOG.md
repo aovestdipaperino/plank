@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ESC ESC and `/rewind`: go back to before an earlier prompt.** Two Escapes
+  within 800 ms on an empty prompt open a picker of the recent prompts, then
+  ask what to restore: the conversation and the files, the conversation only,
+  or the files only. The prompt comes back in the editor to change and send
+  again. `/rewind [n [both | chat | files]]` does the same by number, and
+  numbers match `/fork` and `/tree`. The conversation half is a fork, so the
+  old branch stays in `/tree` and the cached prefix is reused; the file half is
+  `/undo`'s snapshot for that turn. Session-start context (the date line, git
+  status) takes a number but is never offered. Mid-turn a single Escape still
+  interrupts, as before.
+
 - **`/undo`: put back the files the agent changed.** Each turn snapshots the
   files its tools are about to write: a full copy per changed version under
   `~/.plank/file-history/<session>`, one snapshot per turn, no git needed. `/undo` restores the files to before the

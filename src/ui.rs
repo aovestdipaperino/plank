@@ -1555,6 +1555,121 @@ fn btw_question(line: &str) -> Option<&str> {
     if q.is_empty() { None } else { Some(q) }
 }
 
+/// Two Escapes within this long are the rewind gesture.
+const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(800);
+
+/// Records an Escape press and says whether it is the second of a pair within
+/// [`DOUBLE_ESC_WINDOW`]. A pair is consumed: a third press starts a new one.
+fn esc_pressed_twice(last: &mut Option<Instant>, now: Instant) -> bool {
+    match last.take() {
+        Some(t) if now.duration_since(t) <= DOUBLE_ESC_WINDOW => true,
+        _ => {
+            *last = Some(now);
+            false
+        }
+    }
+}
+
+/// Most prompts the rewind picker lists, newest first.
+const REWIND_PICKER_ROWS: usize = 12;
+
+/// Asks one question in the input region and blocks for the answer, on the UI
+/// thread: [`run_ask_panel`] without a worker waiting on the other end.
+/// `None` when the user pressed Escape or Ctrl-C.
+fn run_choice_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    status: &str,
+    tasks: &tui::TaskView,
+    req: &crate::tools::ask::AskRequest,
+) -> Result<Option<String>, String> {
+    use crate::tools::ask::{AskOutcome, AskState};
+    let mut state = AskState::for_request(req);
+    loop {
+        terminal
+            .draw(|f| tui::draw_ask(f, log, req, &state, status, view, tasks))
+            .map(|done| crate::logo::after_draw(done.buffer))
+            .map_err(|e| e.to_string())?;
+        let Some(ev) = next_event(None, Duration::from_millis(100))? else {
+            continue;
+        };
+        let Event::Key(key) = ev else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => state.move_up(),
+            KeyCode::Down => state.move_down(),
+            KeyCode::Enter => {
+                return Ok(match state.resolve(req) {
+                    AskOutcome::Answered(labels) => labels.into_iter().next(),
+                    _ => None,
+                });
+            }
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+/// One prompt `/rewind` can return to.
+struct RewindPoint {
+    /// 1-based, as `/fork` numbers the conversation's user prompts.
+    n: usize,
+    /// The prompt as sent.
+    text: String,
+    /// The file snapshot taken just before it ran, if file history had one.
+    snapshot: Option<u64>,
+}
+
+impl RewindPoint {
+    /// The first line, clipped to fit a list row.
+    fn clip(&self) -> String {
+        let line = self
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        crate::session::title_clip(line.trim(), 60)
+    }
+}
+
+/// What `/rewind` puts back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewindMode {
+    /// The conversation and the files.
+    Both,
+    /// The conversation only (a fork at that prompt).
+    Chat,
+    /// The files only.
+    Files,
+}
+
+impl RewindMode {
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "" | "both" => Some(Self::Both),
+            "chat" | "conversation" => Some(Self::Chat),
+            "files" | "code" => Some(Self::Files),
+            _ => None,
+        }
+    }
+}
+
+/// `/rewind <n> [mode]`'s arguments, or the usage line.
+fn parse_rewind_args(arg: &str) -> Result<(usize, RewindMode), String> {
+    const USAGE: &str = "usage: /rewind <n> [both | chat | files] (see /rewind for the list)";
+    let mut it = arg.split_whitespace();
+    let n = it.next().and_then(|w| w.parse().ok()).ok_or(USAGE)?;
+    let mode = RewindMode::parse(it.next().unwrap_or("")).ok_or(USAGE)?;
+    if it.next().is_some() {
+        return Err(USAGE.to_owned());
+    }
+    Ok((n, mode))
+}
+
 /// `1 file` / `3 files`.
 fn count_files(n: usize) -> String {
     format!("{n} file{}", if n == 1 { "" } else { "s" })
@@ -8232,6 +8347,16 @@ impl Agent<'_> {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => println!("{e}"),
             },
+            "/rewind" if arg.is_empty() => println!("{}", self.rewind_list()),
+            "/rewind" => match parse_rewind_args(arg).and_then(|(n, m)| self.rewind_to(n, m)) {
+                Ok((msg, prompt)) => {
+                    println!("{msg}");
+                    if let Some(p) = prompt {
+                        println!("the prompt was: {p}");
+                    }
+                }
+                Err(e) => println!("{e}"),
+            },
             "/clone" => match self.clone_branch() {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => println!("{e}"),
@@ -9118,6 +9243,7 @@ impl Agent<'_> {
             .unwrap_or("")
             .trim()
             .to_owned();
+        let prompt_no = self.rewind_points().last().map_or(0, |p| p.n);
         let mut slot = self
             .tool_ctx
             .file_history
@@ -9127,7 +9253,7 @@ impl Agent<'_> {
             *slot = Some(crate::filehistory::FileHistory::open(dir));
         }
         if let Some(h) = slot.as_mut() {
-            h.snapshot(&label);
+            h.snapshot_turn(prompt_no, &label);
         }
     }
 
@@ -9169,6 +9295,175 @@ impl Agent<'_> {
         }
         line.push_str("; /undo redo puts them back");
         Ok(line)
+    }
+
+    /// The user prompts of the active conversation, oldest first, numbered from
+    /// 1 as `/fork` and `/tree` number them: the points `/rewind` can return to.
+    fn rewind_points(&self) -> Vec<RewindPoint> {
+        let slot = self.tool_ctx.file_history.lock().ok();
+        let history = slot.as_deref().and_then(Option::as_ref);
+        self.session
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::session::Role::User && !crate::branch::is_tool_user(m))
+            .enumerate()
+            // The numbering is `/fork`'s, which counts the context plank
+            // injects at session start; those are numbered but never offered,
+            // because nobody typed them.
+            .filter(|(_, m)| !m.is_session_context())
+            .map(|(i, m)| RewindPoint {
+                n: i + 1,
+                text: m.text.clone(),
+                snapshot: history.and_then(|h| h.turn_for_prompt(i + 1)),
+            })
+            .collect()
+    }
+
+    /// `/rewind <n> [both | chat | files]`: returns to just before the `n`th
+    /// user prompt. `chat` forks the conversation there (the old branch stays
+    /// in `/tree`, as `/fork` does), `files` puts back the files the agent
+    /// changed since, and `both` (the default) does both. Returns a status
+    /// line and, when the conversation was rewound, the prompt's text so the
+    /// front end can put it back in the editor to be sent again.
+    fn rewind_to(
+        &mut self,
+        n: usize,
+        mode: RewindMode,
+    ) -> Result<(String, Option<String>), String> {
+        let points = self.rewind_points();
+        let point = points
+            .iter()
+            .find(|p| p.n == n)
+            .ok_or_else(|| format!("no prompt {n} to rewind to (see /rewind)"))?;
+        let text = point.text.clone();
+        let mut done: Vec<String> = Vec::new();
+        if mode != RewindMode::Chat {
+            match point.snapshot {
+                Some(id) => done.push(format!("files: {}", self.rewind_files(id)?)),
+                None if mode == RewindMode::Files => {
+                    return Err(format!(
+                        "no file snapshot for prompt {n} (file history was off or not yet open)"
+                    ));
+                }
+                None => done.push("files: no snapshot for that prompt".to_owned()),
+            }
+        }
+        let resubmit = if mode == RewindMode::Files {
+            None
+        } else {
+            done.push(self.fork_branch(&n.to_string(), false)?);
+            Some(text)
+        };
+        Ok((
+            format!("rewound to before prompt {n}; {}", done.join("; ")),
+            resubmit,
+        ))
+    }
+
+    /// ESC ESC: lists the recent prompts, asks what to put back, and does it.
+    /// For the conversation modes the prompt goes back into the editor, so it
+    /// can be changed and sent again.
+    fn tui_rewind_picker(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        view: &mut tui::OutputView,
+        status: &str,
+        tasks: &tui::TaskView,
+        input: &mut TuiInput,
+    ) -> Result<(), String> {
+        use crate::tools::ask::{AskOption, AskRequest};
+        let points = self.rewind_points();
+        if points.is_empty() {
+            log.push_dim("[nothing to rewind to yet]");
+            return Ok(());
+        }
+        let options: Vec<AskOption> = points
+            .iter()
+            .rev()
+            .take(REWIND_PICKER_ROWS)
+            .map(|p| AskOption {
+                label: format!("{}. {}", p.n, p.clip()),
+                description: if p.snapshot.is_some() {
+                    "conversation and files".to_owned()
+                } else {
+                    "conversation only: no file snapshot".to_owned()
+                },
+            })
+            .collect();
+        let pick = AskRequest {
+            question: "Rewind to just before which prompt?".to_owned(),
+            header: "Rewind".to_owned(),
+            options,
+            multi: false,
+            allow_chat: false,
+        };
+        let Some(label) = run_choice_panel(terminal, log, view, status, tasks, &pick)? else {
+            return Ok(());
+        };
+        let Some(n) = label
+            .split('.')
+            .next()
+            .and_then(|w| w.parse::<usize>().ok())
+        else {
+            return Ok(());
+        };
+        let has_files = points.iter().any(|p| p.n == n && p.snapshot.is_some());
+        let mut modes = vec![("Conversation only", RewindMode::Chat)];
+        if has_files {
+            modes.insert(0, ("Conversation and files", RewindMode::Both));
+            modes.push(("Files only", RewindMode::Files));
+        }
+        let what = AskRequest {
+            question: format!("Rewind to before prompt {n}: restore what?"),
+            header: "Rewind".to_owned(),
+            options: modes
+                .iter()
+                .map(|(label, _)| AskOption {
+                    label: (*label).to_owned(),
+                    description: String::new(),
+                })
+                .collect(),
+            multi: false,
+            allow_chat: false,
+        };
+        let Some(choice) = run_choice_panel(terminal, log, view, status, tasks, &what)? else {
+            return Ok(());
+        };
+        let Some(&(_, mode)) = modes.iter().find(|(l, _)| *l == choice) else {
+            return Ok(());
+        };
+        match self.rewind_to(n, mode) {
+            Ok((msg, prompt)) => {
+                log.push_plain(msg);
+                if let Some(text) = prompt {
+                    input.hist_idx = None;
+                    input.buf.set_text(&text);
+                    input.buf.move_end();
+                }
+            }
+            Err(e) => log.push_plain(e),
+        }
+        Ok(())
+    }
+
+    /// `/rewind` with no argument in the plain REPL: the prompts that can be
+    /// returned to, newest last, and how to pick one.
+    fn rewind_list(&self) -> String {
+        use std::fmt::Write as _;
+        let points = self.rewind_points();
+        if points.is_empty() {
+            return "nothing to rewind to yet; send a prompt first".to_owned();
+        }
+        let mut out = String::from("prompts you can rewind to (newest last):");
+        for p in &points {
+            let files = if p.snapshot.is_some() { " [files]" } else { "" };
+            let _ = write!(out, "\n  {:>3}  {}{files}", p.n, p.clip());
+        }
+        out.push_str(
+            "\nuse /rewind <n> [both | chat | files]; ESC ESC in the TUI picks interactively",
+        );
+        out
     }
 
     /// `/undo [n | list | redo]`: puts the files the agent changed back to how
@@ -14026,6 +14321,8 @@ impl Agent<'_> {
         // The `/resume` session picker, when open; it owns every key until it
         // resumes a session or is cancelled.
         let mut resume_pane: Option<crate::resumepane::ResumePane> = None;
+        // When the last Escape was pressed at the idle prompt, for ESC ESC.
+        let mut last_esc: Option<Instant> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
         // attached to the message as file references the model's tools can
         // read. Always empty while IMAGES_ENABLED is off.
@@ -14911,6 +15208,9 @@ impl Agent<'_> {
                 continue;
             }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if key.code != KeyCode::Esc {
+                last_esc = None;
+            }
             // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
@@ -15138,6 +15438,22 @@ impl Agent<'_> {
                 KeyCode::Esc if report.is_some() => report = None,
                 KeyCode::Esc if sub_pane.collapse() => {}
                 KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
+                // ESC ESC on an empty prompt: pick a past prompt to rewind to.
+                KeyCode::Esc
+                    if input.buf.text().is_empty()
+                        && esc_pressed_twice(&mut last_esc, Instant::now()) =>
+                {
+                    if let Err(e) = self.tui_rewind_picker(
+                        terminal,
+                        &mut log,
+                        &mut view,
+                        &idle_status,
+                        &task_view,
+                        &mut input,
+                    ) {
+                        log.push_dim(format!("[rewind failed: {e}]"));
+                    }
+                }
                 // While a report is up, the page keys scroll it: it is short
                 // enough to fit in half the screen only some of the time.
                 // Up/Down stay with the prompt history.
@@ -18762,6 +19078,16 @@ impl Agent<'_> {
             }
             "/fork" => match self.fork_branch(arg, true) {
                 Ok(msg) => log.push_ansi(&msg),
+                Err(e) => log.push_plain(e),
+            },
+            "/rewind" if arg.is_empty() => log.push_plain(self.rewind_list()),
+            "/rewind" => match parse_rewind_args(arg).and_then(|(n, m)| self.rewind_to(n, m)) {
+                Ok((msg, prompt)) => {
+                    log.push_plain(msg);
+                    if let Some(p) = prompt {
+                        log.push_dim(format!("the prompt was: {p}"));
+                    }
+                }
                 Err(e) => log.push_plain(e),
             },
             "/clone" => match self.clone_branch() {
@@ -34647,6 +34973,108 @@ mod tests {
         std::fs::remove_dir_all(crate::filehistory::dir_in(
             &crate::filehistory::root(),
             "undo-files-test",
+        ))
+        .ok();
+    }
+
+    #[test]
+    fn two_escapes_in_quick_succession_are_the_rewind_gesture() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(!esc_pressed_twice(&mut last, t0), "the first only arms it");
+        assert!(esc_pressed_twice(
+            &mut last,
+            t0 + Duration::from_millis(300)
+        ));
+        assert!(last.is_none(), "a pair is consumed");
+        assert!(!esc_pressed_twice(
+            &mut last,
+            t0 + Duration::from_millis(400)
+        ));
+        // Too slow: it is a first press again.
+        assert!(!esc_pressed_twice(&mut last, t0 + Duration::from_secs(5)));
+        assert!(esc_pressed_twice(
+            &mut last,
+            t0 + Duration::from_millis(5300)
+        ));
+    }
+
+    #[test]
+    fn rewind_arguments_parse_or_give_the_usage() {
+        assert_eq!(parse_rewind_args("3").unwrap(), (3, RewindMode::Both));
+        assert_eq!(parse_rewind_args("3 chat").unwrap(), (3, RewindMode::Chat));
+        assert_eq!(
+            parse_rewind_args("12 files").unwrap(),
+            (12, RewindMode::Files)
+        );
+        assert_eq!(parse_rewind_args("2 code").unwrap(), (2, RewindMode::Files));
+        for bad in ["", "x", "3 sideways", "3 chat extra", "-1"] {
+            assert!(
+                parse_rewind_args(bad).unwrap_err().starts_with("usage:"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `/rewind` ties a prompt to the files as they were before it and, for the
+    /// conversation, forks there: it keeps the earlier messages and returns the
+    /// prompt's text to be sent again.
+    #[test]
+    fn rewind_returns_to_before_a_prompt() {
+        let dir = scratch_dir("rewind");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.tool_ctx.cwd.clone_from(&dir);
+        agent.session.id = "rewind-test".to_owned();
+        let f = dir.join("note.txt");
+        std::fs::write(&f, "original").unwrap();
+
+        // Session-start context takes a number in `/fork`'s counting but is
+        // not a prompt anyone typed, so it is never offered.
+        agent
+            .session
+            .push(Message::user("Today's date is 2026-11-19."));
+        agent.session.push(Message::user("first prompt"));
+        agent.file_history_begin_turn();
+        agent.tool_ctx.resolve_for_write("write", &f).unwrap();
+        std::fs::write(&f, "after one").unwrap();
+        agent.session.push(Message::assistant("done one"));
+        agent.session.push(Message::user("second prompt"));
+        agent.file_history_begin_turn();
+        agent.tool_ctx.resolve_for_write("write", &f).unwrap();
+        std::fs::write(&f, "after two").unwrap();
+        agent.session.push(Message::assistant("done two"));
+
+        let points = agent.rewind_points();
+        assert_eq!(points.len(), 2, "the date line is not a prompt");
+        assert_eq!(points.iter().map(|p| p.n).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(points.iter().all(|p| p.snapshot.is_some()));
+        assert!(agent.rewind_list().contains("second prompt"));
+        assert!(!agent.rewind_list().contains("Today's date"));
+
+        // Files only: the conversation stays.
+        let (msg, prompt) = agent.rewind_to(3, RewindMode::Files).unwrap();
+        assert!(msg.contains("restored 1 file"), "{msg}");
+        assert_eq!(prompt, None);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "after one");
+        assert_eq!(agent.session.transcript.len(), 5);
+
+        // Both: back before the first prompt; only the context stays.
+        let (msg, prompt) = agent.rewind_to(2, RewindMode::Both).unwrap();
+        assert!(msg.contains("files:") && msg.contains("forked"), "{msg}");
+        assert_eq!(prompt.as_deref(), Some("first prompt"));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        assert_eq!(agent.session.transcript.len(), 1, "just the context");
+
+        assert!(
+            agent.rewind_to(1, RewindMode::Both).is_err(),
+            "context is not offered"
+        );
+        assert!(agent.rewind_to(9, RewindMode::Both).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(crate::filehistory::dir_in(
+            &crate::filehistory::root(),
+            "rewind-test",
         ))
         .ok();
     }

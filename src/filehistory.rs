@@ -100,6 +100,9 @@ struct Snapshot {
     id: u64,
     time: u64,
     kind: Kind,
+    /// For a [`Kind::Turn`]: which user prompt of the conversation (1-based,
+    /// as `/fork` numbers them) the turn answered; `0` when not known.
+    prompt_no: usize,
     label: String,
     files: BTreeMap<PathBuf, Backup>,
 }
@@ -139,6 +142,8 @@ impl Kind {
 pub struct SnapshotInfo {
     /// Why it was taken.
     pub kind: Kind,
+    /// The prompt number a turn snapshot belongs to; `0` when not known.
+    pub prompt_no: usize,
     /// Stable id, increasing for the life of the history.
     pub id: u64,
     /// Unix seconds when it was taken.
@@ -280,6 +285,7 @@ impl FileHistory {
             .iter()
             .map(|s| SnapshotInfo {
                 kind: s.kind,
+                prompt_no: s.prompt_no,
                 id: s.id,
                 time: s.time,
                 label: s.label.clone(),
@@ -312,6 +318,18 @@ impl FileHistory {
             .map(|s| s.id)
     }
 
+    /// The newest turn snapshot taken for the `n`th user prompt: the files as
+    /// they were before it. The newest wins because a fork reuses prompt
+    /// numbers, and the branch in use is the latest one.
+    #[must_use]
+    pub fn turn_for_prompt(&self, n: usize) -> Option<u64> {
+        self.snapshots
+            .iter()
+            .rev()
+            .find(|s| s.kind == Kind::Turn && s.prompt_no == n && n != 0)
+            .map(|s| s.id)
+    }
+
     /// The id of the newest snapshot of `kind`.
     #[must_use]
     pub fn latest_of(&self, kind: Kind) -> Option<u64> {
@@ -340,8 +358,18 @@ impl FileHistory {
         self.snapshot_kind(Kind::Turn, label)
     }
 
+    /// A turn snapshot for the conversation's `prompt_no`th user prompt, so
+    /// `/rewind` can find the files as they were before that prompt.
+    pub fn snapshot_turn(&mut self, prompt_no: usize, label: &str) -> u64 {
+        self.snapshot_inner(Kind::Turn, prompt_no, label)
+    }
+
     /// [`snapshot`](Self::snapshot) with an explicit [`Kind`].
     pub fn snapshot_kind(&mut self, kind: Kind, label: &str) -> u64 {
+        self.snapshot_inner(kind, 0, label)
+    }
+
+    fn snapshot_inner(&mut self, kind: Kind, prompt_no: usize, label: &str) -> u64 {
         let mut files = BTreeMap::new();
         for path in &self.tracked {
             let latest = self.snapshots.last().and_then(|s| s.files.get(path));
@@ -353,6 +381,7 @@ impl FileHistory {
             id,
             time: now_secs(),
             kind,
+            prompt_no,
             label: label.chars().take(120).collect(),
             files,
         });
@@ -795,10 +824,11 @@ fn render_state(snapshots: &[Snapshot], sequence: u64) -> String {
     for s in snapshots {
         let _ = writeln!(
             out,
-            "S\t{}\t{}\t{}\t{}",
+            "S\t{}\t{}\t{}\t{}\t{}",
             s.id,
             s.time,
             s.kind.tag(),
+            s.prompt_no,
             esc(&s.label)
         );
         for (path, b) in &s.files {
@@ -827,10 +857,11 @@ fn parse_state(text: &str) -> Option<(Vec<Snapshot>, u64)> {
         let f: Vec<&str> = line.split('\t').collect();
         match f.as_slice() {
             ["seq", n] => sequence = n.parse().ok()?,
-            ["S", id, time, kind, label] => snapshots.push(Snapshot {
+            ["S", id, time, kind, prompt_no, label] => snapshots.push(Snapshot {
                 id: id.parse().ok()?,
                 time: time.parse().ok()?,
                 kind: Kind::from_tag(kind)?,
+                prompt_no: prompt_no.parse().ok()?,
                 label: unesc(label),
                 files: BTreeMap::new(),
             }),
@@ -1223,6 +1254,27 @@ mod tests {
         assert_eq!(sweep_in(&root, 0, "keep"), 1);
         assert!(root.join("keep").exists());
         assert!(!root.join("old").exists());
+    }
+
+    #[test]
+    fn a_prompt_number_finds_its_newest_turn_snapshot_and_survives_a_reopen() {
+        let s = Scratch::new("promptno");
+        let f = s.work().join("a.txt");
+        write(&f, "x");
+        let mut h = s.history();
+        let first = h.snapshot_turn(1, "one");
+        h.track(&f);
+        let second = h.snapshot_turn(2, "two");
+        assert_eq!(h.turn_for_prompt(1), Some(first));
+        assert_eq!(h.turn_for_prompt(2), Some(second));
+        assert_eq!(h.turn_for_prompt(3), None);
+        assert_eq!(h.turn_for_prompt(0), None, "0 means unknown");
+        // After a fork the number is reused; the newest branch wins.
+        let again = h.snapshot_turn(2, "two, differently");
+        assert_eq!(h.turn_for_prompt(2), Some(again));
+        let reopened = FileHistory::open(h.dir().to_path_buf());
+        assert_eq!(reopened.turn_for_prompt(2), Some(again));
+        assert_eq!(reopened.snapshots()[0].prompt_no, 1);
     }
 
     #[test]

@@ -214,9 +214,23 @@ first, then interrupts the turn and leaves once it stops</td>
 <td>mark a named return point in this session</td>
 </tr>
 <tr>
-<td><code>/rollback [name]</code></td>
+<td><code>/rollback &lt;name&gt; [--files | --files-only]</code></td>
 <td>return to a checkpoint; the discarded tail is kept as
-<code>pre-rollback</code></td>
+<code>pre-rollback</code>. <code>--files</code> also restores the files
+the agent changed since, <code>--files-only</code> only those</td>
+</tr>
+<tr>
+<td><code>/rewind [n [both | chat | files]]</code></td>
+<td>return to just before prompt <code>n</code>: the conversation (a
+fork, as <code>/fork</code>), the files the agent changed, or both, and
+the prompt comes back for editing. No argument lists the prompts;
+<code>Esc Esc</code> picks one interactively</td>
+</tr>
+<tr>
+<td><code>/undo [n | list | redo]</code></td>
+<td>put the files the agent changed back to before the last turn (or
+the <code>n</code>th earlier one); <code>redo</code> reverses a
+restore. The conversation is untouched</td>
 </tr>
 <tr>
 <td><code>/tree</code></td>

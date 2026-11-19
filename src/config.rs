@@ -1101,6 +1101,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "return to a checkpoint; --files also restores the files the agent changed",
     },
     SlashCommand {
+        name: "/rewind",
+        args: "[n [both | chat | files]]",
+        desc: "return to before an earlier prompt: the conversation, the files, or both (ESC ESC)",
+    },
+    SlashCommand {
         name: "/undo",
         args: "[n | list | redo]",
         desc: "put the files the agent changed back to before the last turn",
@@ -1456,6 +1461,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
         || slash_command_with_args(cmd, "/undo")
+        || slash_command_with_args(cmd, "/rewind")
         || slash_command_with_args(cmd, "/notify")
         || slash_command_with_args(cmd, "/goal")
         || slash_command_with_args(cmd, "/remote-control")
