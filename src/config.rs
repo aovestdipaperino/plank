@@ -1093,12 +1093,17 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/checkpoint",
         args: "[name]",
-        desc: "snapshot the working tree so a turn can be undone",
+        desc: "name this point in the conversation (and the agent's file changes)",
     },
     SlashCommand {
         name: "/rollback",
-        args: "[name]",
-        desc: "restore the working tree from a checkpoint",
+        args: "<name> [--files | --files-only]",
+        desc: "return to a checkpoint; --files also restores the files the agent changed",
+    },
+    SlashCommand {
+        name: "/undo",
+        args: "[n | list | redo]",
+        desc: "put the files the agent changed back to before the last turn",
     },
     SlashCommand {
         name: "/history",
@@ -1450,6 +1455,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/history")
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
+        || slash_command_with_args(cmd, "/undo")
         || slash_command_with_args(cmd, "/notify")
         || slash_command_with_args(cmd, "/goal")
         || slash_command_with_args(cmd, "/remote-control")

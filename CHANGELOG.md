@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/undo`: put back the files the agent changed.** Each turn snapshots the
+  files its tools are about to write: a full copy per changed version under
+  `~/.plank/file-history/<session>`, one snapshot per turn, no git needed. `/undo` restores the files to before the
+  last turn, `/undo 2` before the one earlier, `/undo list` shows the snapshots,
+  and `/undo redo` reverses a restore. A file the agent created is deleted, a
+  deleted one comes back, and permissions survive. `/checkpoint` now records the
+  files too, and `/rollback <name> --files` (or `--files-only`) returns to them.
+  `edit`, `write` and the CSV editor are tracked where they resolve a write
+  path; `bash` is tracked by the files and redirect targets a command names, so
+  `rm -rf src`, `sed -i f` and `echo x > f` are covered but a command that
+  writes files it never names is not. Off with `tools.fileHistory: false`.
+
 - **Git guard for the `bash` tool (`tools.gitGuard`).** A command that throws
   work away or rewrites history (`git reset --hard`, `git clean -f`, a force
   push, `branch -D`, `checkout -- .`, `restore`, `rebase`, `stash drop`, and a

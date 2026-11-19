@@ -985,6 +985,11 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     {
         return refusal;
     }
+    // Save what the command names before it can change it. A GPU-yield re-run
+    // repeats a command already recorded by its first run.
+    if ctx.bash.replay_sandbox.is_none() {
+        ctx.track_bash(cmd);
+    }
     // A GPU-yield re-run reuses the first run's decision verbatim: asking
     // about a protected root again would turn one grant into two prompts.
     let sandbox = match ctx.bash.replay_sandbox.take() {
@@ -1839,6 +1844,52 @@ mod tests {
             again.contains("not run:"),
             "the next call is checked: {again}"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A command that deletes a file it names, and one that overwrites another
+    /// through a redirect, are both undone by a rewind; a read-only command
+    /// tracks nothing.
+    #[test]
+    fn bash_tracks_the_files_a_command_names_so_a_turn_can_be_undone() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let hist = dir.join(".history-under-test");
+        let victim = dir.join("victim.txt");
+        let target = dir.join("target.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::fs::write(&target, "before").unwrap();
+        let mut h = crate::filehistory::FileHistory::new(hist);
+        let turn = h.snapshot("turn 1");
+        *ctx.file_history.lock().unwrap() = Some(h);
+
+        tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "cat victim.txt")]),
+        );
+        assert_eq!(ctx.with_file_history(|h| h.tracked_len()), Some(0));
+
+        tool_bash(
+            &mut ctx,
+            &test_call(
+                "bash",
+                &[(
+                    "command",
+                    "rm victim.txt && echo after > target.txt && echo x > made.txt",
+                )],
+            ),
+        );
+        assert!(!victim.exists());
+        assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "after");
+        assert!(dir.join("made.txt").exists());
+
+        let report = ctx
+            .with_file_history(|h| h.rewind(turn, &|_| true).unwrap())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        assert!(!dir.join("made.txt").exists(), "a created file is removed");
+        assert_eq!(report.skipped.len(), 0, "{report:?}");
         std::fs::remove_dir_all(dir).ok();
     }
 

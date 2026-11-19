@@ -41,6 +41,10 @@ pub struct Checkpoint {
     /// Captured engine KV state; `None` when the engine has no snapshot
     /// support, in which case rollback re-prefills.
     pub kv: Option<crate::kvcache::KVCache>,
+    /// The file-history snapshot ([`crate::filehistory`]) taken with this
+    /// checkpoint, for `/rollback --files`; `None` when file history is off
+    /// or has nothing tracked.
+    pub files: Option<u64>,
 }
 
 /// In-memory, per-session set of named checkpoints (insertion order).
@@ -98,6 +102,7 @@ impl CheckpointStore {
             transcript: session.transcript.clone(),
             tasks: session.tasks.clone(),
             kv,
+            files: None,
         };
         if let Some(slot) = self.entries.iter_mut().find(|c| c.name == name) {
             *slot = cp;
@@ -105,6 +110,13 @@ impl CheckpointStore {
         } else {
             self.entries.push(cp);
             false
+        }
+    }
+
+    /// Records the file-history snapshot taken alongside checkpoint `name`.
+    pub fn set_files(&mut self, name: &str, snapshot: Option<u64>) {
+        if let Some(c) = self.entries.iter_mut().find(|c| c.name == name) {
+            c.files = snapshot;
         }
     }
 
@@ -175,7 +187,12 @@ pub fn render_list(store: &CheckpointStore, now: u64, color: bool) -> String {
     };
     let mut out = String::new();
     for c in store.list() {
-        let kv = if c.kv.is_some() { " +kv" } else { "" };
+        let kv = match (c.kv.is_some(), c.files.is_some()) {
+            (true, true) => " +kv +files",
+            (true, false) => " +kv",
+            (false, true) => " +files",
+            (false, false) => "",
+        };
         let _ = writeln!(
             out,
             "{name_on}{}{reset} {dim}>{reset} {sum_on}{}{reset}",

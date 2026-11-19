@@ -389,6 +389,11 @@ pub struct ToolsSettings {
     /// (the default; refused when there is no one to ask), `block`, or `off`.
     /// See [`crate::gitguard`].
     pub git_guard: crate::gitguard::Mode,
+    /// Whether each user turn snapshots the files the agent's tools are about
+    /// to change, so `/undo` and `/rollback --files` can put them back
+    /// ([`crate::filehistory`]). Default on: a copy is made only for a file a
+    /// tool is about to write, once per change.
+    pub file_history: bool,
 }
 
 impl Default for ToolsSettings {
@@ -407,6 +412,7 @@ impl Default for ToolsSettings {
             remember: true,
             edit_upto: None,
             git_guard: crate::gitguard::Mode::Ask,
+            file_history: true,
         }
     }
 }
@@ -967,6 +973,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "editUpto") {
             self.tools.edit_upto = Some(v);
             self.note("tools.editUpto", origin);
+        }
+        if let Some(v) = boolean(tools, "fileHistory") {
+            self.tools.file_history = v;
+            self.note("tools.fileHistory", origin);
         }
         if let Some(v) = string(tools, "gitGuard").and_then(|s| crate::gitguard::Mode::parse(&s)) {
             self.tools.git_guard = v;
@@ -1682,6 +1692,7 @@ impl Settings {
             upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
             upsert(t, "remember", Json::Bool(self.tools.remember));
             upsert_opt(t, "editUpto", self.tools.edit_upto.map(Json::Bool));
+            upsert(t, "fileHistory", Json::Bool(self.tools.file_history));
             upsert(
                 t,
                 "gitGuard",
@@ -3128,6 +3139,7 @@ mod tests {
     fn tools_git_guard_parses_saves_and_defaults_to_ask() {
         use crate::gitguard::Mode;
         assert_eq!(Settings::default().tools.git_guard, Mode::Ask);
+        assert!(Settings::default().tools.file_history);
         let dir = std::env::temp_dir().join(format!("plank-settings-gg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("settings.json");
@@ -3141,10 +3153,12 @@ mod tests {
         // And it survives a save and reload, so /config never resets it.
         let mut s = Settings::default();
         s.tools.git_guard = Mode::Off;
+        s.tools.file_history = false;
         s.save_to(&path).expect("save");
         let mut reloaded = Settings::default();
         reloaded.overlay(&std::fs::read_to_string(&path).expect("read"));
         assert_eq!(reloaded.tools.git_guard, Mode::Off);
+        assert!(!reloaded.tools.file_history);
         std::fs::remove_dir_all(&dir).ok();
     }
 

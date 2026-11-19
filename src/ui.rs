@@ -1555,6 +1555,45 @@ fn btw_question(line: &str) -> Option<&str> {
     if q.is_empty() { None } else { Some(q) }
 }
 
+/// `1 file` / `3 files`.
+fn count_files(n: usize) -> String {
+    format!("{n} file{}", if n == 1 { "" } else { "s" })
+}
+
+/// `/undo list`: the file snapshots, newest first.
+fn render_file_snapshots(h: &crate::filehistory::FileHistory) -> String {
+    use crate::filehistory::Kind;
+    let snaps = h.snapshots();
+    if snaps.is_empty() {
+        return "no file snapshots yet".to_owned();
+    }
+    let now = now_secs();
+    let mut out = format!("file snapshots ({} tracked):", count_files(h.tracked_len()));
+    let mut turns = 0;
+    for s in snaps.iter().rev() {
+        use std::fmt::Write as _;
+        let what = match s.kind {
+            Kind::Turn => {
+                turns += 1;
+                format!("/undo {turns}")
+            }
+            Kind::Checkpoint => "checkpoint".to_owned(),
+            Kind::Safety => "before a restore (/undo redo)".to_owned(),
+        };
+        let _ = write!(
+            out,
+            "\n  {what:<30} {:>8}  {}",
+            crate::session::format_age(s.time, now),
+            if s.label.is_empty() {
+                "(no prompt)"
+            } else {
+                &s.label
+            }
+        );
+    }
+    out
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5832,6 +5871,7 @@ impl Agent<'_> {
             println!("{}", self.debug_line(&format!("halted: {reason}")));
             return Ok(());
         }
+        self.file_history_begin_turn();
         // A compaction that did not rebuild (interrupted, or no usable summary)
         // ends the turn here, with the conversation untouched — the C goes
         // straight back to IDLE (`worker_run_turn`).
@@ -8183,6 +8223,10 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/undo" => match self.undo_files(arg) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => println!("{e}"),
+            },
             "/tree" => print!("{}", self.tree_view(self.color)),
             "/fork" => match self.fork_branch(arg, self.color) {
                 Ok(msg) => println!("{msg}"),
@@ -8964,16 +9008,22 @@ impl Agent<'_> {
     }
 
     /// Captures a named checkpoint: the current transcript plus the engine KV
-    /// snapshot (when the engine supports it). Returns a status line.
+    /// snapshot (when the engine supports it) and, when file history is on,
+    /// the state of every tracked file. Returns a status line.
     fn checkpoint_create(&mut self, name: &str) -> String {
         let kv = self.engine.get_kv();
         let had_kv = kv.is_some();
         let replaced = self.checkpoints.save(name, &self.session, kv);
+        let files = self
+            .tool_ctx
+            .with_file_history(|h| h.snapshot_kind(crate::filehistory::Kind::Checkpoint, name));
+        self.checkpoints.set_files(name, files);
         let verb = if replaced { "updated" } else { "saved" };
-        let note = if had_kv {
-            " (with engine KV)"
-        } else {
-            " (transcript only)"
+        let note = match (had_kv, files.is_some()) {
+            (true, true) => " (with engine KV and files)",
+            (true, false) => " (with engine KV)",
+            (false, true) => " (transcript and files)",
+            (false, false) => " (transcript only)",
         };
         format!("checkpoint {verb}: {name}{note}")
     }
@@ -8982,10 +9032,41 @@ impl Agent<'_> {
     /// `pre-rollback` (so the rollback is undoable), then the transcript is
     /// restored verbatim and, when the checkpoint carries engine KV, the
     /// session KV is restored so the next turn skips re-prefill.
-    fn rollback_to(&mut self, name: &str) -> Result<String, String> {
+    ///
+    /// `<name> --files` also puts the files the agent changed since back
+    /// (needs a checkpoint taken with file history on); `<name> --files-only`
+    /// restores the files and leaves the conversation alone.
+    fn rollback_to(&mut self, arg: &str) -> Result<String, String> {
+        let usage = "usage: /rollback <name> [--files | --files-only]";
+        let mut parts = arg.split_whitespace();
+        let name = parts.next().ok_or(usage)?;
+        let (mut files, mut files_only) = (false, false);
+        for flag in parts {
+            match flag {
+                "--files" => files = true,
+                "--files-only" => (files, files_only) = (true, true),
+                _ => return Err(usage.to_owned()),
+            }
+        }
         let Some(cp) = self.checkpoints.get(name).cloned() else {
             return Err(format!("no checkpoint named {name} (see /checkpoint)"));
         };
+        let file_note = if files {
+            let id = cp.files.ok_or_else(|| {
+                format!(
+                    "checkpoint {name} has no file snapshot (file history was off or not yet open)"
+                )
+            })?;
+            Some(self.rewind_files(id)?)
+        } else {
+            None
+        };
+        if files_only {
+            return Ok(format!(
+                "files restored to checkpoint {name}: {}",
+                file_note.unwrap_or_default()
+            ));
+        }
         // Snapshot the current tail before discarding it.
         let tail_kv = self.engine.get_kv();
         self.checkpoints
@@ -9007,9 +9088,125 @@ impl Agent<'_> {
             }
             _ => " (transcript restored, re-prefill on next turn)",
         };
+        let files_line = file_note.map_or_else(String::new, |n| format!("; files: {n}"));
         Ok(format!(
-            "rolled back to {name}{note}; tail saved as \"{PRE_ROLLBACK_CHECKPOINT}\""
+            "rolled back to {name}{note}; tail saved as \"{PRE_ROLLBACK_CHECKPOINT}\"{files_line}"
         ))
+    }
+
+    /// Opens (or switches to) this session's file history and snapshots it for
+    /// the turn that is starting, so `/undo` can return to before it. Not for a
+    /// sidechain, and nothing happens when `tools.fileHistory` is off.
+    fn file_history_begin_turn(&mut self) {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        const MONTH: u64 = 30 * 24 * 3600;
+        if !crate::settings::active().tools.file_history
+            || self.in_sidechain()
+            || self.session.id.is_empty()
+        {
+            return;
+        }
+        let root = crate::filehistory::root();
+        let dir = crate::filehistory::dir_in(&root, &self.session.id);
+        SWEPT.call_once(|| {
+            let _ = crate::filehistory::sweep_in(&root, MONTH, &self.session.id);
+        });
+        let label = self
+            .last_user_prompt()
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let mut slot = self
+            .tool_ctx
+            .file_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_none_or(|h| h.dir() != dir) {
+            *slot = Some(crate::filehistory::FileHistory::open(dir));
+        }
+        if let Some(h) = slot.as_mut() {
+            h.snapshot(&label);
+        }
+    }
+
+    /// Restores the tracked files to snapshot `id` and describes what changed.
+    fn rewind_files(&self, id: u64) -> Result<String, String> {
+        let ctx = &self.tool_ctx;
+        let mut slot = ctx
+            .file_history
+            .lock()
+            .map_err(|_| "file history is unavailable".to_owned())?;
+        let h = slot
+            .as_mut()
+            .ok_or("no file history yet: no turn has run in this session")?;
+        let stats = h
+            .diff_stats(id)
+            .ok_or("that file snapshot is gone (evicted)")?;
+        if stats.files.is_empty() {
+            return Ok("the files already match; nothing to restore".to_owned());
+        }
+        let allowed = |p: &std::path::Path| ctx.sandbox.contains_write_target(&ctx.cwd, p);
+        let report = h
+            .rewind(id, &allowed)
+            .ok_or("that file snapshot is gone (evicted)")?;
+        let mut line = format!(
+            "restored {}, removed {} (+{}/-{} lines)",
+            count_files(report.restored.len()),
+            count_files(report.removed.len()),
+            stats.insertions,
+            stats.deletions
+        );
+        if let Some((path, why)) = report.skipped.first() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                line,
+                "; skipped {} (first: {}: {why})",
+                report.skipped.len(),
+                path.display()
+            );
+        }
+        line.push_str("; /undo redo puts them back");
+        Ok(line)
+    }
+
+    /// `/undo [n | list | redo]`: puts the files the agent changed back to how
+    /// they were before the `n`th most recent turn (default 1), lists the
+    /// snapshots, or undoes the last restore. The conversation is untouched.
+    fn undo_files(&self, arg: &str) -> Result<String, String> {
+        use crate::filehistory::Kind;
+        if !crate::settings::active().tools.file_history {
+            return Err("file history is off (tools.fileHistory)".to_owned());
+        }
+        let arg = arg.trim();
+        let target = {
+            let slot = self
+                .tool_ctx
+                .file_history
+                .lock()
+                .map_err(|_| "file history is unavailable".to_owned())?;
+            let h = slot
+                .as_ref()
+                .ok_or("no file history yet: no turn has run in this session")?;
+            match arg {
+                "list" => return Ok(render_file_snapshots(h)),
+                "redo" => h
+                    .latest_of(Kind::Safety)
+                    .ok_or("nothing to redo: no restore has happened")?,
+                _ => {
+                    let n: usize = if arg.is_empty() {
+                        1
+                    } else {
+                        arg.parse()
+                            .map_err(|_| "usage: /undo [n | list | redo]".to_owned())?
+                    };
+                    h.turn_back(n)
+                        .ok_or_else(|| format!("no turn {n} back to restore (see /undo list)"))?
+                }
+            }
+        };
+        self.rewind_files(target)
     }
 
     /// Renders the session tree for `/tree` (issue #65).
@@ -16391,6 +16588,7 @@ impl Agent<'_> {
             let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
             return Ok(());
         }
+        self.file_history_begin_turn();
         let compact_interrupt =
             || shared.interrupt.load(Ordering::Relaxed) || crate::interrupt::pending();
         // No redraw hook: the UI thread paints the compaction bar off its own
@@ -18555,6 +18753,10 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/undo" => match self.undo_files(arg) {
+                Ok(msg) => log.push_plain(msg),
+                Err(e) => log.push_plain(e),
+            },
             "/tree" => {
                 *report = Some(tui::ReportPanel::new("tree", &self.tree_view(true)));
             }
@@ -34393,6 +34595,60 @@ mod tests {
         assert!(rung_files(&agent).is_empty(), "and its blobs are gone");
         assert!(agent.payload_dirty, "the saved payload must be rewritten");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The agent's file history, end to end: a turn snapshots, a tool write is
+    /// tracked at `resolve_for_write`, `/undo` puts the file back, `/undo redo`
+    /// reverses that, and `/rollback --files` returns to a checkpoint's files.
+    #[test]
+    fn undo_and_rollback_files_restore_what_a_turn_changed() {
+        let dir = scratch_dir("undo-files");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.tool_ctx.cwd.clone_from(&dir);
+        agent.session.id = "undo-files-test".to_owned();
+        let f = dir.join("note.txt");
+        std::fs::write(&f, "original").unwrap();
+
+        agent.session.push(Message::user("first change"));
+        agent.file_history_begin_turn();
+        // What `edit`/`write` do before writing.
+        let target = agent.tool_ctx.resolve_for_write("write", &f).unwrap();
+        std::fs::write(&target, "changed by turn 1").unwrap();
+        let cp_msg = agent.checkpoint_create("after-one");
+        assert!(cp_msg.contains("files"), "{cp_msg}");
+
+        agent.session.push(Message::user("second change"));
+        agent.file_history_begin_turn();
+        agent.tool_ctx.resolve_for_write("write", &f).unwrap();
+        std::fs::write(&f, "changed by turn 2").unwrap();
+
+        // /undo: back to before the last turn.
+        let msg = agent.undo_files("").unwrap();
+        assert!(msg.contains("restored 1 file"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "changed by turn 1");
+        // /undo redo: forward again.
+        agent.undo_files("redo").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "changed by turn 2");
+        // /undo 2: before the first turn.
+        agent.undo_files("2").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        agent.undo_files("redo").unwrap();
+
+        // The checkpoint remembers the files; the conversation is left alone.
+        let msg = agent.rollback_to("after-one --files-only").unwrap();
+        assert!(msg.contains("files restored"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "changed by turn 1");
+        assert_eq!(agent.session.transcript.len(), 2, "transcript untouched");
+        assert!(agent.undo_files("list").unwrap().contains("/undo 1"));
+        assert!(agent.undo_files("nonsense").is_err());
+        assert!(agent.rollback_to("after-one --bogus").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(crate::filehistory::dir_in(
+            &crate::filehistory::root(),
+            "undo-files-test",
+        ))
+        .ok();
     }
 
     /// `/fork` keeps a strict prefix of the transcript: rungs at or below the

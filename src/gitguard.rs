@@ -322,6 +322,100 @@ fn git(args: &[String]) -> Option<&'static str> {
     }
 }
 
+/// The file operands of a command line, for [`crate::filehistory`] to back up
+/// before the command runs.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Operands {
+    /// Every non-flag word of every command in the line, substitutions and
+    /// `sh -c` bodies included. Which are files is for the caller to find out.
+    pub names: Vec<String>,
+    /// Paths the line looks set to create: redirect targets, and the operands
+    /// of `touch`, `tee`, `cp`, `mv`, `install` and `ln`.
+    pub creates: Vec<String>,
+}
+
+/// Programs whose non-flag operands may name files they create.
+const CREATORS: &[&str] = &["touch", "tee", "cp", "mv", "install", "ln"];
+
+/// Reads `cmd` the way the git guard does and returns what it names.
+#[must_use]
+pub fn operands(cmd: &str) -> Operands {
+    let mut out = Operands::default();
+    collect_operands(cmd, 0, &mut out);
+    out
+}
+
+fn collect_operands(cmd: &str, depth: usize, out: &mut Operands) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let lexed = lex(cmd);
+    for sub in &lexed.subs {
+        collect_operands(sub, depth + 1, out);
+    }
+    for words in &lexed.segments {
+        segment_operands(words, depth, out);
+    }
+}
+
+fn segment_operands(words: &[String], depth: usize, out: &mut Operands) {
+    let mut i = 0;
+    while let Some(w) = words.get(i) {
+        if is_env_assignment(w) {
+            i += 1;
+        } else if WRAPPERS.contains(&basename(w)) {
+            i += 1;
+            while words.get(i).is_some_and(|f| f.starts_with('-')) {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let Some(head) = words.get(i) else {
+        return;
+    };
+    let name = basename(head);
+    let rest = &words[i + 1..];
+    if SHELLS.contains(&name)
+        && let Some(at) = rest
+            .iter()
+            .position(|w| w.starts_with('-') && !w.starts_with("--") && w.ends_with('c'))
+        && let Some(script) = rest.get(at + 1)
+    {
+        collect_operands(script, depth + 1, out);
+    }
+    let creator = CREATORS.contains(&name);
+    let mut k = 0;
+    while let Some(w) = rest.get(k) {
+        k += 1;
+        if let Some(gt) = w.find('>') {
+            let prefix = &w[..gt];
+            if prefix.chars().all(|c| c.is_ascii_digit() || c == '&') {
+                let after = w[gt + 1..].trim_start_matches(['>', '|']);
+                let target = if after.is_empty() {
+                    let next = rest.get(k).cloned();
+                    k += 1;
+                    next
+                } else if after.starts_with('&') {
+                    None
+                } else {
+                    Some(after.to_string())
+                };
+                out.creates.extend(target);
+                continue;
+            }
+        }
+        if w.starts_with('-') || w.starts_with('<') {
+            continue;
+        }
+        out.names.push(w.clone());
+        if creator {
+            out.creates.push(w.clone());
+        }
+    }
+}
+
 /// The words after a git subcommand, split at a bare `--` into flags and
 /// pathspecs.
 struct Opts<'a> {
@@ -530,6 +624,43 @@ mod tests {
             let _ = destructive(cmd);
         }
         pass("git push origin +");
+    }
+
+    #[test]
+    fn operands_name_files_and_redirect_targets() {
+        let o = operands("rm -rf src/old one.txt && echo hi > out.log 2>&1");
+        assert!(o.names.contains(&"src/old".to_string()));
+        assert!(o.names.contains(&"one.txt".to_string()));
+        assert!(!o.names.iter().any(|n| n.starts_with('-')));
+        assert_eq!(o.creates, vec!["out.log".to_string()]);
+        let o = operands("echo x >>log.txt; cat a >b.txt");
+        assert_eq!(o.creates, vec!["log.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn operands_of_creators_may_be_created() {
+        let o = operands("cp a.txt b.txt; touch c.txt; mv d e");
+        for f in ["a.txt", "b.txt", "c.txt", "d", "e"] {
+            assert!(o.creates.contains(&f.to_string()), "{f}");
+        }
+        assert!(!operands("ls a.txt").creates.contains(&"a.txt".to_string()));
+    }
+
+    #[test]
+    fn operands_see_into_substitution_and_shell_c() {
+        let o = operands("echo $(rm victim.txt)");
+        assert!(o.names.contains(&"victim.txt".to_string()));
+        let o = operands("bash -c 'sed -i s/a/b/ target.rs'");
+        assert!(o.names.contains(&"target.rs".to_string()));
+        let o = operands("sudo env FOO=1 rm gone.txt");
+        assert!(o.names.contains(&"gone.txt".to_string()));
+    }
+
+    #[test]
+    fn operands_of_odd_input_do_not_panic() {
+        for cmd in ["", ">", "2>", "a >", "$(", "`", "'", "&>"] {
+            let _ = operands(cmd);
+        }
     }
 
     #[test]

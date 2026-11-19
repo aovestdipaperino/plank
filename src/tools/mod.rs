@@ -236,6 +236,12 @@ pub struct ToolContext {
     /// local dialects, always for a provider's prompt). Default true, so a
     /// context nobody configured behaves as it always has.
     pub edit_upto: bool,
+    /// The session's per-turn file history (`crate::filehistory`), `None`
+    /// until the agent opens one at the first turn (and always in tests and
+    /// when `tools.fileHistory` is off). Behind a mutex because
+    /// [`resolve_for_write`](Self::resolve_for_write), where every writing
+    /// tool is recorded, only has `&self`.
+    pub file_history: std::sync::Mutex<Option<crate::filehistory::FileHistory>>,
 }
 
 /// An MCP tool's observation once its grids have been edited or refused.
@@ -413,6 +419,7 @@ impl ToolContext {
             error_log_path: None,
             grid_routes: BTreeMap::new(),
             edit_upto: true,
+            file_history: std::sync::Mutex::new(None),
         }
     }
 
@@ -456,6 +463,31 @@ impl ToolContext {
         }
     }
 
+    /// Runs `f` on the file history when one is open. A poisoned lock or no
+    /// history is silently nothing: history never fails a tool call.
+    pub fn with_file_history<R>(
+        &self,
+        f: impl FnOnce(&mut crate::filehistory::FileHistory) -> R,
+    ) -> Option<R> {
+        self.file_history.lock().ok()?.as_mut().map(f)
+    }
+
+    /// Records, before a shell command runs, the files it names and the ones
+    /// it looks set to create, so a turn's changes can be undone. Skipped for
+    /// a provably read-only command. Best effort: a command that writes files
+    /// it never names is not covered.
+    pub fn track_bash(&self, cmd: &str) {
+        if crate::sandbox::is_read_only_command(cmd) {
+            return;
+        }
+        let ops = crate::gitguard::operands(cmd);
+        self.with_file_history(|h| {
+            h.track_command_paths(&self.cwd, &ops.names, &ops.creates, &|p| {
+                self.sandbox.contains_write_target(&self.cwd, p)
+            });
+        });
+    }
+
     /// [`resolve`](Self::resolve) for a tool that is about to *write* the
     /// path. When the sandbox is enabled the target must lie under one of the
     /// sandbox's writable roots (cwd, the temp dirs, configured
@@ -473,6 +505,11 @@ impl ToolContext {
         let path = path.as_ref();
         let full = self.resolve(path);
         if self.sandbox.contains_write_target(&self.cwd, &full) {
+            // The one place every writing tool passes through, so the file's
+            // current bytes are saved before the write that follows.
+            self.with_file_history(|h| {
+                h.track(&full);
+            });
             Ok(full)
         } else {
             Err(format!(

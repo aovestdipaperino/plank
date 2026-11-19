@@ -357,6 +357,16 @@ system prompt, so it takes effect in a new session. See <a
 href="05-tools.html#background-jobs">Background jobs</a>.</td>
 </tr>
 <tr>
+<td><code>tools.fileHistory</code></td>
+<td><code>true</code></td>
+<td>snapshot, once per turn, the files the agent's tools are about to
+change, so <code>/undo</code> and <code>/rollback --files</code> can put
+them back. <code>edit</code> and <code>write</code> are always covered;
+<code>bash</code> is covered for the files and redirect targets the command
+names. Copies live in <code>~/.plank/file-history/&lt;session&gt;</code> and
+sessions untouched for 30 days are swept.</td>
+</tr>
+<tr>
 <td><code>tools.gitGuard</code></td>
 <td><code>"ask"</code></td>
 <td>what the <code>bash</code> tool does with a git command that discards
