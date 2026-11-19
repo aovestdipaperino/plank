@@ -357,6 +357,18 @@ system prompt, so it takes effect in a new session. See <a
 href="05-tools.html#background-jobs">Background jobs</a>.</td>
 </tr>
 <tr>
+<td><code>tools.gitGuard</code></td>
+<td><code>"ask"</code></td>
+<td>what the <code>bash</code> tool does with a git command that discards
+work or rewrites history (<code>reset --hard</code>, <code>clean -f</code>,
+a force push, <code>branch -D</code>, <code>checkout -- .</code>,
+<code>rebase</code>, <code>stash drop</code>, and a few more):
+<code>"ask"</code> prompts, and refuses when nobody can be asked;
+<code>"block"</code> always refuses; <code>"off"</code> runs it unchecked.
+It catches accidents, not a command written to hide from it; the sandbox
+is the boundary.</td>
+</tr>
+<tr>
 <td><code>tools.loopGuards</code></td>
 <td><code>true</code></td>
 <td>arm the loop guards (<code>/loopguard</code> flips it for the

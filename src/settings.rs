@@ -384,6 +384,11 @@ pub struct ToolsSettings {
     /// [`crate::sysprompt::edit_upto`]. Feeds the system prompt, so it takes
     /// effect in a new session.
     pub edit_upto: Option<bool>,
+    /// What the `bash` tool does with a command that discards work or rewrites
+    /// history (`git reset --hard`, `git clean -f`, a force push, ...): `ask`
+    /// (the default; refused when there is no one to ask), `block`, or `off`.
+    /// See [`crate::gitguard`].
+    pub git_guard: crate::gitguard::Mode,
 }
 
 impl Default for ToolsSettings {
@@ -401,6 +406,7 @@ impl Default for ToolsSettings {
             no_progress_guard: false,
             remember: true,
             edit_upto: None,
+            git_guard: crate::gitguard::Mode::Ask,
         }
     }
 }
@@ -961,6 +967,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "editUpto") {
             self.tools.edit_upto = Some(v);
             self.note("tools.editUpto", origin);
+        }
+        if let Some(v) = string(tools, "gitGuard").and_then(|s| crate::gitguard::Mode::parse(&s)) {
+            self.tools.git_guard = v;
+            self.note("tools.gitGuard", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);
@@ -1672,6 +1682,11 @@ impl Settings {
             upsert(t, "bashNotify", Json::Bool(self.tools.bash_notify));
             upsert(t, "remember", Json::Bool(self.tools.remember));
             upsert_opt(t, "editUpto", self.tools.edit_upto.map(Json::Bool));
+            upsert(
+                t,
+                "gitGuard",
+                Json::Str(self.tools.git_guard.as_str().to_string()),
+            );
         }
 
         let mut out = String::new();
@@ -3106,6 +3121,30 @@ mod tests {
         let s = Settings::load_from_paths(&[low], &[high]);
         assert_eq!(s.kvcache.max_bytes, 222);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tools_git_guard_parses_saves_and_defaults_to_ask() {
+        use crate::gitguard::Mode;
+        assert_eq!(Settings::default().tools.git_guard, Mode::Ask);
+        let dir = std::env::temp_dir().join(format!("plank-settings-gg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"tools":{"gitGuard":"block"}}"#).expect("write");
+        let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
+        assert_eq!(s.tools.git_guard, Mode::Block);
+        // An unknown spelling keeps the default instead of failing the load.
+        std::fs::write(&path, r#"{"tools":{"gitGuard":"maybe"}}"#).expect("write");
+        let s = Settings::load_from_paths(&[], std::slice::from_ref(&path));
+        assert_eq!(s.tools.git_guard, Mode::Ask);
+        // And it survives a save and reload, so /config never resets it.
+        let mut s = Settings::default();
+        s.tools.git_guard = Mode::Off;
+        s.save_to(&path).expect("save");
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&std::fs::read_to_string(&path).expect("read"));
+        assert_eq!(reloaded.tools.git_guard, Mode::Off);
         std::fs::remove_dir_all(&dir).ok();
     }
 

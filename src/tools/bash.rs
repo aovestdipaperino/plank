@@ -83,6 +83,10 @@ pub struct BashJobs {
     /// right after and must not share the GPU with a command still running.
     /// Consumed by that call.
     pub wait_to_exit: bool,
+    /// Set by the agent once it has already run the git guard on the next
+    /// `bash` call's command (`suspend_model` asks before the model is
+    /// unloaded, not after). Consumed by that call so the user is asked once.
+    pub git_guard_vetted: bool,
 }
 
 /// A sandbox decision already made for one command: the policy it ran under,
@@ -972,6 +976,15 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
+    // A GPU-yield re-run (it carries the first run's sandbox decision) was
+    // already vetted; asking again would turn one answer into two prompts.
+    let vetted = std::mem::take(&mut ctx.bash.git_guard_vetted);
+    if !vetted
+        && ctx.bash.replay_sandbox.is_none()
+        && let Some(refusal) = git_guard_refusal(ctx, cmd)
+    {
+        return refusal;
+    }
     // A GPU-yield re-run reuses the first run's decision verbatim: asking
     // about a protected root again would turn one grant into two prompts.
     let sandbox = match ctx.bash.replay_sandbox.take() {
@@ -988,6 +1001,54 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let idx = ctx.bash.jobs.len() - 1;
     let wait = std::mem::take(&mut ctx.bash.wait_to_exit);
     ctx.bash.foreground_result(idx, refresh, sandbox, wait)
+}
+
+/// Applies `tools.gitGuard` to `cmd`: `None` lets it run, `Some` is the
+/// model-visible refusal. In `ask` mode the user answers through the same
+/// [`Asker`](crate::tools::ask::Asker) the sandbox prompt uses; with no asker
+/// (`--ui console`) the command is refused, as an unanswerable prompt is.
+pub(crate) fn git_guard_refusal(ctx: &mut ToolContext, cmd: &str) -> Option<String> {
+    use crate::gitguard::Mode;
+    let mode = crate::settings::active().tools.git_guard;
+    if mode == Mode::Off {
+        return None;
+    }
+    let why = crate::gitguard::destructive(cmd)?;
+    let refused = |how: &str| {
+        Some(format!(
+            "Tool error: not run: {why} ({how}). Do not retry it; tell the user what you \
+             wanted to do and let them run it, or pick a non-destructive way. \
+             `tools.gitGuard` in settings.json controls this check.\n"
+        ))
+    };
+    if mode == Mode::Block {
+        return refused("blocked by tools.gitGuard");
+    }
+    let Some(asker) = ctx.asker.as_mut() else {
+        return refused("nobody to ask for permission");
+    };
+    let req = crate::tools::ask::AskRequest {
+        question: format!("This command may lose work: {why}.\n  {cmd}\nRun it?"),
+        header: "Git guard".to_string(),
+        options: vec![
+            crate::tools::ask::AskOption {
+                label: "Run".to_string(),
+                description: "Run this command".to_string(),
+            },
+            crate::tools::ask::AskOption {
+                label: "Deny".to_string(),
+                description: "Do not run it; the model is told it was refused".to_string(),
+            },
+        ],
+        multi: false,
+        allow_chat: false,
+    };
+    match asker.ask(req) {
+        crate::tools::ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Run") => {
+            None
+        }
+        _ => refused("the user declined"),
+    }
 }
 
 /// Decides the sandbox policy one command runs under, asking about any
@@ -1713,6 +1774,81 @@ mod tests {
         );
         assert!(out.contains("exit_status=3\n"));
         assert!(out.contains("oops\n"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An asker that answers every prompt with one fixed label.
+    struct Answers(&'static str);
+
+    impl crate::tools::ask::Asker for Answers {
+        fn ask(&mut self, _req: crate::tools::ask::AskRequest) -> crate::tools::ask::AskOutcome {
+            crate::tools::ask::AskOutcome::Answered(vec![self.0.to_string()])
+        }
+    }
+
+    #[test]
+    fn git_guard_refuses_a_destructive_command_when_nobody_can_be_asked() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        ctx.asker = None;
+        let marker = dir.join("ran");
+        let cmd = format!("touch '{}' && git reset --hard", marker.display());
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd)]));
+        assert!(
+            out.starts_with("Tool error: not run: git reset --hard"),
+            "{out}"
+        );
+        assert!(out.contains("tools.gitGuard"), "{out}");
+        assert!(!marker.exists(), "the refused command must not start");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn git_guard_follows_the_users_answer() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        let marker = dir.join("ran");
+        // `git reset --hard` outside a repository just fails; what matters is
+        // whether the command started, which the marker shows.
+        let cmd = format!("touch '{}'; git reset --hard", marker.display());
+
+        ctx.asker = Some(Box::new(Answers("Deny")));
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd)]));
+        assert!(out.contains("the user declined"), "{out}");
+        assert!(!marker.exists());
+
+        ctx.asker = Some(Box::new(Answers("Run")));
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd)]));
+        assert!(!out.contains("not run:"), "{out}");
+        assert!(marker.exists(), "an approved command runs");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_vetted_call_is_not_asked_again_and_only_once() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        ctx.asker = None;
+        let call = test_call("bash", &[("command", "git reset --hard")]);
+        ctx.bash.git_guard_vetted = true;
+        let out = tool_bash(&mut ctx, &call);
+        assert!(!out.contains("not run:"), "a vetted call runs: {out}");
+        assert!(!ctx.bash.git_guard_vetted, "the flag is consumed");
+        let again = tool_bash(&mut ctx, &call);
+        assert!(
+            again.contains("not run:"),
+            "the next call is checked: {again}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn git_guard_ignores_ordinary_commands() {
+        let _interrupt_guard = crate::interrupt::test_guard();
+        let (mut ctx, dir) = test_ctx();
+        ctx.asker = None;
+        let out = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo hi")]));
+        assert!(out.contains("exit_status=0\n"), "{out}");
         std::fs::remove_dir_all(dir).ok();
     }
 

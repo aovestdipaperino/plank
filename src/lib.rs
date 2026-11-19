@@ -139,6 +139,7 @@ pub mod profiles;
 pub mod provenance;
 pub mod remote;
 pub use trace_stream::render;
+pub mod gitguard;
 pub mod repro;
 pub mod resumepane;
 pub mod sandbox;

@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Git guard for the `bash` tool (`tools.gitGuard`).** A command that throws
+  work away or rewrites history (`git reset --hard`, `git clean -f`, a force
+  push, `branch -D`, `checkout -- .`, `restore`, `rebase`, `stash drop`, and a
+  few more) now asks first, or is refused when nobody can be asked (`--ui
+  console`). The scan is quote-aware, so `echo "git reset --hard"` is data, and
+  it sees chains, subshells, `$(...)`, `sh -c`, `eval`, `sudo`/`env` prefixes
+  and `git -C dir`. Values: `ask` (default), `block`, `off`. It catches
+  accidents; the sandbox is still the boundary.
+
 - **Launch shows every KV cache tier at once.** The launch screen now lists
   all tiers up front, a checkmark for a cached one and a bar for a pending
   one, instead of restarting a single bar per tier. It appears with the

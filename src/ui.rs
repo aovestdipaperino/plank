@@ -4320,6 +4320,12 @@ impl Agent<'_> {
         {
             return blocked;
         }
+        // The git guard likewise asks before the unload, and tells `tool_bash`
+        // it has, so the re-run inside the cycle does not ask a second time.
+        if let Some(refusal) = crate::tools::bash::git_guard_refusal(&mut self.tool_ctx, command) {
+            return refusal;
+        }
+        self.tool_ctx.bash.git_guard_vetted = true;
         let slot = match self.gpu_slot() {
             None => Err(SUSPEND_IGNORED_NO_MODEL.to_owned()),
             Some(_) if crate::tools::bash::backgrounds_itself(command) => {
@@ -4346,6 +4352,8 @@ impl Agent<'_> {
             },
         };
         let (output, end) = crate::gpuyield::run_suspended(&mut host);
+        // Never leave the flag armed for an unrelated later call.
+        self.tool_ctx.bash.git_guard_vetted = false;
         crate::engine::kv_debug(|| format!("gpu yield: suspended run ended {end:?}"));
         output
     }
