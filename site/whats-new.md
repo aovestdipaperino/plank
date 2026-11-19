@@ -7,6 +7,19 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v7.0.10 beta: go back to before a prompt.** Press Esc twice on an empty
+prompt and plank lists your recent prompts, then asks what to put back: the
+conversation, the files the agent changed, or both. The prompt returns to the
+editor so you can change it and send it again. `/rewind` does the same by
+number, `/undo` puts the files back to before the last turn (`/undo redo` takes
+it back), and `/rollback <name> --files` returns to a checkpoint's files. Plank
+saves a copy of each file a tool is about to change, and of the files and
+redirect targets a shell command names, so `rm -rf`, `sed -i` and `echo x > f`
+can be undone; a command that writes files it never names cannot. Separately,
+a `git reset --hard`, forced clean or push, `branch -D`, rebase or similar now
+asks first (`tools.gitGuard`), and the launch screen shows every KV cache tier
+at once.
+
 **v7.0.9 beta: Flint, on plank's own engine.** `plank --model flint`
 downloads Recursive's Flint, a 40B mixture-of-experts model in NVFP4 (about
 23 GB), and runs it on the same Rust engine as Gemma, with Metal kernels

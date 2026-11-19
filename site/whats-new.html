@@ -139,6 +139,21 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>v7.0.10 beta: go back to before a prompt.</strong> Press Esc
+twice on an empty prompt and plank lists your recent prompts, then asks
+what to put back: the conversation, the files the agent changed, or both.
+The prompt returns to the editor so you can change it and send it again.
+<code>/rewind</code> does the same by number, <code>/undo</code> puts the
+files back to before the last turn (<code>/undo redo</code> takes it
+back), and <code>/rollback &lt;name&gt; --files</code> returns to a
+checkpoint's files. Plank saves a copy of each file a tool is about to
+change, and of the files and redirect targets a shell command names, so
+<code>rm -rf</code>, <code>sed -i</code> and <code>echo x &gt; f</code>
+can be undone; a command that writes files it never names cannot.
+Separately, a <code>git reset --hard</code>, forced clean or push,
+<code>branch -D</code>, rebase or similar now asks first
+(<code>tools.gitGuard</code>), and the launch screen shows every KV cache
+tier at once.</p>
 <p><strong>v7.0.9 beta: Flint, on plank's own engine.</strong>
 <code>plank --model flint</code> downloads Recursive's Flint, a 40B
 mixture-of-experts model in NVFP4 (about 23 GB), and runs it on the same
