@@ -27,7 +27,7 @@ hardware it needs; it is not a promise that it works.
 | Desktop notifications | `notify-rust`, terminal's icon | `notify-send`, terminal's `.desktop` entry | PowerShell toast, under Windows Terminal's app id when inside it |
 | Clipboard text and images, open, sound | yes | `wl-*`/`xclip`/`xsel`, `xdg-open`, `paplay`/`aplay`/`ffplay` | PowerShell, `explorer` |
 | `--debug` console mirror | yes | yes | yes (same protocol over `std`) |
-| WASM plugins | yes | yes | yes; building the guests needs a POSIX shell (Git Bash) |
+| WASM plugins | yes | yes | yes; the guest scripts run under Git Bash (CI builds, packages and rebuild-verifies them), but the modules embed `\`-joined paths, so their hashes match only other Windows builds |
 | Prebuilt releases | Homebrew bottle, `.tar.gz` | `.tar.gz` (x86_64, aarch64) | `.zip` (x86_64) |
 
 The release archives for Linux and Windows are added by

@@ -37,7 +37,8 @@ for guest in screensavers arcades csvedit; do
     target=wasm32-wasip1
     crate=plank_tv
   fi
-  built="$ROOT/$guest/target/$target/release/$crate.wasm"
+  # build.sh honours an (absolute) CARGO_TARGET_DIR, shared by every guest.
+  built="${CARGO_TARGET_DIR:-$ROOT/$guest/target}/$target/release/$crate.wasm"
   if [ ! -f "$built" ]; then
     echo "missing build output: $built" >&2
     exit 1
@@ -60,9 +61,16 @@ done
 # given toolchain: a verifier needs to know what to reproduce *with*.
 #
 # Verified with guests/verify.sh, which rebuilds from a clean tree and compares.
+# The OS family is recorded too: Windows embeds `\`-joined source paths, so its
+# modules never match a macOS or Linux build (see build.sh).
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) family=windows ;;
+  *) family=unix ;;
+esac
 {
   echo "# plank guest modules"
   echo "# $(rustc --version)"
+  echo "# built on: $family"
   for guest in screensavers arcades csvedit; do
     (cd "$DIST/$guest/wasm" && sha256 "$guest.wasm")
   done

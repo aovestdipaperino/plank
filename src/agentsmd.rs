@@ -174,11 +174,17 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# rules\n").unwrap();
         let got = prepare(&dir).unwrap();
         assert_eq!(got, Startup::Linked(dir.join("AGENTS.md")));
-        assert_eq!(
-            std::fs::read_link(dir.join("AGENTS.md")).unwrap(),
-            PathBuf::from("CLAUDE.md"),
-            "relative target so the checkout can move"
-        );
+        match std::fs::read_link(dir.join("AGENTS.md")) {
+            Ok(target) => assert_eq!(
+                target,
+                PathBuf::from("CLAUDE.md"),
+                "relative target so the checkout can move"
+            ),
+            // Windows without the symlink privilege makes a hard link
+            // (`platform::link_file`), which has no target to read.
+            Err(_) if cfg!(windows) => {}
+            Err(e) => panic!("AGENTS.md is not a symlink: {e}"),
+        }
         assert_eq!(
             std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
             "# rules\n"

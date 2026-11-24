@@ -254,6 +254,8 @@ mod tests {
         init().unwrap();
         let mut tb = TextBuffer::new(true).unwrap();
         tb.set_insert_final_newline(false);
+        // The buffer's default is CRLF on Windows; the editor pins LF.
+        tb.set_crlf(false);
         tb.write_canon(b"hello\nworld");
         let mut out = String::new();
         tb.save_as_string(&mut out);

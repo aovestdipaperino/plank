@@ -371,7 +371,15 @@ impl FileIndex {
             }
             let found: BTreeSet<String> = lines_from(root, "rg", &args)
                 .into_iter()
-                .map(|p| p.trim_start_matches("./").to_string())
+                // `/` as git prints it: rg on Windows separates with `\`.
+                .map(|p| {
+                    let p = if cfg!(windows) {
+                        p.replace('\\', "/")
+                    } else {
+                        p
+                    };
+                    p.trim_start_matches("./").to_string()
+                })
                 .collect();
             // An empty result means `rg` is missing or failed (it is not
             // installed by default on macOS); walk the tree ourselves rather

@@ -1,0 +1,5 @@
+# LF everywhere, Windows checkouts included. Prompt text, skills and fixtures
+# are compiled in with include_str! and must stay byte-identical to the C
+# reference; a CRLF checkout (Git for Windows' default core.autocrlf=true)
+# would change every one of them.
+* text=auto eol=lf

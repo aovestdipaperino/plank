@@ -204,7 +204,11 @@ jobs:
       - name: Cache pdfium binaries
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pdfium-rs
+          # The download's home per OS, as the step below spells it: Windows
+          # keeps it under %LOCALAPPDATA%, so the Linux path alone never hit.
+          path: |
+            ~/.cache/pdfium-rs
+            ~/AppData/Local/pdfium-rs
           key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Ensure pdfium is downloadable
@@ -224,8 +228,29 @@ jobs:
       # `--release`, as in the macOS job, and here also required: tesseract-rs
       # 0.2.0 looks for `leptonica-1.84.1.lib`, but an MSVC Debug build names
       # it `leptonica-1.84.1d.lib`, so a debug test build fails to link.
+      # Under bash on Windows too: Git Bash sets HOME, which plank's binary
+      # sets from USERPROFILE at startup (`platform::ensure_home`) but a test
+      # harness never does, so under pwsh every `~/.plank` reader saw none.
       - name: Test
+        shell: bash
         run: cargo test --release --lib
+
+      # The WASM guest scripts under Git Bash (#89 step 6): build, package and
+      # rebuild-verify, as the macOS job does. The sums must say they were
+      # built on Windows, whose modules embed `\`-joined paths and so never
+      # match the macOS ones the release ships (guests/build.sh). After the
+      # tests on purpose: building the guests first would switch on the
+      # guest-backed suite on Windows, which is a separate step.
+      - name: Build, package and verify the WASM guests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          sh spike/build-guest.sh
+          sh guests/package.sh
+          cp guests/dist/SHA256SUMS "$RUNNER_TEMP/guest-sums"
+          sh guests/verify.sh "$RUNNER_TEMP/guest-sums"
+          grep -q '^# built on: windows$' "$RUNNER_TEMP/guest-sums"
 
       # The native engines on the CPU (#89 step 5): workspace members the
       # steps above miss. Their kernels sit behind `candle`, and the

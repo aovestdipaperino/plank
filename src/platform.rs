@@ -388,6 +388,42 @@ pub fn ensure_home() {
     }
 }
 
+/// Grows `file` to `len` bytes without allocating them: a sparse file.
+///
+/// Unix: plain `set_len`, which never allocates. Windows: NTFS allocates the
+/// whole extent on `set_len` unless the file is first marked sparse, so a
+/// test's multi-terabyte stand-in fails with "not enough space on the disk".
+///
+/// # Errors
+/// The OS error from marking or sizing the file.
+pub fn set_len_sparse(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        let mut returned = 0u32;
+        // SAFETY: the handle is open for the lifetime of `file`; no input or
+        // output buffer is passed, which FSCTL_SET_SPARSE reads as "set".
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    file.set_len(len)
+}
+
 /// Makes `link` name the file `target` (relative to `link`'s directory).
 ///
 /// Unix: a symlink, as always. Windows: a file symlink when the account may

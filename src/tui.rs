@@ -159,9 +159,14 @@ fn highlighter() -> Arc<TreeSitterHighlighter> {
 /// The width assistant markdown is rendered at: the terminal's, less the
 /// two columns reserved for the output gutter.
 fn markdown_width() -> usize {
-    ratatui::crossterm::terminal::size()
-        .map_or(80, |(w, _)| w as usize)
-        .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
+    // Tests take the no-terminal fallback: a Windows test process can still
+    // read its console's width, which would make the wrap depend on the
+    // window the suite was started from.
+    #[cfg(test)]
+    let cols: usize = 80;
+    #[cfg(not(test))]
+    let cols = ratatui::crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
+    cols.saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
         .max(20)
 }
 
